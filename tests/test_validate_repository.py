@@ -73,6 +73,27 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_reports_missing_reference_style_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide][setup]\n\n[setup]: references/missing.md\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("references/missing.md", errors[0])
+
+    def test_ignores_literal_markdown_link_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "\\[escaped](missing.md)\n"
+                "`[inline](missing.md)`\n"
+                "```markdown\n[fenced](missing.md)\n```\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_rejects_skill_link_that_escapes_distributable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -127,6 +148,17 @@ class PortabilityTests(unittest.TestCase):
             errors = validator.find_portability_violations(root)
             self.assertEqual(1, len(errors))
             self.assertIn("scripts/helper.py", errors[0])
+
+    def test_detects_lowercase_client_cli_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            (root / "assets").mkdir()
+            skill_file = root / "SKILL.md"
+            for instruction in ("Run codex exec.\n", "Run claude.\n", "Run gemini skills.\n"):
+                with self.subTest(instruction=instruction):
+                    skill_file.write_text(instruction, encoding="utf-8")
+                    self.assertEqual(1, len(validator.find_portability_violations(root)))
 
 
 class SecretTests(unittest.TestCase):

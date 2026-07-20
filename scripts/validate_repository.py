@@ -42,10 +42,10 @@ REQUIRED_SKILL_FILES = (
 )
 
 PORTABILITY_PATTERNS = {
-    "client name Codex": re.compile(r"\bCodex\b"),
-    "client name Claude": re.compile(r"\bClaude\b"),
-    "client name Gemini": re.compile(r"\bGemini\b"),
-    "client name Copilot": re.compile(r"\bCopilot\b"),
+    "client name Codex": re.compile(r"\bcodex\b", re.IGNORECASE),
+    "client name Claude": re.compile(r"\bclaude\b", re.IGNORECASE),
+    "client name Gemini": re.compile(r"\bgemini\b", re.IGNORECASE),
+    "client name Copilot": re.compile(r"\bcopilot\b", re.IGNORECASE),
     "Codex-specific path": re.compile(r"\.codex(?:/|\\\\)"),
     "Claude-specific path": re.compile(r"\.claude(?:/|\\\\)"),
     "Gemini-specific path": re.compile(r"\.gemini(?:/|\\\\)"),
@@ -69,6 +69,10 @@ SECRET_PATTERNS = {
 }
 
 MARKDOWN_LINK_START = re.compile(r"!?\[[^\]\n]*\]\(")
+MARKDOWN_REFERENCE_DEFINITION = re.compile(
+    r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|[^\s\n]+)"
+)
+MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 
 
@@ -122,9 +126,86 @@ def markdown_files(root: Path) -> list[Path]:
     )
 
 
+def markdown_searchable_text(text: str) -> str:
+    """Mask literal Markdown regions while preserving offsets and line structure."""
+
+    characters = list(text)
+    offset = 0
+    fence_character: str | None = None
+    fence_length = 0
+
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if fence_character is None:
+            match = MARKDOWN_FENCE_START.match(content)
+            if match:
+                fence = match.group(1)
+                fence_character = fence[0]
+                fence_length = len(fence)
+        else:
+            closing_fence = re.compile(
+                rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
+            )
+            if closing_fence.match(content):
+                fence_character = None
+                fence_length = 0
+
+        if fence_character is not None or MARKDOWN_FENCE_START.match(content):
+            for index in range(offset, offset + len(line)):
+                if characters[index] not in "\r\n":
+                    characters[index] = " "
+        offset += len(line)
+
+    masked = "".join(characters)
+    index = 0
+    while index < len(masked):
+        if masked[index] != "`":
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(masked) and masked[run_end] == "`":
+            run_end += 1
+        delimiter = masked[index:run_end]
+        search_from = run_end
+        closing = -1
+        while True:
+            candidate = masked.find(delimiter, search_from)
+            if candidate == -1:
+                break
+            before_is_tick = candidate > 0 and masked[candidate - 1] == "`"
+            after = candidate + len(delimiter)
+            after_is_tick = after < len(masked) and masked[after] == "`"
+            if not before_is_tick and not after_is_tick:
+                closing = candidate
+                break
+            search_from = candidate + len(delimiter)
+        if closing == -1:
+            index = run_end
+            continue
+        for position in range(index, closing + len(delimiter)):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+        index = closing + len(delimiter)
+        masked = "".join(characters)
+
+    for index, character in enumerate(characters):
+        if character != "[":
+            continue
+        preceding_backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and characters[cursor] == "\\":
+            preceding_backslashes += 1
+            cursor -= 1
+        if preceding_backslashes % 2 == 1:
+            characters[index] = " "
+
+    return "".join(characters)
+
+
 def markdown_link_targets(text: str) -> list[str]:
     """Extract inline Markdown destinations while respecting balanced parentheses."""
 
+    text = markdown_searchable_text(text)
     targets: list[str] = []
     cursor = 0
     while match := MARKDOWN_LINK_START.search(text, cursor):
@@ -165,6 +246,7 @@ def markdown_link_targets(text: str) -> list[str]:
         else:
             cursor = match.end()
 
+    targets.extend(MARKDOWN_REFERENCE_DEFINITION.findall(text))
     return targets
 
 
