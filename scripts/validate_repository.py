@@ -8,7 +8,7 @@ import math
 import re
 import sys
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 
 REQUIRED_ROOT_FILES = (
@@ -52,6 +52,7 @@ PORTABILITY_PATTERNS = {
     "Gemini-specific path": re.compile(r"\.gemini(?:/|\\\\)"),
     "client-specific user-input tool": re.compile(r"\b(?:request_user_input|get_user_input)\b"),
     "machine-specific macOS path": re.compile(r"/Users/[^/\s]+/"),
+    "machine-specific Linux path": re.compile(r"(?:/home/[^/\s]+/|/root/)"),
     "machine-specific Windows path": re.compile(r"[A-Za-z]:\\\\Users\\\\"),
     "shell-specific preapproval syntax": re.compile(r"\bBash\([^\n]*\)"),
 }
@@ -306,7 +307,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
     """Collect generated heading fragments and explicit HTML anchors outside fences."""
 
     fragments: set[str] = set()
-    slug_counts: dict[str, int] = {}
+    used_slugs: set[str] = set()
     fence_character: str | None = None
     fence_length = 0
     setext_candidate: str | None = None
@@ -316,9 +317,13 @@ def markdown_heading_fragments(text: str) -> set[str]:
         base = github_heading_slug(heading)
         if not base:
             return
-        duplicate_index = slug_counts.get(base, 0)
-        slug_counts[base] = duplicate_index + 1
-        fragments.add(base if duplicate_index == 0 else f"{base}-{duplicate_index}")
+        candidate = base
+        duplicate_index = 0
+        while candidate in used_slugs:
+            duplicate_index += 1
+            candidate = f"{base}-{duplicate_index}"
+        used_slugs.add(candidate)
+        fragments.add(candidate)
 
     for line in text.splitlines():
         if fence_character is None:
@@ -369,9 +374,9 @@ def find_broken_links(root: Path) -> list[str]:
                 target = target.split(" ", 1)[0]
             if not target or target.startswith("//") or URI_SCHEME.match(target):
                 continue
-            path_target, separator, fragment = target.partition("#")
-            path_target = unquote(path_target)
-            fragment = unquote(fragment) if separator else ""
+            parsed_target = urlsplit(target)
+            path_target = unquote(parsed_target.path)
+            fragment = unquote(parsed_target.fragment)
             resolved = (path.parent / path_target).resolve() if path_target else path.resolve()
             if path.resolve().is_relative_to(skill_root) and not resolved.is_relative_to(skill_root):
                 errors.append(

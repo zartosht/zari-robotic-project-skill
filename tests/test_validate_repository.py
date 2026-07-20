@@ -68,6 +68,24 @@ class LinkTests(unittest.TestCase):
             (root / "guide.md").write_text("# Details\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_local_links_with_queries_and_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[source](guide.md?plain=1) [details](guide.md?plain=1#details)\n",
+                encoding="utf-8",
+            )
+            (root / "guide.md").write_text("# Details\n", encoding="utf-8")
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_accepts_globally_disambiguated_heading_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Foo\n\n# Foo-1\n\n# Foo\n\n[third](#foo-2)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_reports_stale_same_file_and_cross_file_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,6 +227,19 @@ class PortabilityTests(unittest.TestCase):
                 with self.subTest(instruction=instruction):
                     skill_file.write_text(instruction, encoding="utf-8")
                     self.assertEqual(1, len(validator.find_portability_violations(root)))
+
+    def test_detects_linux_user_home_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            (root / "assets").mkdir()
+            skill_file = root / "SKILL.md"
+            for path in ("/home/alice/robot-project", "/root/robot-project"):
+                with self.subTest(path=path):
+                    skill_file.write_text(f"Open {path}.\n", encoding="utf-8")
+                    errors = validator.find_portability_violations(root)
+                    self.assertEqual(1, len(errors))
+                    self.assertIn("machine-specific Linux path", errors[0])
 
 
 class SecretTests(unittest.TestCase):
