@@ -124,6 +124,8 @@ MARKDOWN_RAW_HTML_TYPE_7 = re.compile(
 )
 MARKDOWN_CODE_SPAN_LT = "\ue000"
 MARKDOWN_CODE_SPAN_GT = "\ue001"
+MARKDOWN_ESCAPED_LBRACKET = "\ue002"
+MARKDOWN_ESCAPED_LT = "\ue003"
 MARKDOWN_AUTOLINK = re.compile(
     r"<((?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)|(?:[^<>\s@]+@[^<>\s@]+))>"
 )
@@ -132,6 +134,8 @@ MARKDOWN_HTML_NAME_ATTRIBUTES = frozenset({"name"})
 MARKDOWN_HTML_LEGACY_ANCHOR_TAGS = frozenset({"a"})
 MARKDOWN_HTML_HREF_ATTRIBUTES = frozenset({"href"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
+MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
+MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -772,7 +776,11 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             preceding_backslashes += 1
             cursor -= 1
         if preceding_backslashes % 2 == 1:
-            characters[index] = " "
+            characters[index] = (
+                MARKDOWN_ESCAPED_LBRACKET
+                if character == "["
+                else MARKDOWN_ESCAPED_LT
+            )
 
     return "".join(characters)
 
@@ -860,6 +868,14 @@ def markdown_unescape(text: str) -> str:
     )
 
 
+def markdown_restore_escaped_openers(text: str) -> str:
+    """Restore escaped punctuation protected from structural Markdown scans."""
+
+    return text.replace(MARKDOWN_ESCAPED_LBRACKET, "[").replace(
+        MARKDOWN_ESCAPED_LT, "<"
+    )
+
+
 def markdown_normalize_reference_label(label: str) -> str:
     """Normalize a reference label for case-insensitive CommonMark matching."""
 
@@ -903,6 +919,7 @@ def markdown_reference_definitions(
     container_lines = markdown_container_lines(lines)
     container_text = "\n".join(content for _, content in container_lines)
     definitions: list[re.Match[str]] = []
+    definition_lines: set[int] = set()
     for match in MARKDOWN_REFERENCE_DEFINITION.finditer(container_text):
         target = match.group("target")
         raw_label = match.group("label")
@@ -926,12 +943,14 @@ def markdown_reference_definitions(
             continue
         if line_index == 0:
             definitions.append(match)
+            definition_lines.update(range(line_index, end_line_index + 1))
             continue
 
         previous_containers, previous_content = container_lines[line_index - 1]
         begins_list_item = markdown_line_starts_list_item(lines[line_index])
         previous_ends_block = (
             not previous_content.strip()
+            or line_index - 1 in definition_lines
             or MARKDOWN_ATX_HEADING.match(previous_content) is not None
             or MARKDOWN_SETEXT_HEADING.match(previous_content) is not None
             or MARKDOWN_THEMATIC_BREAK.match(previous_content) is not None
@@ -942,6 +961,7 @@ def markdown_reference_definitions(
             or previous_ends_block
         ):
             definitions.append(match)
+            definition_lines.update(range(line_index, end_line_index + 1))
     return definitions
 
 
@@ -1000,18 +1020,13 @@ def markdown_reference_usages(
             and markdown_destination_end(text, cursor) is not None
         ):
             continue
-        whitespace_end = markdown_inline_whitespace_end(text, cursor)
-        if whitespace_end is None:
-            reference_label = primary_label
+        if cursor < len(text) and text[cursor] == "[":
+            reference_end = markdown_label_end(text, cursor)
+            if reference_end is None:
+                continue
+            reference_label = text[cursor + 1 : reference_end] or primary_label
         else:
-            cursor = whitespace_end
-            if cursor < len(text) and text[cursor] == "[":
-                reference_end = markdown_label_end(text, cursor)
-                if reference_end is None:
-                    continue
-                reference_label = text[cursor + 1 : reference_end] or primary_label
-            else:
-                reference_label = primary_label
+            reference_label = primary_label
         if len(reference_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH:
             continue
         normalized = markdown_normalize_reference_label(reference_label)
@@ -1061,11 +1076,6 @@ def markdown_label_contains_active_link(
             destination = markdown_destination_end(text, cursor)
             if destination is not None and destination[1] < label_end:
                 return True
-        whitespace_end = markdown_inline_whitespace_end(text, cursor, label_end)
-        if whitespace_end is None:
-            index = nested_end + 1
-            continue
-        cursor = whitespace_end
         if cursor < label_end and text[cursor] == "[":
             reference_end = markdown_label_end(text, cursor)
             if reference_end is not None and reference_end < label_end:
@@ -1090,13 +1100,14 @@ def markdown_label_contains_active_link(
     return False
 
 
-def markdown_protect_code_span_angles(text: str) -> str:
-    """Protect visible angle brackets in code spans from HTML-tag stripping."""
+def markdown_render_code_spans(text: str) -> str:
+    """Render code-span text with CommonMark whitespace normalization."""
 
-    characters = list(text)
+    result: list[str] = []
     index = 0
     while index < len(text):
         if text[index] != "`" or markdown_character_is_escaped(text, index):
+            result.append(text[index])
             index += 1
             continue
         run_end = index
@@ -1115,15 +1126,19 @@ def markdown_protect_code_span_angles(text: str) -> str:
                 delimiter, closing + len(delimiter), paragraph_end
             )
         if closing < 0:
+            result.append(delimiter)
             index = run_end
             continue
-        for position in range(run_end, closing):
-            if characters[position] == "<":
-                characters[position] = MARKDOWN_CODE_SPAN_LT
-            elif characters[position] == ">":
-                characters[position] = MARKDOWN_CODE_SPAN_GT
+
+        content = re.sub(r"[ \t\r\n]+", " ", text[run_end:closing])
+        if content.startswith(" ") and content.endswith(" ") and content.strip():
+            content = content[1:-1]
+        content = content.replace("<", MARKDOWN_CODE_SPAN_LT).replace(
+            ">", MARKDOWN_CODE_SPAN_GT
+        )
+        result.append(content)
         index = closing + len(delimiter)
-    return "".join(characters)
+    return "".join(result)
 
 
 def html_attribute_values(
@@ -1246,7 +1261,16 @@ def markdown_inline_block_end(text: str, start: int) -> int:
         if non_one_ordered_item:
             containers = parent_containers
             content = parent_content
-        if containers != start_containers or markdown_line_interrupts_paragraph(content):
+        interrupts_paragraph = markdown_line_interrupts_paragraph(content)
+        lazy_continuation = (
+            containers != start_containers
+            and len(containers) < len(start_containers)
+            and start_containers[: len(containers)] == containers
+            and not interrupts_paragraph
+        )
+        if (
+            containers != start_containers and not lazy_continuation
+        ) or interrupts_paragraph:
             return line_offsets[line_index]
     return paragraph_end
 
@@ -1366,18 +1390,13 @@ def markdown_active_image_label_ranges(
             and markdown_destination_end(text, cursor) is not None
         )
         if not active:
-            whitespace_end = markdown_inline_whitespace_end(text, cursor)
-            if whitespace_end is None:
-                reference_label = primary_label
+            if cursor < len(text) and text[cursor] == "[":
+                reference_end = markdown_label_end(text, cursor)
+                if reference_end is None:
+                    continue
+                reference_label = text[cursor + 1 : reference_end] or primary_label
             else:
-                cursor = whitespace_end
-                if cursor < len(text) and text[cursor] == "[":
-                    reference_end = markdown_label_end(text, cursor)
-                    if reference_end is None:
-                        continue
-                    reference_label = text[cursor + 1 : reference_end] or primary_label
-                else:
-                    reference_label = primary_label
+                reference_label = primary_label
             active = (
                 len(reference_label) <= MARKDOWN_REFERENCE_LABEL_MAX_LENGTH
                 and markdown_normalize_reference_label(reference_label)
@@ -1431,12 +1450,14 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
                 text, label_start, label_end, reference_labels
             ):
                 continue
-            targets.append((destination[0], True, is_image))
+            targets.append(
+                (markdown_restore_escaped_openers(destination[0]), True, is_image)
+            )
             inline_link_suffix_ranges.append((label_end + 1, destination[1] + 1))
 
     targets.extend(
         (
-            match.group("target"),
+            markdown_restore_escaped_openers(match.group("target")),
             True,
             reference_usages[label],
         )
@@ -1453,6 +1474,14 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         (target, False, True)
         for target in html_attribute_values(
             rendered_text, MARKDOWN_HTML_SRC_ATTRIBUTES
+        )
+    )
+    targets.extend(
+        (target, False, True)
+        for target in html_attribute_values(
+            rendered_text,
+            MARKDOWN_HTML_POSTER_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_POSTER_TAGS,
         )
     )
     return targets
@@ -1517,12 +1546,67 @@ def markdown_strip_inline_html_constructs(text: str) -> str:
     return "".join(result)
 
 
-def github_heading_slug(heading: str) -> str:
+def markdown_strip_active_reference_links(
+    text: str, reference_labels: set[str]
+) -> str:
+    """Keep rendered labels while removing only active full-reference markup."""
+
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        is_image = (
+            text.startswith("![", index)
+            and not markdown_character_is_escaped(text, index)
+        )
+        label_start = index + 1 if is_image else index
+        if (
+            label_start >= len(text)
+            or text[label_start] != "["
+            or markdown_character_is_escaped(text, label_start)
+        ):
+            result.append(text[index])
+            index += 1
+            continue
+
+        label_end = markdown_label_end(text, label_start)
+        reference_start = None if label_end is None else label_end + 1
+        if (
+            reference_start is None
+            or reference_start >= len(text)
+            or text[reference_start] != "["
+        ):
+            result.append(text[index])
+            index += 1
+            continue
+        reference_end = markdown_label_end(text, reference_start)
+        if reference_end is None:
+            result.append(text[index])
+            index += 1
+            continue
+
+        primary_label = text[label_start + 1 : label_end]
+        reference_label = text[reference_start + 1 : reference_end] or primary_label
+        if (
+            len(reference_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH
+            or markdown_normalize_reference_label(reference_label)
+            not in reference_labels
+        ):
+            result.append(text[index])
+            index += 1
+            continue
+
+        result.append(primary_label)
+        index = reference_end + 1
+    return "".join(result)
+
+
+def github_heading_slug(
+    heading: str, reference_labels: set[str] | None = None
+) -> str:
     """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
 
-    heading = markdown_protect_code_span_angles(heading)
-    heading = re.sub(r"!\[([^\]]*)\]\s*\[[^\]]*\]", r"\1", heading)
-    heading = re.sub(r"\[([^\]]+)\]\s*\[[^\]]*\]", r"\1", heading)
+    heading = markdown_render_code_spans(heading)
+    heading = markdown_strip_active_reference_links(heading, reference_labels or set())
     heading = markdown_strip_inline_link_destinations(heading)
     heading = MARKDOWN_AUTOLINK.sub(r"\1", heading)
     heading = markdown_strip_inline_html_constructs(heading)
@@ -1553,9 +1637,11 @@ def markdown_heading_fragments(text: str) -> set[str]:
     used_slugs: set[str] = set()
     setext_candidate: tuple[tuple[str, ...], list[str]] | None = None
 
+    reference_labels: set[str] = set()
+
     def add_heading(heading: str) -> None:
         heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading)
-        base = github_heading_slug(heading)
+        base = github_heading_slug(heading, reference_labels)
         if not base:
             return
         candidate = base
@@ -1582,6 +1668,10 @@ def markdown_heading_fragments(text: str) -> set[str]:
     structure_text = "\n".join(content for _, content in structure_containers)
     reference_definition_lines: set[int] = set()
     reference_definitions = markdown_reference_definitions(structure_text)
+    reference_labels.update(
+        markdown_normalize_reference_label(definition.group("label"))
+        for definition in reference_definitions
+    )
     for definition in reference_definitions:
         start_line = structure_text.count("\n", 0, definition.start())
         end_line = structure_text.count(
