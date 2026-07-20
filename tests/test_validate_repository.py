@@ -102,12 +102,17 @@ class LinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "README.md").write_text(
-                "---\ntitle: Hello World\n---\n\n[title](#title-hello-world)\n",
+                "---\n"
+                "title: Hello World\n"
+                'preview: <a id="frontmatter-anchor" href="missing.md">\n'
+                "---\n\n"
+                "[title](#title-hello-world)\n"
+                "[preview](#frontmatter-anchor)\n",
                 encoding="utf-8",
             )
             errors = validator.find_broken_links(root)
-            self.assertEqual(1, len(errors))
-            self.assertIn("broken Markdown fragment", errors[0])
+            self.assertEqual(2, len(errors))
+            self.assertTrue(all("broken Markdown fragment" in error for error in errors))
 
     def test_accepts_angle_bracketed_destination_with_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -137,6 +142,15 @@ class LinkTests(unittest.TestCase):
             (assets / "diagram(v2).png").write_bytes(b"diagram")
             (root / "README.md").write_text(
                 "[diagram](assets/diagram(v2).png)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_accepts_backslash_escaped_punctuation_in_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "asset(v2).md").write_text("asset\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[asset](asset\\(v2\\).md)\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
 
@@ -198,6 +212,49 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("#inline-anchor" in error for error in errors))
             self.assertTrue(any("#commented-anchor" in error for error in errors))
+
+    def test_excludes_commented_headings_but_keeps_inline_code_headings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Use `real`\n"
+                "<!--\n"
+                "# Removed section\n"
+                "Removed setext\n"
+                "---------------\n"
+                "-->\n"
+                "[real](#use-real)\n"
+                "[removed](#removed-section)\n"
+                "[setext](#removed-setext)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("#removed-section" in error for error in errors))
+            self.assertTrue(any("#removed-setext" in error for error in errors))
+
+    def test_validates_rendered_raw_html_targets_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / "assets"
+            assets.mkdir()
+            (root / "guide.md").write_text("guide\n", encoding="utf-8")
+            (assets / "diagram v2.png").write_bytes(b"diagram")
+            (root / "README.md").write_text(
+                '<a href="guide.md">guide</a>\n'
+                '<a href="">same page</a>\n'
+                '<img src="assets/diagram v2.png">\n'
+                '<a href="references/missing.md">missing</a>\n'
+                '<img src=assets/missing.png>\n'
+                '`<a href="inline-missing.md">`\n'
+                '<!-- <img src="commented-missing.png"> -->\n'
+                '\\<a href="escaped-missing.md">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("references/missing.md" in error for error in errors))
+            self.assertTrue(any("assets/missing.png" in error for error in errors))
 
     def test_rejects_skill_link_that_escapes_distributable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

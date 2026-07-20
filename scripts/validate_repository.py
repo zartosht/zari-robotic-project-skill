@@ -7,6 +7,7 @@ import argparse
 import math
 import re
 import sys
+from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -76,7 +77,18 @@ MARKDOWN_REFERENCE_DEFINITION = re.compile(
 MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
-MARKDOWN_HTML_ANCHOR = re.compile(r"\b(?:id|name)\s*=\s*(['\"])(.*?)\1", re.IGNORECASE)
+MARKDOWN_HTML_TAG = re.compile(r"<[A-Za-z][^<>]*>", re.DOTALL)
+MARKDOWN_HTML_ANCHOR = re.compile(
+    r"""(?<![\w:-])(?:id|name)\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
+    re.IGNORECASE | re.DOTALL,
+)
+MARKDOWN_HTML_TARGET = re.compile(
+    r"""(?<![\w:-])(?:href|src)\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
+    re.IGNORECASE | re.DOTALL,
+)
+MARKDOWN_BACKSLASH_ESCAPE = re.compile(
+    r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
+)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 
@@ -135,10 +147,23 @@ def markdown_files(root: Path) -> list[Path]:
     )
 
 
-def markdown_searchable_text(text: str) -> str:
+def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str:
     """Mask literal Markdown regions while preserving offsets and line structure."""
 
     characters = list(text)
+    lines_with_endings = text.splitlines(keepends=True)
+    if lines_with_endings and lines_with_endings[0].strip() == "---":
+        offset = len(lines_with_endings[0])
+        frontmatter_end = 0
+        for line in lines_with_endings[1:]:
+            offset += len(line)
+            if line.strip() in {"---", "..."}:
+                frontmatter_end = offset
+                break
+        for index in range(frontmatter_end):
+            if characters[index] not in "\r\n":
+                characters[index] = " "
+
     offset = 0
     fence_character: str | None = None
     fence_length = 0
@@ -165,7 +190,8 @@ def markdown_searchable_text(text: str) -> str:
                     characters[index] = " "
         offset += len(line)
 
-    masked = "".join(characters)
+    literal_characters = characters.copy()
+    masked = "".join(literal_characters)
     index = 0
     while index < len(masked):
         if masked[index] != "`":
@@ -192,10 +218,13 @@ def markdown_searchable_text(text: str) -> str:
             index = run_end
             continue
         for position in range(index, closing + len(delimiter)):
-            if characters[position] not in "\r\n":
-                characters[position] = " "
+            if literal_characters[position] not in "\r\n":
+                literal_characters[position] = " "
         index = closing + len(delimiter)
-        masked = "".join(characters)
+        masked = "".join(literal_characters)
+
+    if mask_inline_code:
+        characters = literal_characters.copy()
 
     for comment in re.finditer(r"<!--.*?(?:-->|$)", masked, re.DOTALL):
         for position in range(comment.start(), comment.end()):
@@ -203,7 +232,7 @@ def markdown_searchable_text(text: str) -> str:
                 characters[position] = " "
 
     for index, character in enumerate(characters):
-        if character != "[":
+        if character not in {"[", "<"}:
             continue
         preceding_backslashes = 0
         cursor = index - 1
@@ -214,6 +243,17 @@ def markdown_searchable_text(text: str) -> str:
             characters[index] = " "
 
     return "".join(characters)
+
+
+def html_attribute_values(text: str, pattern: re.Pattern[str]) -> list[str]:
+    """Collect matching HTML attribute values from rendered raw tags."""
+
+    values: list[str] = []
+    for tag in MARKDOWN_HTML_TAG.finditer(text):
+        for attribute in pattern.finditer(tag.group(0)):
+            value = attribute.group(2) if attribute.group(1) else attribute.group(3)
+            values.append(value)
+    return values
 
 
 def markdown_label_end(text: str, start: int) -> int | None:
@@ -274,11 +314,11 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
     return None
 
 
-def markdown_link_targets(text: str) -> list[str]:
-    """Extract inline and reference-style Markdown destinations."""
+def markdown_link_targets(text: str) -> list[tuple[str, bool]]:
+    """Extract Markdown and rendered raw-HTML destinations."""
 
     text = markdown_searchable_text(text)
-    targets: list[str] = []
+    targets: list[tuple[str, bool]] = []
     for label_start, character in enumerate(text):
         if character != "[":
             continue
@@ -287,9 +327,14 @@ def markdown_link_targets(text: str) -> list[str]:
             continue
         destination = markdown_destination_end(text, label_end + 1)
         if destination is not None:
-            targets.append(destination[0])
+            targets.append((destination[0], True))
 
-    targets.extend(MARKDOWN_REFERENCE_DEFINITION.findall(text))
+    targets.extend(
+        (target, True) for target in MARKDOWN_REFERENCE_DEFINITION.findall(text)
+    )
+    targets.extend(
+        (target, False) for target in html_attribute_values(text, MARKDOWN_HTML_TARGET)
+    )
     return targets
 
 
@@ -313,8 +358,6 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
     fragments: set[str] = set()
     used_slugs: set[str] = set()
-    fence_character: str | None = None
-    fence_length = 0
     setext_candidate: str | None = None
 
     def add_heading(heading: str) -> None:
@@ -331,7 +374,10 @@ def markdown_heading_fragments(text: str) -> set[str]:
         fragments.add(candidate)
 
     lines = text.splitlines()
-    searchable_lines = markdown_searchable_text(text).splitlines()
+    searchable_text = markdown_searchable_text(text)
+    structure_lines = markdown_searchable_text(text, mask_inline_code=False).splitlines()
+    for anchor in html_attribute_values(searchable_text, MARKDOWN_HTML_ANCHOR):
+        fragments.add(html_unescape(anchor))
     content_start = 0
     if lines and lines[0].strip() == "---":
         for line_index, line in enumerate(lines[1:], start=1):
@@ -340,36 +386,18 @@ def markdown_heading_fragments(text: str) -> set[str]:
                 break
 
     for line_index, line in enumerate(lines[content_start:], start=content_start):
-        if fence_character is None:
-            fence = MARKDOWN_FENCE_START.match(line)
-            if fence:
-                marker = fence.group(1)
-                fence_character = marker[0]
-                fence_length = len(marker)
-                setext_candidate = None
-                continue
-        else:
-            closing_fence = re.compile(
-                rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
-            )
-            if closing_fence.match(line):
-                fence_character = None
-                fence_length = 0
-            continue
-
-        for anchor in MARKDOWN_HTML_ANCHOR.finditer(searchable_lines[line_index]):
-            fragments.add(anchor.group(2))
-
-        atx_heading = MARKDOWN_ATX_HEADING.match(line)
+        structure_line = structure_lines[line_index]
+        atx_heading = MARKDOWN_ATX_HEADING.match(structure_line)
         if atx_heading:
-            add_heading(atx_heading.group(1))
+            raw_heading = MARKDOWN_ATX_HEADING.match(line)
+            add_heading(raw_heading.group(1) if raw_heading else atx_heading.group(1))
             setext_candidate = None
             continue
-        if MARKDOWN_SETEXT_HEADING.match(line) and setext_candidate:
+        if MARKDOWN_SETEXT_HEADING.match(structure_line) and setext_candidate:
             add_heading(setext_candidate)
             setext_candidate = None
             continue
-        setext_candidate = line.strip() or None
+        setext_candidate = line.strip() if structure_line.strip() else None
 
     return fragments
 
@@ -380,12 +408,15 @@ def find_broken_links(root: Path) -> list[str]:
     fragment_cache: dict[Path, set[str]] = {}
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
-        for raw_target in markdown_link_targets(text):
+        for raw_target, is_markdown in markdown_link_targets(text):
             target = raw_target.strip()
-            if target.startswith("<") and ">" in target:
-                target = target[1 : target.index(">")]
-            else:
-                target = target.split(maxsplit=1)[0]
+            if is_markdown:
+                if target.startswith("<") and ">" in target:
+                    target = target[1 : target.index(">")]
+                else:
+                    target = target.split(maxsplit=1)[0]
+                target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)
+            target = html_unescape(target)
             if not target or target.startswith("//") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)
