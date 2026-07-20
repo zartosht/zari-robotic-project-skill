@@ -108,8 +108,12 @@ MARKDOWN_HTML_ANCHOR = re.compile(
     r"""(?<![\w:-])(?:id|name)\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
     re.IGNORECASE | re.DOTALL,
 )
-MARKDOWN_HTML_TARGET = re.compile(
-    r"""(?<![\w:-])(?:href|src)\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
+MARKDOWN_HTML_HREF = re.compile(
+    r"""(?<![\w:-])href\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
+    re.IGNORECASE | re.DOTALL,
+)
+MARKDOWN_HTML_SRC = re.compile(
+    r"""(?<![\w:-])src\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
     re.IGNORECASE | re.DOTALL,
 )
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
@@ -117,6 +121,19 @@ MARKDOWN_BACKSLASH_ESCAPE = re.compile(
 )
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
+MARKDOWN_SUFFIXES = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".mdown",
+        ".mdtext",
+        ".mdtxt",
+        ".mdwn",
+        ".mkd",
+        ".mkdn",
+        ".mkdown",
+    }
+)
 PORTABLE_TEXT_SUFFIXES = frozenset(
     {
         ".cfg",
@@ -124,8 +141,6 @@ PORTABLE_TEXT_SUFFIXES = frozenset(
         ".ini",
         ".js",
         ".json",
-        ".md",
-        ".markdown",
         ".ps1",
         ".psm1",
         ".py",
@@ -136,7 +151,7 @@ PORTABLE_TEXT_SUFFIXES = frozenset(
         ".yaml",
         ".yml",
     }
-)
+) | MARKDOWN_SUFFIXES
 
 
 def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
@@ -218,7 +233,7 @@ def markdown_files(root: Path) -> list[Path]:
         for path in root.rglob("*")
         if path.is_file()
         and path_resolves_within(path, root)
-        and path.suffix.lower() in {".md", ".markdown"}
+        and path.suffix.lower() in MARKDOWN_SUFFIXES
         and not is_ignored_repository_path(path, root)
     )
 
@@ -306,6 +321,60 @@ def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], st
             active_list_parent = None
 
     return normalized
+
+
+def markdown_fence_container_spec(
+    line: str, containers: tuple[str, ...], content: str
+) -> tuple[tuple[str, int], ...] | None:
+    """Record how each opening container consumes its raw line prefix."""
+
+    prefix_end = len(line) - len(content)
+    cursor = 0
+    spec: list[tuple[str, int]] = []
+    for container in containers:
+        remaining = line[cursor:]
+        if container == "blockquote":
+            blockquote = MARKDOWN_BLOCKQUOTE_PREFIX.match(remaining)
+            if not blockquote:
+                return None
+            cursor += blockquote.end()
+            spec.append((container, 0))
+            continue
+        list_item = MARKDOWN_LIST_PREFIX.match(remaining)
+        if list_item:
+            indent = markdown_list_prefix_end(list_item)
+        else:
+            leading_spaces = len(remaining) - len(remaining.lstrip(" "))
+            indent = min(leading_spaces, prefix_end - cursor)
+        if indent <= 0:
+            return None
+        cursor += indent
+        spec.append((container, indent))
+    return tuple(spec) if cursor == prefix_end else None
+
+
+def markdown_fence_container_content(
+    line: str, spec: tuple[tuple[str, int], ...]
+) -> str | None:
+    """Return fence content after only its opening containers are removed."""
+
+    content = line
+    for index, (container, indent) in enumerate(spec):
+        if container == "blockquote":
+            blockquote = MARKDOWN_BLOCKQUOTE_PREFIX.match(content)
+            if not blockquote:
+                return None
+            content = content[blockquote.end() :]
+            continue
+        if not content.strip():
+            if any(kind == "blockquote" for kind, _ in spec[index + 1 :]):
+                return None
+            return ""
+        leading_spaces = len(content) - len(content.lstrip(" "))
+        if leading_spaces < indent:
+            return None
+        content = content[indent:]
+    return content
 
 
 def markdown_fence_opening(content: str) -> re.Match[str] | None:
@@ -451,20 +520,31 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
     offset = 0
     fence_character: str | None = None
     fence_length = 0
+    fence_container_spec: tuple[tuple[str, int], ...] = ()
     open_paragraph_containers: tuple[str, ...] | None = None
 
     container_lines = markdown_container_lines(
         [line.rstrip("\r\n") for line in lines_with_endings]
     )
     for line, (containers, container_content) in zip(lines_with_endings, container_lines):
+        line_body = line.rstrip("\r\n")
         indented_candidate = MARKDOWN_INDENTED_CODE.match(container_content) is not None
         indented_code = (
             indented_candidate
             and (
                 open_paragraph_containers != containers
-                or markdown_line_starts_list_item(line.rstrip("\r\n"))
+                or markdown_line_starts_list_item(line_body)
             )
         )
+        active_fence_content: str | None = None
+        if fence_character is not None:
+            active_fence_content = markdown_fence_container_content(
+                line_body, fence_container_spec
+            )
+            if active_fence_content is None:
+                fence_character = None
+                fence_length = 0
+                fence_container_spec = ()
         fence_line = fence_character is not None
         if fence_character is None:
             match = None if indented_code else markdown_fence_opening(container_content)
@@ -472,14 +552,20 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
                 fence = match.group(1)
                 fence_character = fence[0]
                 fence_length = len(fence)
+                fence_container_spec = markdown_fence_container_spec(
+                    line_body, containers, container_content
+                ) or ()
                 fence_line = True
         else:
             closing_fence = re.compile(
                 rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
             )
-            if closing_fence.match(container_content):
+            if active_fence_content is not None and closing_fence.match(
+                active_fence_content
+            ):
                 fence_character = None
                 fence_length = 0
+                fence_container_spec = ()
 
         literal_block = indented_code or fence_line
         if literal_block:
@@ -784,7 +870,7 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
 
 
 def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
-    """Extract Markdown and rendered raw-HTML destinations."""
+    """Extract destinations and whether they require Markdown parsing or a file."""
 
     rendered_text = markdown_searchable_text(text)
     markdown_characters = list(rendered_text)
@@ -836,7 +922,11 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     )
     targets.extend(
         (target, False, False)
-        for target in html_attribute_values(rendered_text, MARKDOWN_HTML_TARGET)
+        for target in html_attribute_values(rendered_text, MARKDOWN_HTML_HREF)
+    )
+    targets.extend(
+        (target, False, True)
+        for target in html_attribute_values(rendered_text, MARKDOWN_HTML_SRC)
     )
     return targets
 
@@ -938,7 +1028,7 @@ def find_broken_links(root: Path) -> list[str]:
     fragment_cache: dict[Path, set[str]] = {}
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
-        for raw_target, is_markdown, is_image in markdown_link_targets(text):
+        for raw_target, is_markdown, requires_file in markdown_link_targets(text):
             target = raw_target.strip()
             if not target:
                 continue
@@ -981,12 +1071,16 @@ def find_broken_links(root: Path) -> list[str]:
             if not resolved.exists():
                 errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
                 continue
-            if is_image and not resolved.is_file():
+            if requires_file and not resolved.is_file():
                 errors.append(
-                    f"{path.relative_to(root)}: image target is not a file {raw_target!r}"
+                    f"{path.relative_to(root)}: resource target is not a file {raw_target!r}"
                 )
                 continue
-            if fragment and resolved.is_file() and resolved.suffix.lower() in {".md", ".markdown"}:
+            if (
+                fragment
+                and resolved.is_file()
+                and resolved.suffix.lower() in MARKDOWN_SUFFIXES
+            ):
                 if resolved not in fragment_cache:
                     fragment_cache[resolved] = markdown_heading_fragments(
                         resolved.read_text(encoding="utf-8")

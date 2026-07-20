@@ -351,7 +351,7 @@ class LinkTests(unittest.TestCase):
             )
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
-            self.assertIn("image target is not a file", errors[0])
+            self.assertIn("resource target is not a file", errors[0])
 
     def test_rejects_reference_image_targeting_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -362,7 +362,7 @@ class LinkTests(unittest.TestCase):
             )
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
-            self.assertIn("image target is not a file", errors[0])
+            self.assertIn("resource target is not a file", errors[0])
 
     def test_scans_common_markdown_filename_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -370,6 +370,17 @@ class LinkTests(unittest.TestCase):
             (root / "GUIDE.MD").write_text("[missing](first.md)\n", encoding="utf-8")
             (root / "notes.markdown").write_text("[missing](second.md)\n", encoding="utf-8")
             self.assertEqual(2, len(validator.find_broken_links(root)))
+
+    def test_scans_additional_markdown_filename_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, suffix in enumerate(
+                (".mdown", ".mkd", ".mkdn", ".mkdown"), start=1
+            ):
+                (root / f"guide{suffix}").write_text(
+                    f"[missing](missing-{index}.md)\n", encoding="utf-8"
+                )
+            self.assertEqual(4, len(validator.find_broken_links(root)))
 
     def test_ignores_literal_markdown_link_examples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -392,6 +403,41 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_scopes_fenced_code_blocks_to_their_container(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> ```\n"
+                "> code\n"
+                "```\n"
+                "[literal](missing.md)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_keeps_nested_marker_text_inside_blockquote_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> ```\n"
+                "> > ```\n"
+                "> [literal](missing.md)\n"
+                "> ```\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_tracks_interleaved_list_and_blockquote_fence_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "- > ```\n"
+                "  > [literal](missing.md)\n"
+                "  > ```\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_ignores_deactivated_outer_link_opener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -539,6 +585,20 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("references/missing.md" in error for error in errors))
             self.assertTrue(any("assets/missing.png" in error for error in errors))
+
+    def test_rejects_raw_html_src_targeting_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "assets").mkdir()
+            (root / "scripts").mkdir()
+            (root / "README.md").write_text(
+                '<img src="assets/">\n'
+                '<script src="scripts/"></script>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(all("target is not a file" in error for error in errors))
 
     def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
