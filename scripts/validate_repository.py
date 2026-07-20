@@ -92,6 +92,9 @@ MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}| {0,3}\t)")
 MARKDOWN_FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
+MARKDOWN_THEMATIC_BREAK = re.compile(
+    r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$"
+)
 MARKDOWN_HTML_TAG = re.compile(
     r'''<[A-Za-z](?:[^<>"']|"[^"]*"|'[^']*')*>''', re.DOTALL
 )
@@ -106,8 +109,13 @@ MARKDOWN_RAW_HTML_TYPE_6 = re.compile(
     r"section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[\s/>]|\Z)",
     re.IGNORECASE,
 )
+MARKDOWN_HTML_ATTRIBUTE_NAME = r"[A-Za-z_:][A-Za-z0-9_.:-]*"
+MARKDOWN_HTML_ATTRIBUTE_VALUE = r'''(?:[^\s"'=<>`]+|"[^"]*"|'[^']*')'''
 MARKDOWN_RAW_HTML_TYPE_7 = re.compile(
-    r"^[ \t]{0,3}</?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^<>]*)?[ \t]*/?>[ \t]*$"
+    rf"^[ \t]{{0,3}}(?:"
+    rf"<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+{MARKDOWN_HTML_ATTRIBUTE_NAME}"
+    rf"(?:[ \t]*=[ \t]*{MARKDOWN_HTML_ATTRIBUTE_VALUE})?)*[ \t]*/?>|"
+    rf"</[A-Za-z][A-Za-z0-9-]*[ \t]*>)[ \t]*$"
 )
 MARKDOWN_CODE_SPAN_LT = "\ue000"
 MARKDOWN_CODE_SPAN_GT = "\ue001"
@@ -122,6 +130,10 @@ MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
+MARKDOWN_CHARACTER_REFERENCE = re.compile(
+    r"&(?:#[xX][0-9A-Fa-f]{1,8}|#[0-9]{1,8}|[A-Za-z][A-Za-z0-9]{1,31});"
+)
+MARKDOWN_PARAGRAPH_BOUNDARY = re.compile(r"(?:\r\n?|\n)[ \t]*(?:\r\n?|\n)")
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 MARKDOWN_SUFFIXES = frozenset(
@@ -528,6 +540,7 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
             elif (
                 MARKDOWN_ATX_HEADING.match(content)
                 or MARKDOWN_SETEXT_HEADING.match(content)
+                or MARKDOWN_THEMATIC_BREAK.match(content)
             ):
                 open_paragraph_containers = None
             else:
@@ -617,6 +630,7 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             or literal_block
             or MARKDOWN_ATX_HEADING.match(container_content)
             or MARKDOWN_SETEXT_HEADING.match(container_content)
+            or MARKDOWN_THEMATIC_BREAK.match(container_content)
         ):
             open_paragraph_containers = None
         else:
@@ -640,9 +654,10 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             run_end += 1
         delimiter = masked[index:run_end]
         search_from = run_end
+        paragraph_end = markdown_paragraph_end(masked, index)
         closing = -1
         while True:
-            candidate = masked.find(delimiter, search_from)
+            candidate = masked.find(delimiter, search_from, paragraph_end)
             if candidate == -1:
                 break
             before_is_tick = candidate > 0 and masked[candidate - 1] == "`"
@@ -664,7 +679,17 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
     if mask_inline_code:
         characters = literal_characters.copy()
 
-    for comment in re.finditer(r"<!--.*?(?:-->|$)", masked, re.DOTALL):
+    comment_characters = list(masked)
+    for tag in MARKDOWN_HTML_TAG.finditer(masked):
+        if markdown_character_is_escaped(masked, tag.start()):
+            continue
+        for position in range(*tag.span()):
+            if comment_characters[position] not in "\r\n":
+                comment_characters[position] = " "
+    comment_search_text = "".join(comment_characters)
+    for comment in re.finditer(
+        r"<!--.*?(?:-->|$)", comment_search_text, re.DOTALL
+    ):
         if markdown_character_is_escaped(masked, comment.start()):
             continue
         for position in range(comment.start(), comment.end()):
@@ -696,11 +721,26 @@ def markdown_character_is_escaped(text: str, index: int) -> bool:
     return preceding_backslashes % 2 == 1
 
 
+def markdown_paragraph_end(text: str, start: int) -> int:
+    """Return the first blank-line boundary after an inline construct."""
+
+    boundary = MARKDOWN_PARAGRAPH_BOUNDARY.search(text, start)
+    return len(text) if boundary is None else boundary.start()
+
+
+def markdown_unescape(text: str) -> str:
+    """Decode only semicolon-terminated CommonMark character references."""
+
+    return MARKDOWN_CHARACTER_REFERENCE.sub(
+        lambda match: html_unescape(match.group(0)), text
+    )
+
+
 def markdown_normalize_reference_label(label: str) -> str:
     """Normalize a reference label for case-insensitive CommonMark matching."""
 
     label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", label)
-    return " ".join(html_unescape(label).split()).casefold()
+    return " ".join(markdown_unescape(label).split()).casefold()
 
 
 def markdown_inline_whitespace_end(
@@ -728,6 +768,39 @@ def markdown_inline_whitespace_end(
         if line_endings > 1:
             return None
     return index
+
+
+def markdown_reference_definitions(
+    text: str,
+) -> list[re.Match[str]]:
+    """Return definitions that occur where a new Markdown block may begin."""
+
+    lines = text.splitlines()
+    container_lines = markdown_container_lines(lines)
+    container_text = "\n".join(content for _, content in container_lines)
+    definitions: list[re.Match[str]] = []
+    for match in MARKDOWN_REFERENCE_DEFINITION.finditer(container_text):
+        line_index = container_text.count("\n", 0, match.start())
+        containers, _ = container_lines[line_index]
+        if line_index == 0:
+            definitions.append(match)
+            continue
+
+        previous_containers, previous_content = container_lines[line_index - 1]
+        begins_list_item = markdown_line_starts_list_item(lines[line_index])
+        previous_ends_block = (
+            not previous_content.strip()
+            or MARKDOWN_ATX_HEADING.match(previous_content) is not None
+            or MARKDOWN_SETEXT_HEADING.match(previous_content) is not None
+            or MARKDOWN_THEMATIC_BREAK.match(previous_content) is not None
+        )
+        if (
+            containers != previous_containers
+            or begins_list_item
+            or previous_ends_block
+        ):
+            definitions.append(match)
+    return definitions
 
 
 def markdown_reference_usages(
@@ -852,14 +925,17 @@ def markdown_protect_code_span_angles(text: str) -> str:
         while run_end < len(text) and text[run_end] == "`":
             run_end += 1
         delimiter = text[index:run_end]
-        closing = text.find(delimiter, run_end)
+        paragraph_end = markdown_paragraph_end(text, index)
+        closing = text.find(delimiter, run_end, paragraph_end)
         while closing >= 0:
             before_is_tick = closing > 0 and text[closing - 1] == "`"
             after = closing + len(delimiter)
             after_is_tick = after < len(text) and text[after] == "`"
             if not before_is_tick and not after_is_tick:
                 break
-            closing = text.find(delimiter, closing + len(delimiter))
+            closing = text.find(
+                delimiter, closing + len(delimiter), paragraph_end
+            )
         if closing < 0:
             index = run_end
             continue
@@ -944,7 +1020,8 @@ def markdown_label_end(text: str, start: int) -> int | None:
 
     depth = 1
     index = start + 1
-    while index < len(text):
+    paragraph_end = markdown_paragraph_end(text, start)
+    while index < paragraph_end:
         character = text[index]
         if character == "\\":
             index += 2
@@ -1088,12 +1165,7 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
             if markdown_characters[position] not in "\r\n":
                 markdown_characters[position] = " "
     text = "".join(markdown_characters)
-    container_text = "\n".join(
-        content for _, content in markdown_container_lines(text.splitlines())
-    )
-    reference_definitions = list(
-        MARKDOWN_REFERENCE_DEFINITION.finditer(container_text)
-    )
+    reference_definitions = markdown_reference_definitions(text)
     first_reference_definitions: dict[str, re.Match[str]] = {}
     for match in reference_definitions:
         label = markdown_normalize_reference_label(match.group("label"))
@@ -1164,7 +1236,7 @@ def github_heading_slug(heading: str) -> str:
     heading = heading.replace(MARKDOWN_CODE_SPAN_LT, "<").replace(
         MARKDOWN_CODE_SPAN_GT, ">"
     )
-    heading = html_unescape(heading)
+    heading = markdown_unescape(heading)
     heading = re.sub(
         r"(?<![\w\\])(?P<delimiter>_{1,2})(?=\S)(?P<content>.+?\S)"
         r"(?P=delimiter)(?!\w)",
@@ -1207,7 +1279,8 @@ def markdown_heading_fragments(text: str) -> set[str]:
     raw_containers = markdown_container_lines(lines)
     structure_text = "\n".join(content for _, content in structure_containers)
     reference_definition_lines: set[int] = set()
-    for definition in MARKDOWN_REFERENCE_DEFINITION.finditer(structure_text):
+    reference_definitions = markdown_reference_definitions(structure_text)
+    for definition in reference_definitions:
         start_line = structure_text.count("\n", 0, definition.start())
         end_line = structure_text.count(
             "\n", 0, max(definition.start(), definition.end() - 1)
@@ -1288,7 +1361,9 @@ def find_broken_links(root: Path) -> list[str]:
                 else:
                     target = target.split(maxsplit=1)[0]
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)
-            target = html_unescape(target)
+            target = (
+                markdown_unescape(target) if is_markdown else html_unescape(target)
+            )
             if not target or target.startswith("/") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)
