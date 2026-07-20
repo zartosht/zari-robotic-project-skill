@@ -80,8 +80,10 @@ MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n])+)\]:[ \t]*"
     r"(?:\n[ \t]{1,3})?"
     r"(?P<target><(?:\\.|[^<>\\\n])+>|(?:\\.|[^\s\\])+)"
-    r"(?:[ \t]+(?:\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|"
-    r"\((?:\\.|[^()\\\n])*\)))?[ \t]*(?=\n|$)"
+    r"(?:(?:[ \t]+|\n[ \t]{0,3})(?:"
+    r"\"(?:\\.|[^\"\\\n]|\n(?=[ \t]*\S))*\"|"
+    r"'(?:\\.|[^'\\\n]|\n(?=[ \t]*\S))*'|"
+    r"\((?:\\.|[^()\\\n]|\n(?=[ \t]*\S))*\)))?[ \t]*(?=\n|$)"
 )
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
@@ -487,23 +489,23 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
 
         if type_1:
             raw_container_end = container_end(line_index, containers)
-            opening_tag = MARKDOWN_HTML_TAG.search(
-                text, content_start + type_1.start(), raw_container_end
+            tag_start = content_start + len(content) - len(content.lstrip(" \t"))
+            opening_tag = MARKDOWN_HTML_TAG.match(
+                text, tag_start, raw_container_end
             )
             closing = re.compile(
                 rf"</{re.escape(type_1.group('tag'))}[ \t]*>", re.IGNORECASE
             )
+            closing_match = closing.search(
+                text,
+                opening_tag.end() if opening_tag else content_start + type_1.end(),
+                raw_container_end,
+            )
+            raw_end = closing_match.end() if closing_match else raw_container_end
+            skip_until = line_end_after(raw_end, raw_container_end)
             if opening_tag is None:
-                mask(content_start, raw_container_end)
-                skip_until = raw_container_end
+                mask(content_start, skip_until)
             else:
-                closing_match = closing.search(
-                    text, opening_tag.end(), raw_container_end
-                )
-                raw_end = (
-                    closing_match.end() if closing_match else raw_container_end
-                )
-                skip_until = line_end_after(raw_end, raw_container_end)
                 mask(opening_tag.end(), skip_until)
             open_paragraph_containers = None
         elif special_end:
@@ -531,7 +533,7 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
                 opening_tag = MARKDOWN_HTML_TAG.match(
                     text, tag_start, raw_container_end
                 )
-                body_start = opening_tag.end() if opening_tag else content_end
+                body_start = opening_tag.end() if opening_tag else content_start
                 blank_block_start = body_start
                 blank_block_end = raw_container_end
                 open_paragraph_containers = None
@@ -625,9 +627,22 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
                 if characters[index] not in "\r\n":
                     characters[index] = " "
 
+        stripped_content = container_content.lstrip(" \t")
+        type_7_block = (
+            open_paragraph_containers != containers
+            and MARKDOWN_RAW_HTML_TYPE_7.match(container_content) is not None
+        )
+        raw_html_block = (
+            MARKDOWN_RAW_HTML_TYPE_1.match(container_content) is not None
+            or MARKDOWN_RAW_HTML_TYPE_6.match(container_content) is not None
+            or type_7_block
+            or stripped_content.startswith(("<!--", "<?", "<![CDATA["))
+            or re.match(r"<![A-Z]", stripped_content) is not None
+        )
         if (
             not container_content.strip()
             or literal_block
+            or raw_html_block
             or MARKDOWN_ATX_HEADING.match(container_content)
             or MARKDOWN_SETEXT_HEADING.match(container_content)
             or MARKDOWN_THEMATIC_BREAK.match(container_content)
@@ -728,6 +743,22 @@ def markdown_paragraph_end(text: str, start: int) -> int:
     return len(text) if boundary is None else boundary.start()
 
 
+def markdown_html_tag_is_rendered(text: str, tag: re.Match[str]) -> bool:
+    """Return whether an HTML tag is inline or a type-1 raw-block opener."""
+
+    if tag.end() <= markdown_paragraph_end(text, tag.start()):
+        return True
+
+    line_start = max(
+        text.rfind("\n", 0, tag.start()), text.rfind("\r", 0, tag.start())
+    )
+    line_start += 1
+    type_1 = MARKDOWN_RAW_HTML_TYPE_1.match(text[line_start:])
+    if type_1 is None:
+        return False
+    return line_start + type_1.group(0).find("<") == tag.start()
+
+
 def markdown_unescape(text: str) -> str:
     """Decode only semicolon-terminated CommonMark character references."""
 
@@ -780,6 +811,11 @@ def markdown_reference_definitions(
     container_text = "\n".join(content for _, content in container_lines)
     definitions: list[re.Match[str]] = []
     for match in MARKDOWN_REFERENCE_DEFINITION.finditer(container_text):
+        target = match.group("target")
+        if not target.startswith("<") and not markdown_bare_destination_is_balanced(
+            target
+        ):
+            continue
         line_index = container_text.count("\n", 0, match.start())
         containers, _ = container_lines[line_index]
         if line_index == 0:
@@ -801,6 +837,26 @@ def markdown_reference_definitions(
         ):
             definitions.append(match)
     return definitions
+
+
+def markdown_bare_destination_is_balanced(destination: str) -> bool:
+    """Return whether a bare destination has balanced unescaped parentheses."""
+
+    depth = 0
+    index = 0
+    while index < len(destination):
+        character = destination[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+        index += 1
+    return depth == 0
 
 
 def markdown_reference_usages(
@@ -863,9 +919,23 @@ def markdown_label_contains_active_link(
 ) -> bool:
     """Return whether a link label contains a nested link that deactivates it."""
 
+    bracket_stack: list[int] = []
+    closing_brackets: dict[int, int] = {}
     index = label_start + 1
     while index < label_end:
-        if text[index] != "[" or markdown_character_is_escaped(text, index):
+        if markdown_character_is_escaped(text, index):
+            index += 1
+            continue
+        if text[index] == "[":
+            bracket_stack.append(index)
+        elif text[index] == "]" and bracket_stack:
+            closing_brackets[bracket_stack.pop()] = index
+        index += 1
+
+    index = label_start + 1
+    while index < label_end:
+        nested_end = closing_brackets.get(index)
+        if nested_end is None:
             index += 1
             continue
         is_image = (
@@ -873,17 +943,9 @@ def markdown_label_contains_active_link(
             and text[index - 1] == "!"
             and not markdown_character_is_escaped(text, index - 1)
         )
-        nested_end = markdown_label_end(text, index)
-        if nested_end is None or nested_end > label_end:
-            index += 1
-            continue
         if is_image:
             index = nested_end + 1
             continue
-        if markdown_label_contains_active_link(
-            text, index, nested_end, reference_labels
-        ):
-            return True
 
         cursor = nested_end + 1
         if cursor < label_end and text[cursor] == "(":
@@ -908,7 +970,7 @@ def markdown_label_contains_active_link(
             in reference_labels
         ):
             return True
-        index = nested_end + 1
+        index += 1
     return False
 
 
@@ -958,6 +1020,8 @@ def html_attribute_values(
 
     values: list[str] = []
     for tag_match in MARKDOWN_HTML_TAG.finditer(text):
+        if not markdown_html_tag_is_rendered(text, tag_match):
+            continue
         tag = tag_match.group(0)
         index = 1
         while index < len(tag) and (tag[index].isalnum() or tag[index] in {"-", ":"}):
@@ -1041,12 +1105,13 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
 
     start = opening + 1
     index = start
-    if index >= len(text):
+    paragraph_end = markdown_paragraph_end(text, opening)
+    if index >= paragraph_end:
         return None
 
     if text[index] == "<":
         index += 1
-        while index < len(text):
+        while index < paragraph_end:
             character = text[index]
             if character == "\\":
                 index += 2
@@ -1061,7 +1126,7 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
             return None
     else:
         depth = 0
-        while index < len(text):
+        while index < paragraph_end:
             character = text[index]
             if character == "\\":
                 index += 2
@@ -1078,8 +1143,8 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
 
     destination_end = index
     separator_start = index
-    whitespace_end = markdown_inline_whitespace_end(text, index)
-    if whitespace_end is None or whitespace_end >= len(text):
+    whitespace_end = markdown_inline_whitespace_end(text, index, paragraph_end)
+    if whitespace_end is None or whitespace_end >= paragraph_end:
         return None
     index = whitespace_end
     if text[index] == ")":
@@ -1089,7 +1154,7 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
 
     title_closer = ")" if text[index] == "(" else text[index]
     index += 1
-    while index < len(text):
+    while index < paragraph_end:
         character = text[index]
         if character == "\\":
             index += 2
@@ -1101,8 +1166,8 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
     else:
         return None
 
-    whitespace_end = markdown_inline_whitespace_end(text, index)
-    if whitespace_end is None or whitespace_end >= len(text):
+    whitespace_end = markdown_inline_whitespace_end(text, index, paragraph_end)
+    if whitespace_end is None or whitespace_end >= paragraph_end:
         return None
     index = whitespace_end
     if text[index] != ")":
@@ -1161,6 +1226,8 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     rendered_text = markdown_searchable_text(text)
     markdown_characters = list(rendered_text)
     for tag in MARKDOWN_HTML_TAG.finditer(rendered_text):
+        if not markdown_html_tag_is_rendered(rendered_text, tag):
+            continue
         for position in range(*tag.span()):
             if markdown_characters[position] not in "\r\n":
                 markdown_characters[position] = " "
@@ -1244,12 +1311,13 @@ def github_heading_slug(heading: str) -> str:
         heading,
     )
     heading = re.sub(r"[*~`]", "", heading).lower()
+    heading = re.sub(r"\s", "-", heading)
     characters = [
         character
         for character in heading
-        if character.isalnum() or character in {"-", "_"} or character.isspace()
+        if character.isalnum() or character in {"-", "_"}
     ]
-    return re.sub(r"\s", "-", "".join(characters).strip())
+    return "".join(characters)
 
 
 def markdown_heading_fragments(text: str) -> set[str]:
