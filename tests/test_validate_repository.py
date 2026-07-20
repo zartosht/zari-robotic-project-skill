@@ -120,6 +120,15 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_tab_separator_before_link_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                '[guide](guide.md\t"Guide")\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_destination_with_balanced_parentheses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -172,6 +181,23 @@ class LinkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_literal_and_commented_html_anchor_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<a id="real-anchor"></a>\n'
+                '`<a id="inline-anchor"></a>`\n'
+                '<!-- <a id="commented-anchor"></a> -->\n'
+                '[real](#real-anchor)\n'
+                '[inline](#inline-anchor)\n'
+                '[commented](#commented-anchor)\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("#inline-anchor" in error for error in errors))
+            self.assertTrue(any("#commented-anchor" in error for error in errors))
 
     def test_rejects_skill_link_that_escapes_distributable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

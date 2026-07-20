@@ -197,6 +197,11 @@ def markdown_searchable_text(text: str) -> str:
         index = closing + len(delimiter)
         masked = "".join(characters)
 
+    for comment in re.finditer(r"<!--.*?(?:-->|$)", masked, re.DOTALL):
+        for position in range(comment.start(), comment.end()):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+
     for index, character in enumerate(characters):
         if character != "[":
             continue
@@ -326,6 +331,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
         fragments.add(candidate)
 
     lines = text.splitlines()
+    searchable_lines = markdown_searchable_text(text).splitlines()
     content_start = 0
     if lines and lines[0].strip() == "---":
         for line_index, line in enumerate(lines[1:], start=1):
@@ -333,7 +339,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
                 content_start = line_index + 1
                 break
 
-    for line in lines[content_start:]:
+    for line_index, line in enumerate(lines[content_start:], start=content_start):
         if fence_character is None:
             fence = MARKDOWN_FENCE_START.match(line)
             if fence:
@@ -351,7 +357,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
                 fence_length = 0
             continue
 
-        for anchor in MARKDOWN_HTML_ANCHOR.finditer(line):
+        for anchor in MARKDOWN_HTML_ANCHOR.finditer(searchable_lines[line_index]):
             fragments.add(anchor.group(2))
 
         atx_heading = MARKDOWN_ATX_HEADING.match(line)
@@ -379,7 +385,7 @@ def find_broken_links(root: Path) -> list[str]:
             if target.startswith("<") and ">" in target:
                 target = target[1 : target.index(">")]
             else:
-                target = target.split(" ", 1)[0]
+                target = target.split(maxsplit=1)[0]
             if not target or target.startswith("//") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)
