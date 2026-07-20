@@ -98,6 +98,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(all("broken Markdown fragment" in error for error in errors))
 
+    def test_does_not_generate_heading_fragments_from_yaml_frontmatter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "---\ntitle: Hello World\n---\n\n[title](#title-hello-world)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("broken Markdown fragment", errors[0])
+
     def test_accepts_angle_bracketed_destination_with_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -241,6 +252,18 @@ class PortabilityTests(unittest.TestCase):
                     self.assertEqual(1, len(errors))
                     self.assertIn("machine-specific Linux path", errors[0])
 
+    def test_detects_canonical_windows_user_home_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            (root / "assets").mkdir()
+            (root / "SKILL.md").write_text(
+                r"Open C:\Users\alice\robot-project." + "\n", encoding="utf-8"
+            )
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("machine-specific Windows path", errors[0])
+
 
 class SecretTests(unittest.TestCase):
     def test_detects_fine_grained_github_token_shape(self) -> None:
@@ -258,6 +281,17 @@ class SecretTests(unittest.TestCase):
             root = Path(directory)
             (root / "config.txt").write_text("GITHUB_TOKEN is provided by CI.\n", encoding="utf-8")
             self.assertEqual([], validator.find_secret_like_content(root))
+
+    def test_ignores_local_credentials_but_scans_env_example(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = "github_" + "pat_1234567890abcdefghijklmnop"
+            for filename in (".env", ".env.local", "private.pem", "private.key"):
+                (root / filename).write_text(f"token={token}\n", encoding="utf-8")
+            (root / ".env.example").write_text(f"token={token}\n", encoding="utf-8")
+            errors = validator.find_secret_like_content(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn(".env.example", errors[0])
 
 
 class ResourceTests(unittest.TestCase):

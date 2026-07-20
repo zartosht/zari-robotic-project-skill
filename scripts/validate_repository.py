@@ -53,7 +53,7 @@ PORTABILITY_PATTERNS = {
     "client-specific user-input tool": re.compile(r"\b(?:request_user_input|get_user_input)\b"),
     "machine-specific macOS path": re.compile(r"/Users/[^/\s]+/"),
     "machine-specific Linux path": re.compile(r"(?:/home/[^/\s]+/|/root/)"),
-    "machine-specific Windows path": re.compile(r"[A-Za-z]:\\\\Users\\\\"),
+    "machine-specific Windows path": re.compile(r"[A-Za-z]:\\Users\\", re.IGNORECASE),
     "shell-specific preapproval syntax": re.compile(r"\bBash\([^\n]*\)"),
 }
 
@@ -325,7 +325,15 @@ def markdown_heading_fragments(text: str) -> set[str]:
         used_slugs.add(candidate)
         fragments.add(candidate)
 
-    for line in text.splitlines():
+    lines = text.splitlines()
+    content_start = 0
+    if lines and lines[0].strip() == "---":
+        for line_index, line in enumerate(lines[1:], start=1):
+            if line.strip() in {"---", "..."}:
+                content_start = line_index + 1
+                break
+
+    for line in lines[content_start:]:
         if fence_character is None:
             fence = MARKDOWN_FENCE_START.match(line)
             if fence:
@@ -424,7 +432,9 @@ def find_secret_like_content(root: Path) -> list[str]:
     for path in sorted(
         path
         for path in root.rglob("*")
-        if path.is_file() and not is_ignored_repository_path(path, root)
+        if path.is_file()
+        and not is_ignored_repository_path(path, root)
+        and not is_ignored_secret_file(path)
     ):
         try:
             text = path.read_text(encoding="utf-8")
@@ -434,6 +444,17 @@ def find_secret_like_content(root: Path) -> list[str]:
             if pattern.search(text):
                 errors.append(f"{path.relative_to(root)}: possible {label}")
     return errors
+
+
+def is_ignored_secret_file(path: Path) -> bool:
+    """Return whether a local credential file is explicitly excluded from version control."""
+
+    name = path.name
+    return (
+        name == ".env"
+        or (name.startswith(".env.") and name != ".env.example")
+        or path.suffix.lower() in {".key", ".pem"}
+    )
 
 
 def find_empty_resources(root: Path) -> list[str]:
