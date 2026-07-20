@@ -112,6 +112,34 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#a-amp-b", errors[0])
 
+    def test_preserves_visible_autolinks_in_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# See <https://example.com>\n"
+                "[rendered](#see-httpsexamplecom)\n"
+                "[wrong](#see)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertTrue(errors[0].endswith("in '#see'"))
+
+    def test_accumulates_multiline_setext_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "First line\n"
+                "second line\n"
+                "-----------\n"
+                "[rendered](#first-line-second-line)\n"
+                "[wrong](#second-line)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#second-line", errors[0])
+
     def test_strips_reference_style_markup_from_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -259,6 +287,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("quoted-missing.md" in error for error in errors))
             self.assertTrue(any("listed-missing.md" in error for error in errors))
+
+    def test_reports_reference_destination_continued_on_next_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide][docs]\n"
+                "[docs]:\n"
+                "  references/missing.md\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("references/missing.md", errors[0])
 
     def test_reports_missing_outer_link_around_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -421,6 +462,22 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("references/missing.md" in error for error in errors))
             self.assertTrue(any("assets/missing.png" in error for error in errors))
+
+    def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "script.js").write_text("script\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                '<script src="script.js">\n'
+                'const example = "[example](missing.md)";\n'
+                "# Hidden heading\n"
+                "</script>\n"
+                "[hidden](#hidden-heading)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#hidden-heading", errors[0])
 
     def test_rejects_skill_link_that_escapes_distributable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

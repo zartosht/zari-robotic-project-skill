@@ -72,7 +72,8 @@ SECRET_PATTERNS = {
 }
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|[^\s\n]+)"
+    r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*"
+    r"(?:\n[ \t]{1,3})?(<[^>\n]+>|[^\s\n]+)"
 )
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
@@ -84,6 +85,14 @@ MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 MARKDOWN_HTML_TAG = re.compile(r"<[A-Za-z][^<>]*>", re.DOTALL)
+MARKDOWN_RAW_HTML_BLOCK = re.compile(
+    r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>])[^>]*>"
+    r"(?P<body>.*?)(?:</(?P=tag)[ \t]*>|(?=\Z))",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+MARKDOWN_AUTOLINK = re.compile(
+    r"<((?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)|(?:[^<>\s@]+@[^<>\s@]+))>"
+)
 MARKDOWN_HTML_ANCHOR = re.compile(
     r"""(?<![\w:-])(?:id|name)\s*=\s*(?:(["'])(.*?)\1|([^\s"'=<>`]+))""",
     re.IGNORECASE | re.DOTALL,
@@ -320,6 +329,12 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             open_paragraph_containers = containers
         offset += len(line)
 
+    block_search_text = "".join(characters)
+    for html_block in MARKDOWN_RAW_HTML_BLOCK.finditer(block_search_text):
+        for index in range(*html_block.span("body")):
+            if characters[index] not in "\r\n":
+                characters[index] = " "
+
     literal_characters = characters.copy()
     masked = "".join(literal_characters)
     index = 0
@@ -503,6 +518,7 @@ def github_heading_slug(heading: str) -> str:
     heading = re.sub(r"\[([^\]]+)\]\s*\[[^\]]*\]", r"\1", heading)
     heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
+    heading = MARKDOWN_AUTOLINK.sub(r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
     heading = html_unescape(heading)
     heading = re.sub(
@@ -525,7 +541,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
     fragments: set[str] = set()
     used_slugs: set[str] = set()
-    setext_candidate: tuple[tuple[str, ...], str] | None = None
+    setext_candidate: tuple[tuple[str, ...], list[str]] | None = None
 
     def add_heading(heading: str) -> None:
         heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading)
@@ -568,12 +584,15 @@ def markdown_heading_fragments(text: str) -> set[str]:
             and setext_candidate
             and setext_candidate[0] == containers
         ):
-            add_heading(setext_candidate[1])
+            add_heading(" ".join(setext_candidate[1]))
             setext_candidate = None
             continue
-        setext_candidate = (
-            (containers, raw_content.strip()) if structure_content.strip() else None
-        )
+        if not structure_content.strip():
+            setext_candidate = None
+        elif setext_candidate and setext_candidate[0] == containers:
+            setext_candidate[1].append(raw_content.strip())
+        else:
+            setext_candidate = (containers, [raw_content.strip()])
 
     return fragments
 
