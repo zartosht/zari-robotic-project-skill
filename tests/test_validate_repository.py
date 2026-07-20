@@ -59,6 +59,16 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_site_root_web_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[issues](/zartosht/zari-robotic-project-skill/issues)\n"
+                '<img src="/assets/project-logo.png">\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_same_file_and_cross_file_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -66,6 +76,23 @@ class LinkTests(unittest.TestCase):
                 "# Setup\n\n[same](#setup) [cross](guide.md#details)\n", encoding="utf-8"
             )
             (root / "guide.md").write_text("# Details\n", encoding="utf-8")
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_accepts_headings_inside_markdown_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> # Quoted heading\n"
+                "> Quoted setext\n"
+                "> --------------\n"
+                "- # Listed heading\n"
+                "> - # Nested heading\n"
+                "[quoted](#quoted-heading)\n"
+                "[setext](#quoted-setext)\n"
+                "[listed](#listed-heading)\n"
+                "[nested](#nested-heading)\n",
+                encoding="utf-8",
+            )
             self.assertEqual([], validator.find_broken_links(root))
 
     def test_accepts_local_links_with_queries_and_fragments(self) -> None:
@@ -191,7 +218,19 @@ class LinkTests(unittest.TestCase):
             (root / "README.md").write_text(
                 "\\[escaped](missing.md)\n"
                 "`[inline](missing.md)`\n"
-                "```markdown\n[fenced](missing.md)\n```\n",
+                "```markdown\n[fenced](missing.md)\n```\n"
+                "> ```markdown\n> [quoted-fenced](missing.md)\n> ```\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_indented_markdown_code_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "    [indented](missing.md)\n"
+                "\t<img src=missing.png>\n"
+                ">     [quoted](missing.md)\n",
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))

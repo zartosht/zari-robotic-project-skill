@@ -74,6 +74,11 @@ SECRET_PATTERNS = {
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|[^\s\n]+)"
 )
+MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
+MARKDOWN_LIST_PREFIX = re.compile(
+    r"^[ \t]{0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]+|$)"
+)
+MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}|\t)")
 MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
@@ -147,6 +152,26 @@ def markdown_files(root: Path) -> list[Path]:
     )
 
 
+def markdown_container_content(line: str) -> tuple[tuple[str, ...], str]:
+    """Remove directly expressed blockquote and list container prefixes."""
+
+    containers: list[str] = []
+    content = line
+    while content:
+        blockquote = MARKDOWN_BLOCKQUOTE_PREFIX.match(content)
+        if blockquote:
+            containers.append("blockquote")
+            content = content[blockquote.end() :]
+            continue
+        list_item = MARKDOWN_LIST_PREFIX.match(content)
+        if list_item:
+            containers.append("list")
+            content = content[list_item.end() :]
+            continue
+        break
+    return tuple(containers), content
+
+
 def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str:
     """Mask literal Markdown regions while preserving offsets and line structure."""
 
@@ -170,8 +195,12 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
 
     for line in text.splitlines(keepends=True):
         content = line.rstrip("\r\n")
+        _, container_content = markdown_container_content(content)
+        indented_code = MARKDOWN_INDENTED_CODE.match(container_content) is not None
         if fence_character is None:
-            match = MARKDOWN_FENCE_START.match(content)
+            match = (
+                None if indented_code else MARKDOWN_FENCE_START.match(container_content)
+            )
             if match:
                 fence = match.group(1)
                 fence_character = fence[0]
@@ -180,11 +209,15 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             closing_fence = re.compile(
                 rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
             )
-            if closing_fence.match(content):
+            if closing_fence.match(container_content):
                 fence_character = None
                 fence_length = 0
 
-        if fence_character is not None or MARKDOWN_FENCE_START.match(content):
+        if (
+            indented_code
+            or fence_character is not None
+            or MARKDOWN_FENCE_START.match(container_content)
+        ):
             for index in range(offset, offset + len(line)):
                 if characters[index] not in "\r\n":
                     characters[index] = " "
@@ -358,7 +391,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
     fragments: set[str] = set()
     used_slugs: set[str] = set()
-    setext_candidate: str | None = None
+    setext_candidate: tuple[tuple[str, ...], str] | None = None
 
     def add_heading(heading: str) -> None:
         heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading)
@@ -387,17 +420,25 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
     for line_index, line in enumerate(lines[content_start:], start=content_start):
         structure_line = structure_lines[line_index]
-        atx_heading = MARKDOWN_ATX_HEADING.match(structure_line)
+        containers, structure_content = markdown_container_content(structure_line)
+        _, raw_content = markdown_container_content(line)
+        atx_heading = MARKDOWN_ATX_HEADING.match(structure_content)
         if atx_heading:
-            raw_heading = MARKDOWN_ATX_HEADING.match(line)
+            raw_heading = MARKDOWN_ATX_HEADING.match(raw_content)
             add_heading(raw_heading.group(1) if raw_heading else atx_heading.group(1))
             setext_candidate = None
             continue
-        if MARKDOWN_SETEXT_HEADING.match(structure_line) and setext_candidate:
-            add_heading(setext_candidate)
+        if (
+            MARKDOWN_SETEXT_HEADING.match(structure_content)
+            and setext_candidate
+            and setext_candidate[0] == containers
+        ):
+            add_heading(setext_candidate[1])
             setext_candidate = None
             continue
-        setext_candidate = line.strip() if structure_line.strip() else None
+        setext_candidate = (
+            (containers, raw_content.strip()) if structure_content.strip() else None
+        )
 
     return fragments
 
@@ -417,7 +458,7 @@ def find_broken_links(root: Path) -> list[str]:
                     target = target.split(maxsplit=1)[0]
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)
             target = html_unescape(target)
-            if not target or target.startswith("//") or URI_SCHEME.match(target):
+            if not target or target.startswith("/") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)
             path_target = unquote(parsed_target.path)
