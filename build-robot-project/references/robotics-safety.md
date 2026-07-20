@@ -25,6 +25,7 @@ Require explicit user confirmation before:
 - increasing actuator speed, force, torque, travel, or movement range;
 - enabling autonomous movement or floor movement;
 - enabling an always-listening microphone or a camera;
+- enabling local sensitive-data collection or storage, including location, nearby-device identifiers, credentials, biometric data, or other sensitive telemetry;
 - transmitting audio, video, location, credentials, or other sensitive data;
 - using dangerous tools, mains voltage, or high-current systems;
 - building, modifying, or charging custom battery packs;
@@ -110,7 +111,7 @@ If the builder or operator may be a minor, require responsible-adult supervision
 
 ## Camera, Microphone, Network, and AI Privacy
 
-Default sensitive features to disabled. Require a per-data-type flow covering collection, purpose, destination/provider, transport and storage encryption, access control, retention, deletion, diagnostic-log redaction, third-party processing or training, bystander consent, and offline behavior.
+Default sensitive features, collection, and retention to disabled. Require informed and explicit approval before enabling local sensitive-data collection or storage, even when nothing is transmitted. Require a per-data-type flow covering collection, purpose, destination/provider, transport and storage encryption, access control, retention, deletion, diagnostic-log redaction, third-party processing or training, bystander consent, and offline behavior.
 
 Require:
 

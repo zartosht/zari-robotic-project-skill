@@ -93,6 +93,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#motordriver", errors[0])
 
+    def test_decodes_entities_before_generating_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# A &amp; B\n"
+                "[rendered](#a--b)\n"
+                "[wrong](#a-amp-b)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#a-amp-b", errors[0])
+
     def test_accepts_headings_inside_markdown_containers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -379,6 +392,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("escapes distributable skill directory", errors[0])
 
+    def test_rejects_repository_link_that_escapes_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "repository"
+            root.mkdir()
+            (workspace / "outside.md").write_text("outside\n", encoding="utf-8")
+            (root / "README.md").write_text("[outside](../outside.md)\n", encoding="utf-8")
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("escapes repository checkout", errors[0])
+
 
 class PortabilityTests(unittest.TestCase):
     def test_detects_client_specific_tool_name(self) -> None:
@@ -545,6 +569,22 @@ class SafetyDocumentationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("first body contact", skill)
         self.assertIn("first body contact", safety)
+
+    def test_local_sensitive_data_collection_and_storage_are_mandatory_gates(self) -> None:
+        skill = (REPOSITORY_ROOT / "build-robot-project" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        safety = (
+            REPOSITORY_ROOT
+            / "build-robot-project"
+            / "references"
+            / "robotics-safety.md"
+        ).read_text(encoding="utf-8")
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        required_gate = "local sensitive-data collection or storage"
+        self.assertIn(required_gate, skill)
+        self.assertIn(required_gate, safety)
+        self.assertIn(required_gate, readme)
 
 
 class RepositoryTests(unittest.TestCase):

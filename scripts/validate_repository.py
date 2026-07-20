@@ -464,6 +464,7 @@ def github_heading_slug(heading: str) -> str:
     heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
+    heading = html_unescape(heading)
     heading = re.sub(
         r"(?<![\w\\])(?P<delimiter>_{1,2})(?=\S)(?P<content>.+?\S)"
         r"(?P=delimiter)(?!\w)",
@@ -476,7 +477,7 @@ def github_heading_slug(heading: str) -> str:
         for character in heading
         if character.isalnum() or character in {"-", "_"} or character.isspace()
     ]
-    return re.sub(r"\s+", "-", "".join(characters).strip())
+    return re.sub(r"\s", "-", "".join(characters).strip())
 
 
 def markdown_heading_fragments(text: str) -> set[str]:
@@ -539,7 +540,8 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
 def find_broken_links(root: Path) -> list[str]:
     errors: list[str] = []
-    skill_root = (root / "build-robot-project").resolve()
+    repository_root = root.resolve()
+    skill_root = (repository_root / "build-robot-project").resolve()
     fragment_cache: dict[Path, set[str]] = {}
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
@@ -573,6 +575,12 @@ def find_broken_links(root: Path) -> list[str]:
                 errors.append(
                     f"{path.relative_to(root)}: relative link escapes distributable skill "
                     f"directory {raw_target!r}"
+                )
+                continue
+            if not resolved.is_relative_to(repository_root):
+                errors.append(
+                    f"{path.relative_to(root)}: relative link escapes repository checkout "
+                    f"{raw_target!r}"
                 )
                 continue
             if not resolved.exists():
