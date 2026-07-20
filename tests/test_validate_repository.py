@@ -301,6 +301,33 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
 
+    def test_ignores_unused_and_duplicate_reference_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target.md").write_text("target\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide][docs]\n\n"
+                "[docs]: target.md\n"
+                "[unused]: unused-missing.md\n"
+                "[docs]: duplicate-missing.md\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_uses_first_duplicate_reference_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target.md").write_text("target\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide][docs]\n\n"
+                "[docs]: first-missing.md\n"
+                "[docs]: target.md\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("first-missing.md", errors[0])
+
     def test_reports_missing_outer_link_around_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -432,6 +459,18 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("rendered-missing.md", errors[0])
+
+    def test_scans_list_continuation_links_inside_blockquotes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> - item\n"
+                ">     [guide](missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_ignores_literal_and_commented_html_anchor_examples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -231,12 +231,21 @@ def markdown_list_prefix_end(match: re.Match[str]) -> int:
     return match.start("padding") + consumed_padding
 
 
+def markdown_blockquote_content(line: str) -> tuple[tuple[str, ...], str]:
+    """Remove direct blockquote prefixes while retaining their container context."""
+
+    containers: list[str] = []
+    content = line
+    while blockquote := MARKDOWN_BLOCKQUOTE_PREFIX.match(content):
+        containers.append("blockquote")
+        content = content[blockquote.end() :]
+    return tuple(containers), content
+
+
 def markdown_line_starts_list_item(line: str) -> bool:
     """Return whether a line directly opens a list item, including in blockquotes."""
 
-    content = line
-    while blockquote := MARKDOWN_BLOCKQUOTE_PREFIX.match(content):
-        content = content[blockquote.end() :]
+    _, content = markdown_blockquote_content(line)
     return MARKDOWN_LIST_PREFIX.match(content) is not None
 
 
@@ -265,26 +274,36 @@ def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], st
 
     normalized: list[tuple[tuple[str, ...], str]] = []
     active_list_indent: int | None = None
+    active_list_parent: tuple[str, ...] | None = None
     for line in lines:
-        leading_spaces = len(line) - len(line.lstrip(" "))
+        parent_containers, parent_content = markdown_blockquote_content(line)
+        leading_spaces = len(parent_content) - len(parent_content.lstrip(" "))
         is_continuation = (
             active_list_indent is not None
+            and active_list_parent == parent_containers
             and leading_spaces >= active_list_indent
-            and bool(line.strip())
+            and bool(parent_content.strip())
         )
         if is_continuation:
             nested_containers, content = markdown_container_content(
-                line[active_list_indent:]
+                parent_content[active_list_indent:]
             )
-            normalized.append((("list", *nested_containers), content))
+            normalized.append(
+                (
+                    (*parent_containers, "list", *nested_containers),
+                    content,
+                )
+            )
         else:
             normalized.append(markdown_container_content(line))
 
-        list_item = MARKDOWN_LIST_PREFIX.match(line)
+        list_item = MARKDOWN_LIST_PREFIX.match(parent_content)
         if list_item:
             active_list_indent = markdown_list_prefix_end(list_item)
-        elif line.strip() and not is_continuation:
+            active_list_parent = parent_containers
+        elif parent_content.strip() and not is_continuation:
             active_list_indent = None
+            active_list_parent = None
 
     return normalized
 
@@ -561,24 +580,30 @@ def markdown_normalize_reference_label(label: str) -> str:
     return " ".join(html_unescape(label).split()).casefold()
 
 
-def markdown_image_reference_labels(text: str) -> set[str]:
-    """Collect labels whose reference definitions are used by images."""
+def markdown_reference_usages(
+    text: str, reference_labels: set[str]
+) -> dict[str, bool]:
+    """Collect active reference labels and whether any use renders an image."""
 
-    labels: set[str] = set()
-    index = 0
-    while index + 1 < len(text):
-        if (
-            text[index] != "!"
-            or text[index + 1] != "["
-            or markdown_character_is_escaped(text, index)
-        ):
-            index += 1
+    usages: dict[str, bool] = {}
+    for label_start, character in enumerate(text):
+        if character != "[" or markdown_character_is_escaped(text, label_start):
             continue
-        label_start = index + 1
         label_end = markdown_label_end(text, label_start)
         if label_end is None:
-            index += 2
             continue
+        is_image = (
+            label_start > 0
+            and text[label_start - 1] == "!"
+            and not markdown_character_is_escaped(text, label_start - 1)
+        )
+        if label_end + 1 < len(text) and text[label_end + 1] == ":":
+            continue
+        if not is_image and markdown_label_contains_active_link(
+            text, label_start, label_end, reference_labels
+        ):
+            continue
+
         primary_label = text[label_start + 1 : label_end]
         cursor = label_end + 1
         if (
@@ -586,22 +611,20 @@ def markdown_image_reference_labels(text: str) -> set[str]:
             and text[cursor] == "("
             and markdown_destination_end(text, cursor) is not None
         ):
-            index = label_end + 1
             continue
         while cursor < len(text) and text[cursor].isspace():
             cursor += 1
         if cursor < len(text) and text[cursor] == "[":
             reference_end = markdown_label_end(text, cursor)
             if reference_end is None:
-                index = label_end + 1
                 continue
             reference_label = text[cursor + 1 : reference_end] or primary_label
-            labels.add(markdown_normalize_reference_label(reference_label))
-            index = reference_end + 1
-            continue
-        labels.add(markdown_normalize_reference_label(primary_label))
-        index = label_end + 1
-    return labels
+        else:
+            reference_label = primary_label
+        normalized = markdown_normalize_reference_label(reference_label)
+        if normalized in reference_labels:
+            usages[normalized] = usages.get(normalized, False) or is_image
+    return usages
 
 
 def markdown_label_contains_active_link(
@@ -776,11 +799,12 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     reference_definitions = list(
         MARKDOWN_REFERENCE_DEFINITION.finditer(container_text)
     )
-    reference_labels = {
-        markdown_normalize_reference_label(match.group("label"))
-        for match in reference_definitions
-    }
-    image_reference_labels = markdown_image_reference_labels(text)
+    first_reference_definitions: dict[str, re.Match[str]] = {}
+    for match in reference_definitions:
+        label = markdown_normalize_reference_label(match.group("label"))
+        first_reference_definitions.setdefault(label, match)
+    reference_labels = set(first_reference_definitions)
+    reference_usages = markdown_reference_usages(text, reference_labels)
     targets: list[tuple[str, bool, bool]] = []
     for label_start, character in enumerate(text):
         if character != "[":
@@ -805,10 +829,10 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         (
             match.group("target"),
             True,
-            markdown_normalize_reference_label(match.group("label"))
-            in image_reference_labels,
+            reference_usages[label],
         )
-        for match in reference_definitions
+        for label, match in first_reference_definitions.items()
+        if label in reference_usages
     )
     targets.extend(
         (target, False, False)
