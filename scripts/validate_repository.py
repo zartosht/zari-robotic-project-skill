@@ -77,7 +77,7 @@ SECRET_PATTERNS = {
 }
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>[^\]\n]+)\]:[ \t]*"
+    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n])+)\]:[ \t]*"
     r"(?:\n[ \t]{1,3})?(?P<target><[^>\n]+>|[^\s\n]+)"
 )
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
@@ -89,7 +89,9 @@ MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}| {0,3}\t)")
 MARKDOWN_FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
-MARKDOWN_HTML_TAG = re.compile(r"<[A-Za-z][^<>]*>", re.DOTALL)
+MARKDOWN_HTML_TAG = re.compile(
+    r'''<[A-Za-z](?:[^<>"']+|"[^"]*"|'[^']*')*>''', re.DOTALL
+)
 MARKDOWN_RAW_HTML_TYPE_1 = re.compile(
     r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>]|\Z)", re.IGNORECASE
 )
@@ -403,6 +405,11 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
     container_lines = markdown_container_lines(
         [line.rstrip("\r\n") for line in lines_with_endings]
     )
+    line_offsets: list[int] = []
+    running_offset = 0
+    for line in lines_with_endings:
+        line_offsets.append(running_offset)
+        running_offset += len(line)
     offset = 0
     skip_until = 0
     blank_block_start: int | None = None
@@ -420,7 +427,18 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
             cursor = tag.end()
         mask(cursor, end)
 
-    for line, (containers, content) in zip(lines_with_endings, container_lines):
+    def container_end(line_index: int, containers: tuple[str, ...]) -> int:
+        if not containers:
+            return len(text)
+        for next_index in range(line_index + 1, len(container_lines)):
+            next_containers = container_lines[next_index][0]
+            if next_containers[: len(containers)] != containers:
+                return line_offsets[next_index]
+        return len(text)
+
+    for line_index, (line, (containers, content)) in enumerate(
+        zip(lines_with_endings, container_lines)
+    ):
         line_body = line.rstrip("\r\n")
         content_start = offset + len(line_body) - len(content)
         content_end = offset + len(line_body)
@@ -451,19 +469,26 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
             special_end = (r">", content.find("<!"))
 
         if type_1:
-            opening_end = text.find(">", content_start + type_1.end())
+            raw_container_end = container_end(line_index, containers)
+            opening_tag = MARKDOWN_HTML_TAG.search(
+                text, content_start + type_1.start(), raw_container_end
+            )
             closing = re.compile(
                 rf"</{re.escape(type_1.group('tag'))}[ \t]*>", re.IGNORECASE
             )
-            if opening_end < 0:
-                mask(content_start, len(text))
-                skip_until = len(text)
+            if opening_tag is None:
+                mask(content_start, raw_container_end)
+                skip_until = raw_container_end
             else:
-                closing_match = closing.search(text, opening_end + 1)
-                raw_end = closing_match.end() if closing_match else len(text)
-                line_end = text.find("\n", raw_end)
-                skip_until = len(text) if line_end < 0 else line_end + 1
-                mask(opening_end + 1, skip_until)
+                closing_match = closing.search(
+                    text, opening_tag.end(), raw_container_end
+                )
+                raw_end = (
+                    closing_match.end() if closing_match else raw_container_end
+                )
+                line_end = text.find("\n", raw_end, raw_container_end)
+                skip_until = raw_container_end if line_end < 0 else line_end + 1
+                mask(opening_tag.end(), skip_until)
             open_paragraph_containers = None
         elif special_end:
             marker, block_start = special_end
@@ -483,9 +508,9 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
             )
             raw_tag = type_6 or type_7
             if raw_tag:
-                opening_end = content.find(">", raw_tag.end())
+                opening_tag = MARKDOWN_HTML_TAG.search(content, raw_tag.start())
                 body_start = content_start + (
-                    opening_end + 1 if opening_end >= 0 else len(content)
+                    opening_tag.end() if opening_tag is not None else len(content)
                 )
                 blank_block_start = body_start
                 open_paragraph_containers = None
@@ -614,11 +639,7 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             before_is_tick = candidate > 0 and masked[candidate - 1] == "`"
             after = candidate + len(delimiter)
             after_is_tick = after < len(masked) and masked[after] == "`"
-            if (
-                not markdown_character_is_escaped(masked, candidate)
-                and not before_is_tick
-                and not after_is_tick
-            ):
+            if not before_is_tick and not after_is_tick:
                 closing = candidate
                 break
             search_from = candidate + len(delimiter)
@@ -677,8 +698,11 @@ def markdown_reference_usages(
     """Collect active reference labels and whether any use renders an image."""
 
     usages: dict[str, bool] = {}
+    image_label_ranges = markdown_active_image_label_ranges(text, reference_labels)
     for label_start, character in enumerate(text):
         if character != "[" or markdown_character_is_escaped(text, label_start):
+            continue
+        if any(start < label_start < end for start, end in image_label_ranges):
             continue
         label_end = markdown_label_end(text, label_start)
         if label_end is None:
@@ -908,6 +932,49 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
     return text[start:destination_end], index
 
 
+def markdown_active_image_label_ranges(
+    text: str, reference_labels: set[str]
+) -> list[tuple[int, int]]:
+    """Return rendered image-label ranges whose nested targets are alt text only."""
+
+    ranges: list[tuple[int, int]] = []
+    for label_start, character in enumerate(text):
+        if character != "[" or label_start == 0 or text[label_start - 1] != "!":
+            continue
+        if markdown_character_is_escaped(text, label_start - 1):
+            continue
+        label_end = markdown_label_end(text, label_start)
+        if label_end is None:
+            continue
+
+        primary_label = text[label_start + 1 : label_end]
+        cursor = label_end + 1
+        active = (
+            cursor < len(text)
+            and text[cursor] == "("
+            and markdown_destination_end(text, cursor) is not None
+        )
+        if not active:
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor < len(text) and text[cursor] == "[":
+                reference_end = markdown_label_end(text, cursor)
+                if reference_end is not None:
+                    reference_label = text[cursor + 1 : reference_end] or primary_label
+                    active = (
+                        markdown_normalize_reference_label(reference_label)
+                        in reference_labels
+                    )
+            else:
+                active = (
+                    markdown_normalize_reference_label(primary_label)
+                    in reference_labels
+                )
+        if active:
+            ranges.append((label_start, label_end))
+    return ranges
+
+
 def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     """Extract destinations and whether they require Markdown parsing or a file."""
 
@@ -929,10 +996,13 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         label = markdown_normalize_reference_label(match.group("label"))
         first_reference_definitions.setdefault(label, match)
     reference_labels = set(first_reference_definitions)
+    image_label_ranges = markdown_active_image_label_ranges(text, reference_labels)
     reference_usages = markdown_reference_usages(text, reference_labels)
     targets: list[tuple[str, bool, bool]] = []
     for label_start, character in enumerate(text):
         if character != "[":
+            continue
+        if any(start < label_start < end for start, end in image_label_ranges):
             continue
         label_end = markdown_label_end(text, label_start)
         if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":

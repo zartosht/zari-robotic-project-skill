@@ -301,6 +301,16 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
 
+    def test_reports_reference_label_with_escaped_closing_bracket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide][a\\]]\n\n[a\\]]: missing.md\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_reports_reference_definitions_inside_markdown_containers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -369,6 +379,15 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
 
+    def test_ignores_link_target_nested_inside_image_description(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "image.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                "![alt [guide](missing.md)](image.png)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_rejects_markdown_image_targeting_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -418,6 +437,14 @@ class LinkTests(unittest.TestCase):
                 "```markdown\n[fenced](missing.md)\n```\n"
                 "> ```markdown\n> [quoted-fenced](missing.md)\n> ```\n",
                 encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_code_span_closed_by_backslash_prefixed_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "`[guide](missing.md)\\`\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
 
@@ -623,6 +650,16 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("references/missing.md" in error for error in errors))
             self.assertTrue(any("assets/missing.png" in error for error in errors))
 
+    def test_validates_html_target_after_quoted_greater_than(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<img alt="a > b" src="missing.png">\n', encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
+
     def test_rejects_raw_html_src_targeting_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -652,6 +689,19 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("#hidden-heading", errors[0])
+
+    def test_stops_unclosed_raw_html_block_when_container_ends(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> <script>\n"
+                '> const example = "[literal](ignored.md)";\n'
+                "[guide](missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_preserves_multiline_raw_html_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
