@@ -78,9 +78,12 @@ SECRET_PATTERNS = {
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n])+)\]:[ \t]*"
-    r"(?:\n[ \t]{1,3})?(?P<target><[^>\n]+>|[^\s\n]+)"
+    r"(?:\n[ \t]{1,3})?"
+    r"(?P<target><(?:\\.|[^<>\\\n])+>|(?:\\.|[^\s\\])+)"
+    r"(?:[ \t]+(?:\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|"
+    r"\((?:\\.|[^()\\\n])*\)))?[ \t]*(?=\n|$)"
 )
-MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
+MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
     r"^(?P<indent>[ \t]{0,3})(?P<marker>[*+-]|\d{1,9}[.)])"
     r"(?P<padding>[ \t]+|$)"
@@ -90,7 +93,7 @@ MARKDOWN_FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 MARKDOWN_HTML_TAG = re.compile(
-    r'''<[A-Za-z](?:[^<>"']+|"[^"]*"|'[^']*')*>''', re.DOTALL
+    r'''<[A-Za-z](?:[^<>"']|"[^"]*"|'[^']*')*>''', re.DOTALL
 )
 MARKDOWN_RAW_HTML_TYPE_1 = re.compile(
     r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>]|\Z)", re.IGNORECASE
@@ -111,7 +114,9 @@ MARKDOWN_CODE_SPAN_GT = "\ue001"
 MARKDOWN_AUTOLINK = re.compile(
     r"<((?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)|(?:[^<>\s@]+@[^<>\s@]+))>"
 )
-MARKDOWN_HTML_ANCHOR_ATTRIBUTES = frozenset({"id", "name"})
+MARKDOWN_HTML_ID_ATTRIBUTES = frozenset({"id"})
+MARKDOWN_HTML_NAME_ATTRIBUTES = frozenset({"name"})
+MARKDOWN_HTML_LEGACY_ANCHOR_TAGS = frozenset({"a"})
 MARKDOWN_HTML_HREF_ATTRIBUTES = frozenset({"href"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
@@ -428,6 +433,10 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
                 return line_offsets[next_index]
         return len(text)
 
+    def line_end_after(start: int, limit: int) -> int:
+        line_ending = re.search(r"\r\n?|\n", text[start:limit])
+        return limit if line_ending is None else start + line_ending.end()
+
     for line_index, (line, (containers, content)) in enumerate(
         zip(lines_with_endings, container_lines)
     ):
@@ -482,17 +491,18 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
                 raw_end = (
                     closing_match.end() if closing_match else raw_container_end
                 )
-                line_end = text.find("\n", raw_end, raw_container_end)
-                skip_until = raw_container_end if line_end < 0 else line_end + 1
+                skip_until = line_end_after(raw_end, raw_container_end)
                 mask(opening_tag.end(), skip_until)
             open_paragraph_containers = None
         elif special_end:
             marker, block_start = special_end
             absolute_start = content_start + block_start
-            marker_match = re.compile(marker).search(text, absolute_start)
-            raw_end = marker_match.end() if marker_match else len(text)
-            line_end = text.find("\n", raw_end)
-            skip_until = len(text) if line_end < 0 else line_end + 1
+            raw_container_end = container_end(line_index, containers)
+            marker_match = re.compile(marker).search(
+                text, absolute_start, raw_container_end
+            )
+            raw_end = marker_match.end() if marker_match else raw_container_end
+            skip_until = line_end_after(raw_end, raw_container_end)
             mask(absolute_start, skip_until)
             open_paragraph_containers = None
         else:
@@ -504,12 +514,14 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
             )
             raw_tag = type_6 or type_7
             if raw_tag:
-                opening_tag = MARKDOWN_HTML_TAG.search(content, raw_tag.start())
-                body_start = content_start + (
-                    opening_tag.end() if opening_tag is not None else len(content)
+                raw_container_end = container_end(line_index, containers)
+                tag_start = content_start + len(content) - len(content.lstrip(" \t"))
+                opening_tag = MARKDOWN_HTML_TAG.match(
+                    text, tag_start, raw_container_end
                 )
+                body_start = opening_tag.end() if opening_tag else content_end
                 blank_block_start = body_start
-                blank_block_end = container_end(line_index, containers)
+                blank_block_end = raw_container_end
                 open_paragraph_containers = None
             elif not content.strip():
                 open_paragraph_containers = None
@@ -860,7 +872,12 @@ def markdown_protect_code_span_angles(text: str) -> str:
     return "".join(characters)
 
 
-def html_attribute_values(text: str, names: frozenset[str]) -> list[str]:
+def html_attribute_values(
+    text: str,
+    names: frozenset[str],
+    *,
+    tag_names: frozenset[str] | None = None,
+) -> list[str]:
     """Collect top-level HTML attribute values without scanning quoted values."""
 
     values: list[str] = []
@@ -869,6 +886,9 @@ def html_attribute_values(text: str, names: frozenset[str]) -> list[str]:
         index = 1
         while index < len(tag) and (tag[index].isalnum() or tag[index] in {"-", ":"}):
             index += 1
+        tag_name = tag[1:index].casefold()
+        if tag_names is not None and tag_name not in tag_names:
+            continue
         while index < len(tag) - 1:
             while index < len(tag) - 1 and tag[index].isspace():
                 index += 1
@@ -1082,8 +1102,11 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     image_label_ranges = markdown_active_image_label_ranges(text, reference_labels)
     reference_usages = markdown_reference_usages(text, reference_labels)
     targets: list[tuple[str, bool, bool]] = []
+    inline_link_suffix_ranges: list[tuple[int, int]] = []
     for label_start, character in enumerate(text):
         if character != "[":
+            continue
+        if any(start <= label_start < end for start, end in inline_link_suffix_ranges):
             continue
         if any(start < label_start < end for start, end in image_label_ranges):
             continue
@@ -1102,6 +1125,7 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
             ):
                 continue
             targets.append((destination[0], True, is_image))
+            inline_link_suffix_ranges.append((label_end + 1, destination[1] + 1))
 
     targets.extend(
         (
@@ -1189,8 +1213,12 @@ def markdown_heading_fragments(text: str) -> set[str]:
             "\n", 0, max(definition.start(), definition.end() - 1)
         )
         reference_definition_lines.update(range(start_line, end_line + 1))
+    for anchor in html_attribute_values(searchable_text, MARKDOWN_HTML_ID_ATTRIBUTES):
+        fragments.add(html_unescape(anchor))
     for anchor in html_attribute_values(
-        searchable_text, MARKDOWN_HTML_ANCHOR_ATTRIBUTES
+        searchable_text,
+        MARKDOWN_HTML_NAME_ATTRIBUTES,
+        tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
     ):
         fragments.add(html_unescape(anchor))
     content_start = 0
