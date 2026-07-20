@@ -115,17 +115,25 @@ def markdown_files(root: Path) -> list[Path]:
 
 def find_broken_links(root: Path) -> list[str]:
     errors: list[str] = []
+    skill_root = (root / "build-robot-project").resolve()
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
         for raw_target in MARKDOWN_LINK.findall(text):
             target = raw_target.strip()
-            if target.startswith("<") and target.endswith(">"):
-                target = target[1:-1]
-            target = target.split(" ", 1)[0]
+            if target.startswith("<") and ">" in target:
+                target = target[1 : target.index(">")]
+            else:
+                target = target.split(" ", 1)[0]
             if not target or target.startswith(("#", "http://", "https://", "mailto:")):
                 continue
             target = unquote(target.split("#", 1)[0])
             resolved = (path.parent / target).resolve()
+            if path.resolve().is_relative_to(skill_root) and not resolved.is_relative_to(skill_root):
+                errors.append(
+                    f"{path.relative_to(root)}: relative link escapes distributable skill "
+                    f"directory {raw_target!r}"
+                )
+                continue
             if not resolved.exists():
                 errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
     return errors
@@ -137,7 +145,10 @@ def find_portability_violations(skill_root: Path) -> list[str]:
     portable_paths.extend((skill_root / "references").rglob("*"))
     portable_paths.extend((skill_root / "assets").rglob("*"))
     for path in sorted(path for path in portable_paths if path.is_file()):
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
         for label, pattern in PORTABILITY_PATTERNS.items():
             match = pattern.search(text)
             if match:

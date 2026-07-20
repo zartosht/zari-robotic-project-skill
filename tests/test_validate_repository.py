@@ -51,6 +51,28 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_angle_bracketed_destination_with_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "power path.png").write_bytes(b"diagram")
+            (root / "README.md").write_text(
+                "[diagram](<assets/power path.png>)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_rejects_skill_link_that_escapes_distributable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill_root = root / "build-robot-project"
+            skill_root.mkdir()
+            (root / "README.md").write_text("repository docs\n", encoding="utf-8")
+            (skill_root / "SKILL.md").write_text("[docs](../README.md)\n", encoding="utf-8")
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("escapes distributable skill directory", errors[0])
+
 
 class PortabilityTests(unittest.TestCase):
     def test_detects_client_specific_tool_name(self) -> None:
@@ -70,6 +92,16 @@ class PortabilityTests(unittest.TestCase):
             (root / "SKILL.md").write_text(
                 "Use the agent's available structured input capability.\n", encoding="utf-8"
             )
+            self.assertEqual([], validator.find_portability_violations(root))
+
+    def test_skips_binary_portable_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            assets = root / "assets"
+            assets.mkdir()
+            (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
+            (assets / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff")
             self.assertEqual([], validator.find_portability_violations(root))
 
 
