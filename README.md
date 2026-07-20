@@ -146,10 +146,10 @@ Official sources checked:
 Codex officially documents repository-scoped and user-scoped skills under `.agents/skills`. To install for one project from a local clone:
 
 ```bash
-mkdir -p /path/to/robot-project/.agents/skills
-test ! -e /path/to/robot-project/.agents/skills/build-robot-project &&
-  cp -R build-robot-project /path/to/robot-project/.agents/skills/ &&
-cp LICENSE /path/to/robot-project/.agents/skills/build-robot-project/LICENSE
+mkdir -p "/path/to/robot-project/.agents/skills"
+test ! -e "/path/to/robot-project/.agents/skills/build-robot-project" &&
+  cp -R build-robot-project "/path/to/robot-project/.agents/skills/" &&
+cp LICENSE "/path/to/robot-project/.agents/skills/build-robot-project/LICENSE"
 ```
 
 For a user-scoped installation:
@@ -174,10 +174,10 @@ $build-robot-project Help me start a desk robot in this empty folder.
 Claude Code officially documents project skills under `.claude/skills/` and personal skills under `~/.claude/skills/`.
 
 ```bash
-mkdir -p /path/to/robot-project/.claude/skills
-test ! -e /path/to/robot-project/.claude/skills/build-robot-project &&
-  cp -R build-robot-project /path/to/robot-project/.claude/skills/ &&
-cp LICENSE /path/to/robot-project/.claude/skills/build-robot-project/LICENSE
+mkdir -p "/path/to/robot-project/.claude/skills"
+test ! -e "/path/to/robot-project/.claude/skills/build-robot-project" &&
+  cp -R build-robot-project "/path/to/robot-project/.claude/skills/" &&
+cp LICENSE "/path/to/robot-project/.claude/skills/build-robot-project/LICENSE"
 ```
 
 Or install for the current user:
@@ -221,10 +221,10 @@ The current Gemini CLI documentation warns that some unpaid tiers are transition
 VS Code officially documents shared project skills under `.github/skills/`, `.claude/skills/`, or `.agents/skills/`. For a repository-local copy:
 
 ```bash
-mkdir -p /path/to/robot-project/.github/skills
-test ! -e /path/to/robot-project/.github/skills/build-robot-project &&
-  cp -R build-robot-project /path/to/robot-project/.github/skills/ &&
-cp LICENSE /path/to/robot-project/.github/skills/build-robot-project/LICENSE
+mkdir -p "/path/to/robot-project/.github/skills"
+test ! -e "/path/to/robot-project/.github/skills/build-robot-project" &&
+  cp -R build-robot-project "/path/to/robot-project/.github/skills/" &&
+cp LICENSE "/path/to/robot-project/.github/skills/build-robot-project/LICENSE"
 ```
 
 Open Chat, run `/skills` to inspect configured skills, and invoke:

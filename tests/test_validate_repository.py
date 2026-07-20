@@ -191,6 +191,20 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
 
+    def test_reports_reference_definitions_inside_markdown_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> [quoted]: references/quoted-missing.md\n"
+                "- [listed]: references/listed-missing.md\n"
+                "[one][quoted] [two][listed]\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("quoted-missing.md" in error for error in errors))
+            self.assertTrue(any("listed-missing.md" in error for error in errors))
+
     def test_reports_missing_outer_link_around_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -234,6 +248,19 @@ class LinkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_distinguishes_list_continuations_from_indented_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "10. rendered item\n"
+                "    [rendered](rendered-missing.md)\n"
+                "-     [code](code-missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("rendered-missing.md", errors[0])
 
     def test_ignores_literal_and_commented_html_anchor_examples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -350,6 +377,19 @@ class PortabilityTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("scripts/helper.py", errors[0])
 
+    def test_scans_utf16_bundled_text_for_portability_violations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            (root / "assets").mkdir()
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
+            (scripts / "helper.ps1").write_text("Run codex exec.\n", encoding="utf-16")
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("scripts/helper.ps1", errors[0])
+
     def test_detects_lowercase_client_cli_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -435,6 +475,11 @@ class InstallationDocumentationTests(unittest.TestCase):
         self.assertEqual(len(checks), len(copies))
         self.assertTrue(all(line.endswith(" &&") for line in checks))
         self.assertTrue(all(line.strip().endswith(" &&") for line in copies))
+        project_commands = [line for line in lines if "/path/to/robot-project" in line]
+        self.assertTrue(project_commands)
+        self.assertTrue(
+            all('"/path/to/robot-project' in line for line in project_commands)
+        )
 
 
 class SafetyDocumentationTests(unittest.TestCase):

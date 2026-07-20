@@ -76,7 +76,8 @@ MARKDOWN_REFERENCE_DEFINITION = re.compile(
 )
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
-    r"^[ \t]{0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]+|$)"
+    r"^(?P<indent>[ \t]{0,3})(?P<marker>[*+-]|\d{1,9}[.)])"
+    r"(?P<padding>[ \t]+|$)"
 )
 MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}|\t)")
 MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
@@ -96,6 +97,26 @@ MARKDOWN_BACKSLASH_ESCAPE = re.compile(
 )
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
+PORTABLE_TEXT_SUFFIXES = frozenset(
+    {
+        ".cfg",
+        ".csv",
+        ".ini",
+        ".js",
+        ".json",
+        ".md",
+        ".markdown",
+        ".ps1",
+        ".psm1",
+        ".py",
+        ".sh",
+        ".toml",
+        ".ts",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
 def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
@@ -152,6 +173,14 @@ def markdown_files(root: Path) -> list[Path]:
     )
 
 
+def markdown_list_prefix_end(match: re.Match[str]) -> int:
+    """Return the content offset for a CommonMark list marker."""
+
+    padding = match.group("padding")
+    consumed_padding = 1 if len(padding) > 4 else len(padding)
+    return match.start("padding") + consumed_padding
+
+
 def markdown_container_content(line: str) -> tuple[tuple[str, ...], str]:
     """Remove directly expressed blockquote and list container prefixes."""
 
@@ -166,10 +195,39 @@ def markdown_container_content(line: str) -> tuple[tuple[str, ...], str]:
         list_item = MARKDOWN_LIST_PREFIX.match(content)
         if list_item:
             containers.append("list")
-            content = content[list_item.end() :]
+            content = content[markdown_list_prefix_end(list_item) :]
             continue
         break
     return tuple(containers), content
+
+
+def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], str]]:
+    """Normalize direct containers and single-list continuation indentation."""
+
+    normalized: list[tuple[tuple[str, ...], str]] = []
+    active_list_indent: int | None = None
+    for line in lines:
+        leading_spaces = len(line) - len(line.lstrip(" "))
+        is_continuation = (
+            active_list_indent is not None
+            and leading_spaces >= active_list_indent
+            and bool(line.strip())
+        )
+        if is_continuation:
+            nested_containers, content = markdown_container_content(
+                line[active_list_indent:]
+            )
+            normalized.append((("list", *nested_containers), content))
+        else:
+            normalized.append(markdown_container_content(line))
+
+        list_item = MARKDOWN_LIST_PREFIX.match(line)
+        if list_item:
+            active_list_indent = markdown_list_prefix_end(list_item)
+        elif line.strip() and not is_continuation:
+            active_list_indent = None
+
+    return normalized
 
 
 def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str:
@@ -193,9 +251,10 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
     fence_character: str | None = None
     fence_length = 0
 
-    for line in text.splitlines(keepends=True):
-        content = line.rstrip("\r\n")
-        _, container_content = markdown_container_content(content)
+    container_lines = markdown_container_lines(
+        [line.rstrip("\r\n") for line in lines_with_endings]
+    )
+    for line, (_, container_content) in zip(lines_with_endings, container_lines):
         indented_code = MARKDOWN_INDENTED_CODE.match(container_content) is not None
         if fence_character is None:
             match = (
@@ -362,8 +421,12 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool]]:
         if destination is not None:
             targets.append((destination[0], True))
 
+    container_text = "\n".join(
+        content for _, content in markdown_container_lines(text.splitlines())
+    )
     targets.extend(
-        (target, True) for target in MARKDOWN_REFERENCE_DEFINITION.findall(text)
+        (target, True)
+        for target in MARKDOWN_REFERENCE_DEFINITION.findall(container_text)
     )
     targets.extend(
         (target, False) for target in html_attribute_values(text, MARKDOWN_HTML_TARGET)
@@ -409,6 +472,8 @@ def markdown_heading_fragments(text: str) -> set[str]:
     lines = text.splitlines()
     searchable_text = markdown_searchable_text(text)
     structure_lines = markdown_searchable_text(text, mask_inline_code=False).splitlines()
+    structure_containers = markdown_container_lines(structure_lines)
+    raw_containers = markdown_container_lines(lines)
     for anchor in html_attribute_values(searchable_text, MARKDOWN_HTML_ANCHOR):
         fragments.add(html_unescape(anchor))
     content_start = 0
@@ -419,9 +484,8 @@ def markdown_heading_fragments(text: str) -> set[str]:
                 break
 
     for line_index, line in enumerate(lines[content_start:], start=content_start):
-        structure_line = structure_lines[line_index]
-        containers, structure_content = markdown_container_content(structure_line)
-        _, raw_content = markdown_container_content(line)
+        containers, structure_content = structure_containers[line_index]
+        _, raw_content = raw_containers[line_index]
         atx_heading = MARKDOWN_ATX_HEADING.match(structure_content)
         if atx_heading:
             raw_heading = MARKDOWN_ATX_HEADING.match(raw_content)
@@ -493,10 +557,29 @@ def find_portability_violations(skill_root: Path) -> list[str]:
     portable_paths.extend((skill_root / "assets").rglob("*"))
     portable_paths.extend((skill_root / "scripts").rglob("*"))
     for path in sorted(path for path in portable_paths if path.is_file()):
+        data = path.read_bytes()
         try:
-            text = path.read_text(encoding="utf-8")
+            text = data.decode("utf-8")
         except UnicodeDecodeError:
-            continue
+            text = ""
+            for byte_order_mark, encoding in (
+                (b"\xff\xfe\x00\x00", "utf-32"),
+                (b"\x00\x00\xfe\xff", "utf-32"),
+                (b"\xff\xfe", "utf-16"),
+                (b"\xfe\xff", "utf-16"),
+            ):
+                if data.startswith(byte_order_mark):
+                    try:
+                        text = data.decode(encoding)
+                    except UnicodeDecodeError:
+                        pass
+                    break
+            if not text:
+                if path.suffix.lower() in PORTABLE_TEXT_SUFFIXES:
+                    errors.append(
+                        f"{path.relative_to(skill_root)}: undecodable textual resource"
+                    )
+                continue
         for label, pattern in PORTABILITY_PATTERNS.items():
             match = pattern.search(text)
             if match:
