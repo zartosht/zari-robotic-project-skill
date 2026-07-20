@@ -68,7 +68,8 @@ SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
 
-MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+MARKDOWN_LINK_START = re.compile(r"!?\[[^\]\n]*\]\(")
+IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 
 
 def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
@@ -109,8 +110,62 @@ def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
     return data, body, errors
 
 
+def is_ignored_repository_path(path: Path, root: Path) -> bool:
+    """Return whether a path belongs to generated repository-local state."""
+
+    return any(part in IGNORED_DIRECTORY_NAMES for part in path.relative_to(root).parts)
+
+
 def markdown_files(root: Path) -> list[Path]:
-    return sorted(path for path in root.rglob("*.md") if ".git" not in path.parts)
+    return sorted(
+        path for path in root.rglob("*.md") if not is_ignored_repository_path(path, root)
+    )
+
+
+def markdown_link_targets(text: str) -> list[str]:
+    """Extract inline Markdown destinations while respecting balanced parentheses."""
+
+    targets: list[str] = []
+    cursor = 0
+    while match := MARKDOWN_LINK_START.search(text, cursor):
+        start = match.end()
+        index = start
+        depth = 1
+        in_angle_destination = False
+        title_quote: str | None = None
+
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                index += 2
+                continue
+            if in_angle_destination:
+                if character == ">":
+                    in_angle_destination = False
+                index += 1
+                continue
+            if title_quote:
+                if character == title_quote:
+                    title_quote = None
+                index += 1
+                continue
+            if character == "<" and not text[start:index].strip():
+                in_angle_destination = True
+            elif character in {'"', "'"} and index > start and text[index - 1].isspace():
+                title_quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    targets.append(text[start:index])
+                    cursor = index + 1
+                    break
+            index += 1
+        else:
+            cursor = match.end()
+
+    return targets
 
 
 def find_broken_links(root: Path) -> list[str]:
@@ -118,7 +173,7 @@ def find_broken_links(root: Path) -> list[str]:
     skill_root = (root / "build-robot-project").resolve()
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
-        for raw_target in MARKDOWN_LINK.findall(text):
+        for raw_target in markdown_link_targets(text):
             target = raw_target.strip()
             if target.startswith("<") and ">" in target:
                 target = target[1 : target.index(">")]
@@ -144,6 +199,7 @@ def find_portability_violations(skill_root: Path) -> list[str]:
     portable_paths = [skill_root / "SKILL.md"]
     portable_paths.extend((skill_root / "references").rglob("*"))
     portable_paths.extend((skill_root / "assets").rglob("*"))
+    portable_paths.extend((skill_root / "scripts").rglob("*"))
     for path in sorted(path for path in portable_paths if path.is_file()):
         try:
             text = path.read_text(encoding="utf-8")
@@ -159,7 +215,11 @@ def find_portability_violations(skill_root: Path) -> list[str]:
 
 def find_secret_like_content(root: Path) -> list[str]:
     errors: list[str] = []
-    for path in sorted(path for path in root.rglob("*") if path.is_file() and ".git" not in path.parts):
+    for path in sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not is_ignored_repository_path(path, root)
+    ):
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -167,6 +227,18 @@ def find_secret_like_content(root: Path) -> list[str]:
         for label, pattern in SECRET_PATTERNS.items():
             if pattern.search(text):
                 errors.append(f"{path.relative_to(root)}: possible {label}")
+    return errors
+
+
+def find_empty_resources(root: Path) -> list[str]:
+    errors: list[str] = []
+    for path in sorted(
+        path for path in root.rglob("*") if not is_ignored_repository_path(path, root)
+    ):
+        if path.is_file() and path.stat().st_size == 0:
+            errors.append(f"empty file: {path.relative_to(root)}")
+        if path.is_dir() and not any(path.iterdir()):
+            errors.append(f"empty directory: {path.relative_to(root)}")
     return errors
 
 
@@ -204,12 +276,7 @@ def validate_repository(root: Path) -> list[str]:
         if estimated_tokens >= 5000:
             errors.append(f"SKILL.md estimated token count must stay below 5000; found {estimated_tokens}")
 
-    for path in sorted(path for path in root.rglob("*") if ".git" not in path.parts):
-        if path.is_file() and path.stat().st_size == 0:
-            errors.append(f"empty file: {path.relative_to(root)}")
-        if path.is_dir() and not any(path.iterdir()):
-            errors.append(f"empty directory: {path.relative_to(root)}")
-
+    errors.extend(find_empty_resources(root))
     errors.extend(find_broken_links(root))
     if skill_root.is_dir():
         errors.extend(find_portability_violations(skill_root))

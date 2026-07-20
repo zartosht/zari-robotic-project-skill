@@ -147,8 +147,8 @@ Codex officially documents repository-scoped and user-scoped skills under `.agen
 
 ```bash
 mkdir -p /path/to/robot-project/.agents/skills
-test ! -e /path/to/robot-project/.agents/skills/build-robot-project
-cp -R build-robot-project /path/to/robot-project/.agents/skills/
+test ! -e /path/to/robot-project/.agents/skills/build-robot-project &&
+  cp -R build-robot-project /path/to/robot-project/.agents/skills/ &&
 cp LICENSE /path/to/robot-project/.agents/skills/build-robot-project/LICENSE
 ```
 
@@ -156,12 +156,12 @@ For a user-scoped installation:
 
 ```bash
 mkdir -p "$HOME/.agents/skills"
-test ! -e "$HOME/.agents/skills/build-robot-project"
-cp -R build-robot-project "$HOME/.agents/skills/"
+test ! -e "$HOME/.agents/skills/build-robot-project" &&
+  cp -R build-robot-project "$HOME/.agents/skills/" &&
 cp LICENSE "$HOME/.agents/skills/build-robot-project/LICENSE"
 ```
 
-The `test` command intentionally stops if the destination exists. Review differences and remove or rename the old copy yourself before replacing it. Codex detects skill changes automatically in current documentation; restart if the skill does not appear.
+The chained copy sequence stops if the destination exists. Review differences and remove or rename the old copy yourself before replacing it. Codex detects skill changes automatically in current documentation; restart if the skill does not appear.
 
 Invoke with a matching request or, where supported:
 
@@ -175,8 +175,8 @@ Claude Code officially documents project skills under `.claude/skills/` and pers
 
 ```bash
 mkdir -p /path/to/robot-project/.claude/skills
-test ! -e /path/to/robot-project/.claude/skills/build-robot-project
-cp -R build-robot-project /path/to/robot-project/.claude/skills/
+test ! -e /path/to/robot-project/.claude/skills/build-robot-project &&
+  cp -R build-robot-project /path/to/robot-project/.claude/skills/ &&
 cp LICENSE /path/to/robot-project/.claude/skills/build-robot-project/LICENSE
 ```
 
@@ -184,8 +184,8 @@ Or install for the current user:
 
 ```bash
 mkdir -p "$HOME/.claude/skills"
-test ! -e "$HOME/.claude/skills/build-robot-project"
-cp -R build-robot-project "$HOME/.claude/skills/"
+test ! -e "$HOME/.claude/skills/build-robot-project" &&
+  cp -R build-robot-project "$HOME/.claude/skills/" &&
 cp LICENSE "$HOME/.claude/skills/build-robot-project/LICENSE"
 ```
 
@@ -222,8 +222,8 @@ VS Code officially documents shared project skills under `.github/skills/`, `.cl
 
 ```bash
 mkdir -p /path/to/robot-project/.github/skills
-test ! -e /path/to/robot-project/.github/skills/build-robot-project
-cp -R build-robot-project /path/to/robot-project/.github/skills/
+test ! -e /path/to/robot-project/.github/skills/build-robot-project &&
+  cp -R build-robot-project /path/to/robot-project/.github/skills/ &&
 cp LICENSE /path/to/robot-project/.github/skills/build-robot-project/LICENSE
 ```
 
