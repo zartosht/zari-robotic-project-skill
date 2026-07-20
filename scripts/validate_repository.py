@@ -78,7 +78,7 @@ SECRET_PATTERNS = {
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n])+)\]:[ \t]*"
-    r"(?:\n[ \t]{1,3})?"
+    r"(?:\n[ \t]{0,3})?"
     r"(?P<target><(?:\\.|[^<>\\\n])+>|(?:\\.|[^\s\\])+)"
     r"(?:(?:[ \t]+|\n[ \t]{0,3})(?:"
     r"\"(?:\\.|[^\"\\\n]|\n(?=[ \t]*\S))*\"|"
@@ -97,8 +97,13 @@ MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 MARKDOWN_THEMATIC_BREAK = re.compile(
     r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$"
 )
+MARKDOWN_HTML_ATTRIBUTE_NAME = r"[A-Za-z_:][A-Za-z0-9_.:-]*"
+MARKDOWN_HTML_ATTRIBUTE_VALUE = r'''(?:[^\s"'=<>`]+|"[^"]*"|'[^']*')'''
 MARKDOWN_HTML_TAG = re.compile(
-    r'''<[A-Za-z](?:[^<>"']|"[^"]*"|'[^']*')*>''', re.DOTALL
+    rf"<[A-Za-z][A-Za-z0-9-]*"
+    rf"(?:[ \t\r\n]+{MARKDOWN_HTML_ATTRIBUTE_NAME}"
+    rf"(?:[ \t\r\n]*=[ \t\r\n]*{MARKDOWN_HTML_ATTRIBUTE_VALUE})?)*"
+    rf"[ \t\r\n]*/?>"
 )
 MARKDOWN_RAW_HTML_TYPE_1 = re.compile(
     r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>]|\Z)", re.IGNORECASE
@@ -111,8 +116,6 @@ MARKDOWN_RAW_HTML_TYPE_6 = re.compile(
     r"section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[\s/>]|\Z)",
     re.IGNORECASE,
 )
-MARKDOWN_HTML_ATTRIBUTE_NAME = r"[A-Za-z_:][A-Za-z0-9_.:-]*"
-MARKDOWN_HTML_ATTRIBUTE_VALUE = r'''(?:[^\s"'=<>`]+|"[^"]*"|'[^']*')'''
 MARKDOWN_RAW_HTML_TYPE_7 = re.compile(
     rf"^[ \t]{{0,3}}(?:"
     rf"<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+{MARKDOWN_HTML_ATTRIBUTE_NAME}"
@@ -136,6 +139,7 @@ MARKDOWN_CHARACTER_REFERENCE = re.compile(
     r"&(?:#[xX][0-9A-Fa-f]{1,8}|#[0-9]{1,8}|[A-Za-z][A-Za-z0-9]{1,31});"
 )
 MARKDOWN_PARAGRAPH_BOUNDARY = re.compile(r"(?:\r\n?|\n)[ \t]*(?:\r\n?|\n)")
+MARKDOWN_REFERENCE_LABEL_MAX_LENGTH = 999
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 MARKDOWN_SUFFIXES = frozenset(
@@ -175,7 +179,10 @@ def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
     """Parse the intentionally simple scalar YAML frontmatter used by this skill."""
 
     errors: list[str] = []
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return {}, "", [f"{path}: SKILL.md must be valid UTF-8"]
     lines = text.splitlines()
     if not lines or lines[0] != "---":
         return {}, text, [f"{path}: frontmatter must start on line 1"]
@@ -702,12 +709,10 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             if comment_characters[position] not in "\r\n":
                 comment_characters[position] = " "
     comment_search_text = "".join(comment_characters)
-    for comment in re.finditer(
-        r"<!--.*?(?:-->|$)", comment_search_text, re.DOTALL
-    ):
-        if markdown_character_is_escaped(masked, comment.start()):
+    for start, end in markdown_inline_html_special_spans(comment_search_text):
+        if markdown_character_is_escaped(masked, start):
             continue
-        for position in range(comment.start(), comment.end()):
+        for position in range(start, end):
             if characters[position] not in "\r\n":
                 characters[position] = " "
 
@@ -757,6 +762,38 @@ def markdown_html_tag_is_rendered(text: str, tag: re.Match[str]) -> bool:
     if type_1 is None:
         return False
     return line_start + type_1.group(0).find("<") == tag.start()
+
+
+def markdown_inline_html_special_spans(text: str) -> list[tuple[int, int]]:
+    """Return complete inline HTML special constructs within one paragraph."""
+
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        start = text.find("<", index)
+        if start < 0:
+            break
+        if text.startswith("<!--", start):
+            opener_length, closer = 4, "-->"
+        elif text.startswith("<?", start):
+            opener_length, closer = 2, "?>"
+        elif text.startswith("<![CDATA[", start):
+            opener_length, closer = 9, "]]>"
+        elif re.match(r"<![A-Z]", text[start:]):
+            opener_length, closer = 3, ">"
+        else:
+            index = start + 1
+            continue
+
+        paragraph_end = markdown_paragraph_end(text, start)
+        closing = text.find(closer, start + opener_length, paragraph_end)
+        if closing < 0:
+            index = start + opener_length
+            continue
+        end = closing + len(closer)
+        spans.append((start, end))
+        index = end
+    return spans
 
 
 def markdown_unescape(text: str) -> str:
@@ -812,6 +849,9 @@ def markdown_reference_definitions(
     definitions: list[re.Match[str]] = []
     for match in MARKDOWN_REFERENCE_DEFINITION.finditer(container_text):
         target = match.group("target")
+        normalized_label = markdown_normalize_reference_label(match.group("label"))
+        if len(normalized_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH:
+            continue
         if not target.startswith("<") and not markdown_bare_destination_is_balanced(
             target
         ):
@@ -1342,7 +1382,15 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
     lines = text.splitlines()
     searchable_text = markdown_searchable_text(text)
-    structure_lines = markdown_searchable_text(text, mask_inline_code=False).splitlines()
+    structure_text_with_tags = markdown_searchable_text(text, mask_inline_code=False)
+    structure_characters = list(structure_text_with_tags)
+    for tag in MARKDOWN_HTML_TAG.finditer(structure_text_with_tags):
+        if not markdown_html_tag_is_rendered(structure_text_with_tags, tag):
+            continue
+        for position in range(*tag.span()):
+            if structure_characters[position] not in "\r\n":
+                structure_characters[position] = " "
+    structure_lines = "".join(structure_characters).splitlines()
     structure_containers = markdown_container_lines(structure_lines)
     raw_containers = markdown_container_lines(lines)
     structure_text = "\n".join(content for _, content in structure_containers)
@@ -1372,6 +1420,19 @@ def markdown_heading_fragments(text: str) -> set[str]:
     for line_index, line in enumerate(lines[content_start:], start=content_start):
         containers, structure_content = structure_containers[line_index]
         _, raw_content = raw_containers[line_index]
+        parent_containers, parent_content = markdown_blockquote_content(line)
+        direct_list_item = MARKDOWN_LIST_PREFIX.match(parent_content)
+        non_one_ordered_interrupt = (
+            direct_list_item is not None
+            and direct_list_item.group("marker")[0].isdigit()
+            and int(direct_list_item.group("marker")[:-1]) != 1
+            and setext_candidate is not None
+            and setext_candidate[0] == parent_containers
+        )
+        if non_one_ordered_interrupt:
+            containers = parent_containers
+            structure_content = parent_content
+            raw_content = parent_content
         if line_index in reference_definition_lines:
             setext_candidate = None
             continue
@@ -1553,6 +1614,7 @@ def find_empty_resources(root: Path) -> list[str]:
         for path in root.rglob("*")
         if path_resolves_within(path, root)
         and not is_ignored_repository_path(path, root)
+        and not (path.is_file() and is_ignored_secret_file(path))
     ):
         if path.is_file() and path.stat().st_size == 0:
             errors.append(f"empty file: {path.relative_to(root)}")
@@ -1601,9 +1663,14 @@ def validate_repository(root: Path) -> list[str]:
             errors.append("SKILL.md name must be 1-64 characters")
         if not 1 <= len(description) <= 1024:
             errors.append("SKILL.md description must be 1-1024 characters")
-        line_count = len(skill_file.read_text(encoding="utf-8").splitlines())
-        if line_count >= 500:
-            errors.append(f"SKILL.md must stay below 500 lines; found {line_count}")
+        try:
+            skill_text = skill_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            skill_text = None
+        if skill_text is not None:
+            line_count = len(skill_text.splitlines())
+            if line_count >= 500:
+                errors.append(f"SKILL.md must stay below 500 lines; found {line_count}")
         estimated_tokens = math.ceil(len(body) / 4)
         if estimated_tokens >= 5000:
             errors.append(f"SKILL.md estimated token count must stay below 5000; found {estimated_tokens}")

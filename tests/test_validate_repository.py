@@ -33,6 +33,14 @@ class FrontmatterTests(unittest.TestCase):
             _, _, errors = validator.parse_frontmatter(path)
             self.assertTrue(errors)
 
+    def test_reports_invalid_utf8_frontmatter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "SKILL.md"
+            path.write_bytes(b"\xff")
+            _, _, errors = validator.parse_frontmatter(path)
+            self.assertEqual(1, len(errors))
+            self.assertIn("valid UTF-8", errors[0])
+
 
 class LinkTests(unittest.TestCase):
     def test_reports_missing_relative_link(self) -> None:
@@ -226,6 +234,21 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_does_not_treat_non_one_list_marker_as_paragraph_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "paragraph\n"
+                "2. # phantom\n\n"
+                "2. # Real\n"
+                "[real](#real)\n"
+                "[stale](#phantom)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#phantom", errors[0])
+
     def test_accepts_local_links_with_queries_and_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -383,6 +406,16 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
 
+    def test_reports_unindented_reference_destination_on_next_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[docs]:\nmissing.md\n\n[guide][docs]\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_reports_reference_with_multiline_title(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -401,6 +434,22 @@ class LinkTests(unittest.TestCase):
                 "[old]: missing(foo.md\n\n[guide][old]\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_reference_label_longer_than_commonmark_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid_label = "a" * 999
+            overlong_label = "b" * 1000
+            (root / "README.md").write_text(
+                f"[valid][{valid_label}]\n"
+                f"[literal][{overlong_label}]\n\n"
+                f"[{valid_label}]: missing.md\n"
+                f"[{overlong_label}]: ignored-missing.md\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_ignores_unused_and_duplicate_reference_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -534,6 +583,16 @@ class LinkTests(unittest.TestCase):
     def test_html_tag_scanner_handles_large_unterminated_input(self) -> None:
         text = "<widget " + ("x" * 10_000)
         self.assertIsNone(validator.MARKDOWN_HTML_TAG.search(text))
+
+    def test_rejects_link_inside_malformed_inline_html_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "<x foo==[guide](missing.md)>\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_rejects_link_after_invalid_backtick_fence_opener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -716,6 +775,27 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_stops_inline_html_comment_at_paragraph_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "text <!--\n\n[guide](missing.md) -->\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_masks_special_inline_html_constructs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "text <? [one](first-missing.md) ?>\n"
+                "text <!A [two](second-missing.md)>\n"
+                "text <![CDATA[[three](third-missing.md)]]>\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_stops_unclosed_special_html_blocks_when_container_ends(self) -> None:
         openers = ("<!-- unclosed", "<? unclosed", "<!DECLARATION", "<![CDATA[")
@@ -909,6 +989,17 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.html", errors[0])
+
+    def test_excludes_heading_inside_multiline_html_attribute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div\n title="\n# phantom\n">\n\n[stale](#phantom)\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#phantom", errors[0])
 
     def test_rejects_link_after_malformed_type_seven_html_opener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1230,6 +1321,13 @@ class ResourceTests(unittest.TestCase):
             (package / "__init__.py").write_bytes(b"")
             self.assertEqual([], validator.find_empty_resources(root))
 
+    def test_ignores_empty_local_credential_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename in (".env", ".env.local", "private.pem", "private.key"):
+                (root / filename).write_bytes(b"")
+            self.assertEqual([], validator.find_empty_resources(root))
+
 
 class InstallationDocumentationTests(unittest.TestCase):
     def test_copy_installation_commands_are_fail_closed(self) -> None:
@@ -1305,6 +1403,15 @@ class RepositoryTests(unittest.TestCase):
                 "build-robot-project/references/discovery-interview.md",
                 errors,
             )
+
+    def test_reports_invalid_skill_encoding_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill_root = root / "build-robot-project"
+            skill_root.mkdir()
+            (skill_root / "SKILL.md").write_bytes(b"\xff")
+            errors = validator.validate_repository(root)
+            self.assertTrue(any("valid UTF-8" in error for error in errors))
 
     def test_current_repository_passes(self) -> None:
         self.assertEqual([], validator.validate_repository(REPOSITORY_ROOT))
