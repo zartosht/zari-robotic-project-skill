@@ -77,7 +77,7 @@ SECRET_PATTERNS = {
 }
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n])+)\]:[ \t]*"
+    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n]|\n(?![ \t]*\n))+)\]:[ \t]*"
     r"(?:\n[ \t]{0,3})?"
     r"(?P<target><(?:\\.|[^<>\\\n])+>|(?:\\.|[^\s\\])+)"
     r"(?:(?:[ \t]+|\n[ \t]{0,3})(?:"
@@ -791,6 +791,15 @@ def markdown_inline_html_special_spans(text: str) -> list[tuple[int, int]]:
             index = start + opener_length
             continue
         end = closing + len(closer)
+        if text.startswith("<!--", start):
+            content = text[start + opener_length : closing]
+            if (
+                content.startswith((">", "->"))
+                or content.endswith("-")
+                or "--" in content
+            ):
+                index = start + opener_length
+                continue
         spans.append((start, end))
         index = end
     return spans
@@ -849,8 +858,8 @@ def markdown_reference_definitions(
     definitions: list[re.Match[str]] = []
     for match in MARKDOWN_REFERENCE_DEFINITION.finditer(container_text):
         target = match.group("target")
-        normalized_label = markdown_normalize_reference_label(match.group("label"))
-        if len(normalized_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH:
+        raw_label = match.group("label")
+        if len(raw_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH:
             continue
         if not target.startswith("<") and not markdown_bare_destination_is_balanced(
             target
@@ -936,15 +945,18 @@ def markdown_reference_usages(
             continue
         whitespace_end = markdown_inline_whitespace_end(text, cursor)
         if whitespace_end is None:
-            continue
-        cursor = whitespace_end
-        if cursor < len(text) and text[cursor] == "[":
-            reference_end = markdown_label_end(text, cursor)
-            if reference_end is None:
-                continue
-            reference_label = text[cursor + 1 : reference_end] or primary_label
-        else:
             reference_label = primary_label
+        else:
+            cursor = whitespace_end
+            if cursor < len(text) and text[cursor] == "[":
+                reference_end = markdown_label_end(text, cursor)
+                if reference_end is None:
+                    continue
+                reference_label = text[cursor + 1 : reference_end] or primary_label
+            else:
+                reference_label = primary_label
+        if len(reference_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH:
+            continue
         normalized = markdown_normalize_reference_label(reference_label)
         if normalized in reference_labels:
             usages[normalized] = usages.get(normalized, False) or is_image
@@ -1003,9 +1015,16 @@ def markdown_label_contains_active_link(
                 reference_label = text[cursor + 1 : reference_end]
                 if not reference_label:
                     reference_label = text[index + 1 : nested_end]
-                if markdown_normalize_reference_label(reference_label) in reference_labels:
+                if (
+                    len(reference_label) <= MARKDOWN_REFERENCE_LABEL_MAX_LENGTH
+                    and markdown_normalize_reference_label(reference_label)
+                    in reference_labels
+                ):
                     return True
         elif (
+            len(text[index + 1 : nested_end])
+            <= MARKDOWN_REFERENCE_LABEL_MAX_LENGTH
+            and
             markdown_normalize_reference_label(text[index + 1 : nested_end])
             in reference_labels
         ):
@@ -1169,8 +1188,10 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
         while index < paragraph_end:
             character = text[index]
             if character == "\\":
-                index += 2
-                continue
+                escape = MARKDOWN_BACKSLASH_ESCAPE.match(text, index)
+                if escape is not None:
+                    index = escape.end()
+                    continue
             if character.isspace() or (character == ")" and depth == 0):
                 break
             if character == "(":
@@ -1240,21 +1261,21 @@ def markdown_active_image_label_ranges(
         if not active:
             whitespace_end = markdown_inline_whitespace_end(text, cursor)
             if whitespace_end is None:
-                continue
-            cursor = whitespace_end
-            if cursor < len(text) and text[cursor] == "[":
-                reference_end = markdown_label_end(text, cursor)
-                if reference_end is not None:
-                    reference_label = text[cursor + 1 : reference_end] or primary_label
-                    active = (
-                        markdown_normalize_reference_label(reference_label)
-                        in reference_labels
-                    )
+                reference_label = primary_label
             else:
-                active = (
-                    markdown_normalize_reference_label(primary_label)
-                    in reference_labels
-                )
+                cursor = whitespace_end
+                if cursor < len(text) and text[cursor] == "[":
+                    reference_end = markdown_label_end(text, cursor)
+                    if reference_end is None:
+                        continue
+                    reference_label = text[cursor + 1 : reference_end] or primary_label
+                else:
+                    reference_label = primary_label
+            active = (
+                len(reference_label) <= MARKDOWN_REFERENCE_LABEL_MAX_LENGTH
+                and markdown_normalize_reference_label(reference_label)
+                in reference_labels
+            )
         if active:
             ranges.append((label_start, label_end))
     return ranges
@@ -1330,14 +1351,48 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     return targets
 
 
+def markdown_strip_inline_link_destinations(text: str) -> str:
+    """Keep rendered labels while removing valid inline link destinations."""
+
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        is_image = (
+            text.startswith("![", index)
+            and not markdown_character_is_escaped(text, index)
+        )
+        label_start = index + 1 if is_image else index
+        if (
+            text[label_start] != "["
+            or markdown_character_is_escaped(text, label_start)
+        ):
+            result.append(text[index])
+            index += 1
+            continue
+
+        label_end = markdown_label_end(text, label_start)
+        if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":
+            result.append(text[index])
+            index += 1
+            continue
+        destination = markdown_destination_end(text, label_end + 1)
+        if destination is None:
+            result.append(text[index])
+            index += 1
+            continue
+
+        result.append(text[label_start + 1 : label_end])
+        index = destination[1] + 1
+    return "".join(result)
+
+
 def github_heading_slug(heading: str) -> str:
     """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
 
     heading = markdown_protect_code_span_angles(heading)
     heading = re.sub(r"!\[([^\]]*)\]\s*\[[^\]]*\]", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\s*\[[^\]]*\]", r"\1", heading)
-    heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
-    heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
+    heading = markdown_strip_inline_link_destinations(heading)
     heading = MARKDOWN_AUTOLINK.sub(r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
     heading = heading.replace(MARKDOWN_CODE_SPAN_LT, "<").replace(
@@ -1550,14 +1605,12 @@ def find_broken_links(root: Path) -> list[str]:
 
 def find_portability_violations(skill_root: Path) -> list[str]:
     errors: list[str] = []
-    portable_paths = [skill_root / "SKILL.md"]
-    portable_paths.extend((skill_root / "references").rglob("*"))
-    portable_paths.extend((skill_root / "assets").rglob("*"))
-    portable_paths.extend((skill_root / "scripts").rglob("*"))
     for path in sorted(
         path
-        for path in portable_paths
-        if path.is_file() and path_resolves_within(path, skill_root)
+        for path in skill_root.rglob("*")
+        if path.is_file()
+        and path_resolves_within(path, skill_root)
+        and path.relative_to(skill_root).parts[:1] != ("agents",)
     ):
         data = path.read_bytes()
         text = decode_text_data(data)

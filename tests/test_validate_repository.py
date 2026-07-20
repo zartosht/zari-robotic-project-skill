@@ -111,6 +111,22 @@ class LinkTests(unittest.TestCase):
             (root / "guide.md").write_text("# Details\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_strips_balanced_inline_destination_from_heading_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = root / "docs"
+            docs.mkdir()
+            (docs / "(legacy).md").write_text("legacy\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "# [API](docs/(legacy).md)\n"
+                "[rendered](#api)\n"
+                "[stale](#apimd)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#apimd", errors[0])
+
     def test_preserves_literal_underscores_in_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -350,6 +366,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_bare_destination_with_backslash_before_space(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide](missing\\ file.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_backslash_escaped_punctuation_in_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -368,6 +392,26 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
+
+    def test_reports_shortcut_reference_before_paragraph_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[docs]\n\n[docs]: missing.md\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_reports_multiline_reference_definition_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide][foo bar]\n\n[foo\nbar]: missing.md\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_reports_reference_label_with_escaped_closing_bracket(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -450,6 +494,15 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_ignores_overlong_reference_usage_label_before_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide][" + (" " * 999) + "a]\n\n[a]: missing.md\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_ignores_unused_and_duplicate_reference_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -781,6 +834,16 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 "text <!--\n\n[guide](missing.md) -->\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_preserves_link_inside_malformed_inline_html_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "text <!-- bad -- [guide](missing.md) -->\n", encoding="utf-8"
             )
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
@@ -1206,6 +1269,26 @@ class PortabilityTests(unittest.TestCase):
             errors = validator.find_portability_violations(root)
             self.assertEqual(1, len(errors))
             self.assertIn("scripts/helper.py", errors[0])
+
+    def test_scans_other_distributed_resources_for_portability_violations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            examples = root / "examples"
+            examples.mkdir()
+            (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
+            (examples / "usage.md").write_text("Run codex exec.\n", encoding="utf-8")
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("examples/usage.md", errors[0])
+
+    def test_excludes_intentional_agent_metadata_from_portability_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
+            (agents / "openai.yaml").write_text("Use Codex metadata.\n", encoding="utf-8")
+            self.assertEqual([], validator.find_portability_violations(root))
 
     def test_scans_utf16_bundled_text_for_portability_violations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
