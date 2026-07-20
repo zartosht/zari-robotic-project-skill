@@ -251,6 +251,21 @@ def decode_text_data(data: bytes) -> str | None:
         return None
 
 
+def data_looks_binary(data: bytes) -> bool:
+    """Detect binary payloads without misclassifying BOM-marked Unicode text."""
+
+    unicode_boms = (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff", b"\xff\xfe", b"\xfe\xff")
+    if data.startswith(unicode_boms):
+        return False
+    sample = data[:8192]
+    if b"\x00" in sample:
+        return True
+    control_bytes = sum(
+        byte < 32 and byte not in {8, 9, 10, 12, 13} for byte in sample
+    )
+    return bool(sample) and control_bytes / len(sample) > 0.3
+
+
 def markdown_files(root: Path) -> list[Path]:
     return sorted(
         path
@@ -266,8 +281,35 @@ def markdown_list_prefix_end(match: re.Match[str]) -> int:
     """Return the content offset for a CommonMark list marker."""
 
     padding = match.group("padding")
-    consumed_padding = 1 if len(padding) > 4 else len(padding)
+    padding_start = match.start("padding")
+    start_column = len(match.string[:padding_start].expandtabs(4))
+    padding_columns = (
+        len((" " * start_column + padding).expandtabs(4)) - start_column
+    )
+    consumed_padding = 1 if padding_columns > 4 else len(padding)
     return match.start("padding") + consumed_padding
+
+
+def markdown_list_prefix_columns(match: re.Match[str]) -> int:
+    """Return the visual content column after a CommonMark list marker."""
+
+    return len(match.string[: markdown_list_prefix_end(match)].expandtabs(4))
+
+
+def markdown_strip_indent_columns(text: str, required_columns: int) -> str | None:
+    """Remove required leading columns, expanding tabs at four-column stops."""
+
+    index = 0
+    columns = 0
+    while index < len(text) and text[index] in " \t" and columns < required_columns:
+        if text[index] == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            columns += 1
+        index += 1
+    if columns < required_columns:
+        return None
+    return (" " * (columns - required_columns)) + text[index:]
 
 
 def markdown_blockquote_content(line: str) -> tuple[tuple[str, ...], str]:
@@ -316,17 +358,19 @@ def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], st
     active_list_parent: tuple[str, ...] | None = None
     for line in lines:
         parent_containers, parent_content = markdown_blockquote_content(line)
-        leading_spaces = len(parent_content) - len(parent_content.lstrip(" "))
+        continuation_content = (
+            markdown_strip_indent_columns(parent_content, active_list_indent)
+            if active_list_indent is not None
+            else None
+        )
         is_continuation = (
             active_list_indent is not None
             and active_list_parent == parent_containers
-            and leading_spaces >= active_list_indent
+            and continuation_content is not None
             and bool(parent_content.strip())
         )
         if is_continuation:
-            nested_containers, content = markdown_container_content(
-                parent_content[active_list_indent:]
-            )
+            nested_containers, content = markdown_container_content(continuation_content)
             normalized.append(
                 (
                     (*parent_containers, "list", *nested_containers),
@@ -338,7 +382,7 @@ def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], st
 
         list_item = MARKDOWN_LIST_PREFIX.match(parent_content)
         if list_item:
-            active_list_indent = markdown_list_prefix_end(list_item)
+            active_list_indent = markdown_list_prefix_columns(list_item)
             active_list_parent = parent_containers
         elif parent_content.strip() and not is_continuation:
             active_list_indent = None
@@ -366,13 +410,16 @@ def markdown_fence_container_spec(
             continue
         list_item = MARKDOWN_LIST_PREFIX.match(remaining)
         if list_item:
-            indent = markdown_list_prefix_end(list_item)
+            raw_indent = markdown_list_prefix_end(list_item)
+            indent = markdown_list_prefix_columns(list_item)
         else:
-            leading_spaces = len(remaining) - len(remaining.lstrip(" "))
-            indent = min(leading_spaces, prefix_end - cursor)
+            raw_indent = min(
+                len(remaining) - len(remaining.lstrip(" \t")), prefix_end - cursor
+            )
+            indent = len(remaining[:raw_indent].expandtabs(4))
         if indent <= 0:
             return None
-        cursor += indent
+        cursor += raw_indent
         spec.append((container, indent))
     return tuple(spec) if cursor == prefix_end else None
 
@@ -394,10 +441,10 @@ def markdown_fence_container_content(
             if any(kind == "blockquote" for kind, _ in spec[index + 1 :]):
                 return None
             return ""
-        leading_spaces = len(content) - len(content.lstrip(" "))
-        if leading_spaces < indent:
+        stripped = markdown_strip_indent_columns(content, indent)
+        if stripped is None:
             return None
-        content = content[indent:]
+        content = stripped
     return content
 
 
@@ -867,6 +914,16 @@ def markdown_reference_definitions(
             continue
         line_index = container_text.count("\n", 0, match.start())
         containers, _ = container_lines[line_index]
+        end_line_index = container_text.count(
+            "\n", 0, max(match.start(), match.end() - 1)
+        )
+        if any(
+            continued_containers != containers
+            for continued_containers, _ in container_lines[
+                line_index + 1 : end_line_index + 1
+            ]
+        ):
+            continue
         if line_index == 0:
             definitions.append(match)
             continue
@@ -1143,8 +1200,8 @@ def markdown_label_end(text: str, start: int) -> int | None:
 
     depth = 1
     index = start + 1
-    paragraph_end = markdown_paragraph_end(text, start)
-    while index < paragraph_end:
+    inline_block_end = markdown_inline_block_end(text, start)
+    while index < inline_block_end:
         character = text[index]
         if character == "\\":
             index += 2
@@ -1157,6 +1214,56 @@ def markdown_label_end(text: str, start: int) -> int | None:
                 return index
         index += 1
     return None
+
+
+def markdown_inline_block_end(text: str, start: int) -> int:
+    """Return the next paragraph-interrupting block boundary after an inline start."""
+
+    paragraph_end = markdown_paragraph_end(text, start)
+    lines_with_endings = text[:paragraph_end].splitlines(keepends=True)
+    lines = [line.rstrip("\r\n") for line in lines_with_endings]
+    container_lines = markdown_container_lines(lines)
+    line_offsets: list[int] = []
+    offset = 0
+    for line in lines_with_endings:
+        line_offsets.append(offset)
+        offset += len(line)
+    start_line = max(
+        index for index, line_offset in enumerate(line_offsets) if line_offset <= start
+    )
+    start_containers = container_lines[start_line][0]
+
+    for line_index in range(start_line + 1, len(lines)):
+        containers, content = container_lines[line_index]
+        parent_containers, parent_content = markdown_blockquote_content(lines[line_index])
+        direct_list_item = MARKDOWN_LIST_PREFIX.match(parent_content)
+        non_one_ordered_item = (
+            direct_list_item is not None
+            and direct_list_item.group("marker")[0].isdigit()
+            and int(direct_list_item.group("marker")[:-1]) != 1
+            and parent_containers == start_containers
+        )
+        if non_one_ordered_item:
+            containers = parent_containers
+            content = parent_content
+        if containers != start_containers or markdown_line_interrupts_paragraph(content):
+            return line_offsets[line_index]
+    return paragraph_end
+
+
+def markdown_line_interrupts_paragraph(content: str) -> bool:
+    """Return whether content begins a block that can interrupt a paragraph."""
+
+    stripped = content.lstrip(" \t")
+    return bool(
+        MARKDOWN_ATX_HEADING.match(content)
+        or MARKDOWN_THEMATIC_BREAK.match(content)
+        or markdown_fence_opening(content)
+        or MARKDOWN_RAW_HTML_TYPE_1.match(content)
+        or MARKDOWN_RAW_HTML_TYPE_6.match(content)
+        or stripped.startswith(("<!--", "<?", "<![CDATA["))
+        or re.match(r"<![A-Z]", stripped)
+    )
 
 
 def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
@@ -1386,6 +1493,30 @@ def markdown_strip_inline_link_destinations(text: str) -> str:
     return "".join(result)
 
 
+def markdown_strip_inline_html_constructs(text: str) -> str:
+    """Remove complete rendered inline HTML while retaining visible text."""
+
+    spans: list[tuple[int, int]] = []
+    special_search_characters = list(text)
+    for tag in MARKDOWN_HTML_TAG.finditer(text):
+        spans.append(tag.span())
+        for position in range(*tag.span()):
+            special_search_characters[position] = " "
+    special_search_text = "".join(special_search_characters)
+    spans.extend(markdown_inline_html_special_spans(special_search_text))
+
+    result: list[str] = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if start < cursor:
+            cursor = max(cursor, end)
+            continue
+        result.append(text[cursor:start])
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
 def github_heading_slug(heading: str) -> str:
     """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
 
@@ -1394,7 +1525,7 @@ def github_heading_slug(heading: str) -> str:
     heading = re.sub(r"\[([^\]]+)\]\s*\[[^\]]*\]", r"\1", heading)
     heading = markdown_strip_inline_link_destinations(heading)
     heading = MARKDOWN_AUTOLINK.sub(r"\1", heading)
-    heading = re.sub(r"<[^>]+>", "", heading)
+    heading = markdown_strip_inline_html_constructs(heading)
     heading = heading.replace(MARKDOWN_CODE_SPAN_LT, "<").replace(
         MARKDOWN_CODE_SPAN_GT, ">"
     )
@@ -1613,6 +1744,8 @@ def find_portability_violations(skill_root: Path) -> list[str]:
         and path.relative_to(skill_root).parts[:1] != ("agents",)
     ):
         data = path.read_bytes()
+        if data_looks_binary(data):
+            continue
         text = decode_text_data(data)
         if text is None:
             if path.suffix.lower() in PORTABLE_TEXT_SUFFIXES:

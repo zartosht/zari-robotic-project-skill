@@ -142,6 +142,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#motordriver", errors[0])
 
+    def test_strips_complete_inline_html_from_heading_fragments(self) -> None:
+        headings = (
+            "hello <!-- a > b --> world",
+            'hello <span title="a > b"> world',
+        )
+        for heading in headings:
+            with self.subTest(heading=heading), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "README.md").write_text(
+                    f"# {heading}\n[rendered](#hello--world)\n", encoding="utf-8"
+                )
+                self.assertEqual([], validator.find_broken_links(root))
+
     def test_decodes_entities_before_generating_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -355,6 +368,23 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_link_label_crossing_block_boundary(self) -> None:
+        block_starts = ("# heading", "- item", "> quote", "```", "<!-- block")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for block_start in block_starts:
+                with self.subTest(block_start=block_start):
+                    (root / "README.md").write_text(
+                        f"[guide\n{block_start}](missing.md)\n", encoding="utf-8"
+                    )
+                    self.assertEqual([], validator.find_broken_links(root))
+            (root / "README.md").write_text(
+                "[guide\ncontinuation](missing.md)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_accepts_destination_with_balanced_parentheses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -412,6 +442,14 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_ignores_multiline_reference_definition_across_container_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[foo\n- bar]: missing.md\n\n[x][foo bar]\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_reports_reference_label_with_escaped_closing_bracket(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -666,6 +704,20 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_expands_list_marker_tab_when_scoping_fenced_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "-\t```\n  [guide](missing.md)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+            (root / "README.md").write_text(
+                "-\t```\n    [literal](missing.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_scopes_fenced_code_blocks_to_their_container(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1255,6 +1307,13 @@ class PortabilityTests(unittest.TestCase):
             assets.mkdir()
             (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
             (assets / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff")
+            self.assertEqual([], validator.find_portability_violations(root))
+
+    def test_skips_utf8_decodable_binary_portable_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
+            (root / "model.bin").write_bytes(b"\x00codex\x00")
             self.assertEqual([], validator.find_portability_violations(root))
 
     def test_scans_bundled_scripts_for_portability_violations(self) -> None:
