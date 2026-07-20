@@ -52,8 +52,13 @@ PORTABILITY_PATTERNS = {
     "Claude-specific path": re.compile(r"\.claude(?:/|\\\\)"),
     "Gemini-specific path": re.compile(r"\.gemini(?:/|\\\\)"),
     "client-specific user-input tool": re.compile(r"\b(?:request_user_input|get_user_input)\b"),
-    "machine-specific macOS path": re.compile(r"/Users/[^/\s]+/"),
-    "machine-specific Linux path": re.compile(r"(?:/home/[^/\s]+/|/root/)"),
+    "machine-specific macOS path": re.compile(
+        r"/Users/[^/\s]+(?=/|[\s)\]}>.,;:!?]|$)"
+    ),
+    "machine-specific Linux path": re.compile(
+        r"(?:/home/[^/\s]+(?=/|[\s)\]}>.,;:!?]|$)|"
+        r"/root(?=/|[\s)\]}>.,;:!?]|$))"
+    ),
     "machine-specific Windows path": re.compile(r"[A-Za-z]:\\Users\\", re.IGNORECASE),
     "shell-specific preapproval syntax": re.compile(r"\bBash\([^\n]*\)"),
 }
@@ -80,8 +85,8 @@ MARKDOWN_LIST_PREFIX = re.compile(
     r"^(?P<indent>[ \t]{0,3})(?P<marker>[*+-]|\d{1,9}[.)])"
     r"(?P<padding>[ \t]+|$)"
 )
-MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}|\t)")
-MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}| {0,3}\t)")
+MARKDOWN_FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 MARKDOWN_HTML_TAG = re.compile(r"<[A-Za-z][^<>]*>", re.DOTALL)
@@ -558,7 +563,7 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
                 fence_line = True
         else:
             closing_fence = re.compile(
-                rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
+                rf"^ {{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
             )
             if active_fence_content is not None and closing_fence.match(
                 active_fence_content
@@ -832,41 +837,75 @@ def markdown_label_end(text: str, start: int) -> int | None:
 
 
 def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
-    """Extract a parenthesized destination with balanced nested parentheses."""
+    """Extract a valid CommonMark inline destination and its closing parenthesis."""
 
     start = opening + 1
     index = start
-    depth = 1
-    in_angle_destination = False
-    title_quote: str | None = None
+    if index >= len(text):
+        return None
 
+    if text[index] == "<":
+        index += 1
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                index += 2
+                continue
+            if character in "\r\n<":
+                return None
+            if character == ">":
+                index += 1
+                break
+            index += 1
+        else:
+            return None
+    else:
+        depth = 0
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                index += 2
+                continue
+            if character.isspace() or (character == ")" and depth == 0):
+                break
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            index += 1
+        if depth:
+            return None
+
+    destination_end = index
+    separator_start = index
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        return None
+    if text[index] == ")":
+        return text[start:destination_end], index
+    if index == separator_start or text[index] not in {'"', "'", "("}:
+        return None
+
+    title_closer = ")" if text[index] == "(" else text[index]
+    index += 1
     while index < len(text):
         character = text[index]
         if character == "\\":
             index += 2
             continue
-        if in_angle_destination:
-            if character == ">":
-                in_angle_destination = False
+        if character == title_closer:
             index += 1
-            continue
-        if title_quote:
-            if character == title_quote:
-                title_quote = None
-            index += 1
-            continue
-        if character == "<" and not text[start:index].strip():
-            in_angle_destination = True
-        elif character in {'"', "'"} and index > start and text[index - 1].isspace():
-            title_quote = character
-        elif character == "(":
-            depth += 1
-        elif character == ")":
-            depth -= 1
-            if depth == 0:
-                return text[start:index], index
+            break
         index += 1
-    return None
+    else:
+        return None
+
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] != ")":
+        return None
+    return text[start:destination_end], index
 
 
 def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
@@ -1026,8 +1065,21 @@ def find_broken_links(root: Path) -> list[str]:
     repository_root = root.resolve()
     skill_root = (repository_root / "build-robot-project").resolve()
     fragment_cache: dict[Path, set[str]] = {}
+    decoded_markdown_cache: dict[Path, str | None] = {}
+
+    def read_markdown(path: Path) -> str | None:
+        if path not in decoded_markdown_cache:
+            decoded_markdown_cache[path] = decode_text_data(path.read_bytes())
+            if decoded_markdown_cache[path] is None:
+                errors.append(
+                    f"{path.relative_to(root)}: undecodable textual resource"
+                )
+        return decoded_markdown_cache[path]
+
     for path in markdown_files(root):
-        text = path.read_text(encoding="utf-8")
+        text = read_markdown(path)
+        if text is None:
+            continue
         for raw_target, is_markdown, requires_file in markdown_link_targets(text):
             target = raw_target.strip()
             if not target:
@@ -1082,9 +1134,10 @@ def find_broken_links(root: Path) -> list[str]:
                 and resolved.suffix.lower() in MARKDOWN_SUFFIXES
             ):
                 if resolved not in fragment_cache:
-                    fragment_cache[resolved] = markdown_heading_fragments(
-                        resolved.read_text(encoding="utf-8")
-                    )
+                    resolved_text = read_markdown(resolved)
+                    if resolved_text is None:
+                        continue
+                    fragment_cache[resolved] = markdown_heading_fragments(resolved_text)
                 if fragment not in fragment_cache[resolved]:
                     errors.append(
                         f"{path.relative_to(root)}: broken Markdown fragment "

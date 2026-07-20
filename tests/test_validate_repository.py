@@ -57,6 +57,25 @@ class LinkTests(unittest.TestCase):
             (root / "README.md").write_text("[top]()\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_decodes_utf16_markdown_before_scanning_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[missing](missing.md)\n", encoding="utf-16"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_decodes_utf16_markdown_fragment_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[details](guide.md#details)\n", encoding="utf-8"
+            )
+            (root / "guide.md").write_text("# Details\n", encoding="utf-16")
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_mixed_case_external_uri_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -244,6 +263,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_inline_construct_with_invalid_bare_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[example](missing file.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_destination_with_balanced_parentheses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -399,6 +426,16 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 "``` bad ` info\n[guide](missing.md)\n```\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_rejects_link_after_tab_indented_fence_opener(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                " \t```\n[guide](missing.md)\n```\n", encoding="utf-8"
             )
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
@@ -755,12 +792,27 @@ class PortabilityTests(unittest.TestCase):
             (root / "references").mkdir()
             (root / "assets").mkdir()
             skill_file = root / "SKILL.md"
-            for path in ("/home/alice/robot-project", "/root/robot-project"):
+            for path in (
+                "/home/alice/robot-project",
+                "/home/alice",
+                "/root/robot-project",
+                "/root",
+            ):
                 with self.subTest(path=path):
                     skill_file.write_text(f"Open {path}.\n", encoding="utf-8")
                     errors = validator.find_portability_violations(root)
                     self.assertEqual(1, len(errors))
                     self.assertIn("machine-specific Linux path", errors[0])
+
+    def test_detects_macos_user_home_without_trailing_slash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            (root / "assets").mkdir()
+            (root / "SKILL.md").write_text("Open /Users/alice\n", encoding="utf-8")
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("machine-specific macOS path", errors[0])
 
     def test_detects_canonical_windows_user_home_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
