@@ -307,7 +307,7 @@ Claims are labeled as confirmed specifications, manufacturer claims, retailer cl
 
 ## Safety and Approval Model
 
-Explicit confirmation is required before purchasing, applying power to new wiring, connecting batteries or actuators to power, uploading movement-capable firmware, first movement, increasing motion energy, autonomous or floor movement, cameras, always-listening microphones, sensitive-data transmission, dangerous tools, mains voltage, high-current work, custom battery packs, or unresolved electrical compatibility.
+Explicit confirmation is required before purchasing, applying power to new wiring, connecting batteries or actuators to power, uploading movement-capable firmware, first movement, first body contact for a wearable or haptic robot, increasing motion energy, autonomous or floor movement, cameras, always-listening microphones, sensitive-data transmission, dangerous tools, mains voltage, high-current work, custom battery packs, or unresolved electrical compatibility.
 
 AI may propose intent only. A deterministic validator must convert approved intent into bounded commands, and firmware must independently enforce limits, freshness, watchdog stops, fault stops, safe startup, and emergency stopping. Any motion capable of injury or material property damage requires a reachable, latching physical stop or non-network power/enable cut-off independent of the app and primary control process.
 

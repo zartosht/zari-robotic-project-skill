@@ -21,6 +21,7 @@ Require explicit user confirmation before:
 - introducing, storing, pressurizing, preloading, or releasing hazardous energy, including pressure, gravity, springs, flywheels, heat, or non-electrical actuation;
 - uploading firmware capable of causing movement;
 - performing the first physical movement test;
+- first body contact for a wearable, haptic, or body-contact robot;
 - increasing actuator speed, force, torque, travel, or movement range;
 - enabling autonomous movement or floor movement;
 - enabling an always-listening microphone or a camera;
@@ -101,7 +102,7 @@ For wearables, haptics, or body-contact robots:
 - limit skin pressure, temperature, vibration intensity, duty cycle, and wear duration;
 - prevent circulation restriction, entanglement, and snagging;
 - provide a quick-release or breakaway appropriate to the hazard;
-- test conservative cues on a non-body mock before body contact;
+- test conservative cues on a non-body mock, then require explicit user confirmation before first body contact;
 - do not make navigation or other safety-critical decisions depend solely on unqualified haptic output;
 - seek qualified human-factors or clinical review for assistive or medical use.
 

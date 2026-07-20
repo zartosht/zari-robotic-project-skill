@@ -21,6 +21,7 @@ REQUIRED_ROOT_FILES = (
     "tests/forward-tests.md",
     "tests/forward-test-report.md",
     "tests/adversarial-review-report.md",
+    "tests/test_validate_repository.py",
 )
 
 REQUIRED_SKILL_FILES = (
@@ -72,6 +73,9 @@ MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|[^\s\n]+)"
 )
 MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
+MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
+MARKDOWN_HTML_ANCHOR = re.compile(r"\b(?:id|name)\s*=\s*(['\"])(.*?)\1", re.IGNORECASE)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 
@@ -283,9 +287,78 @@ def markdown_link_targets(text: str) -> list[str]:
     return targets
 
 
+def github_heading_slug(heading: str) -> str:
+    """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
+
+    heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+    heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
+    heading = re.sub(r"<[^>]+>", "", heading)
+    heading = re.sub(r"[\*_~`]", "", heading).lower()
+    characters = [
+        character
+        for character in heading
+        if character.isalnum() or character in {"-", "_"} or character.isspace()
+    ]
+    return re.sub(r"\s+", "-", "".join(characters).strip())
+
+
+def markdown_heading_fragments(text: str) -> set[str]:
+    """Collect generated heading fragments and explicit HTML anchors outside fences."""
+
+    fragments: set[str] = set()
+    slug_counts: dict[str, int] = {}
+    fence_character: str | None = None
+    fence_length = 0
+    setext_candidate: str | None = None
+
+    def add_heading(heading: str) -> None:
+        heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading)
+        base = github_heading_slug(heading)
+        if not base:
+            return
+        duplicate_index = slug_counts.get(base, 0)
+        slug_counts[base] = duplicate_index + 1
+        fragments.add(base if duplicate_index == 0 else f"{base}-{duplicate_index}")
+
+    for line in text.splitlines():
+        if fence_character is None:
+            fence = MARKDOWN_FENCE_START.match(line)
+            if fence:
+                marker = fence.group(1)
+                fence_character = marker[0]
+                fence_length = len(marker)
+                setext_candidate = None
+                continue
+        else:
+            closing_fence = re.compile(
+                rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
+            )
+            if closing_fence.match(line):
+                fence_character = None
+                fence_length = 0
+            continue
+
+        for anchor in MARKDOWN_HTML_ANCHOR.finditer(line):
+            fragments.add(anchor.group(2))
+
+        atx_heading = MARKDOWN_ATX_HEADING.match(line)
+        if atx_heading:
+            add_heading(atx_heading.group(1))
+            setext_candidate = None
+            continue
+        if MARKDOWN_SETEXT_HEADING.match(line) and setext_candidate:
+            add_heading(setext_candidate)
+            setext_candidate = None
+            continue
+        setext_candidate = line.strip() or None
+
+    return fragments
+
+
 def find_broken_links(root: Path) -> list[str]:
     errors: list[str] = []
     skill_root = (root / "build-robot-project").resolve()
+    fragment_cache: dict[Path, set[str]] = {}
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
         for raw_target in markdown_link_targets(text):
@@ -294,10 +367,12 @@ def find_broken_links(root: Path) -> list[str]:
                 target = target[1 : target.index(">")]
             else:
                 target = target.split(" ", 1)[0]
-            if not target or target.startswith(("#", "//")) or URI_SCHEME.match(target):
+            if not target or target.startswith("//") or URI_SCHEME.match(target):
                 continue
-            target = unquote(target.split("#", 1)[0])
-            resolved = (path.parent / target).resolve()
+            path_target, separator, fragment = target.partition("#")
+            path_target = unquote(path_target)
+            fragment = unquote(fragment) if separator else ""
+            resolved = (path.parent / path_target).resolve() if path_target else path.resolve()
             if path.resolve().is_relative_to(skill_root) and not resolved.is_relative_to(skill_root):
                 errors.append(
                     f"{path.relative_to(root)}: relative link escapes distributable skill "
@@ -306,6 +381,17 @@ def find_broken_links(root: Path) -> list[str]:
                 continue
             if not resolved.exists():
                 errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                continue
+            if fragment and resolved.is_file() and resolved.suffix.lower() in {".md", ".markdown"}:
+                if resolved not in fragment_cache:
+                    fragment_cache[resolved] = markdown_heading_fragments(
+                        resolved.read_text(encoding="utf-8")
+                    )
+                if fragment not in fragment_cache[resolved]:
+                    errors.append(
+                        f"{path.relative_to(root)}: broken Markdown fragment "
+                        f"#{fragment!s} in {raw_target!r}"
+                    )
     return errors
 
 

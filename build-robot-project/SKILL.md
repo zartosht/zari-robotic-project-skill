@@ -108,7 +108,7 @@ After implementation, report these exact sections:
 
 Read [robotics-safety.md](references/robotics-safety.md) before work involving power, actuators, batteries, tools, autonomy, cameras, microphones, networking, or sensitive data.
 
-Require explicit confirmation before purchasing; applying power to new wiring; connecting a battery, motor, or servo to power; introducing, storing, pressurizing, preloading, or releasing hazardous energy; uploading movement-capable firmware; the first physical movement; increasing force, speed, or range; autonomous or floor movement; enabling cameras, always-listening microphones, or sensitive-data transmission; dangerous tools; mains voltage; high-current systems; custom battery packs; or any step with unresolved voltage, current, polarity, or compatibility.
+Require explicit confirmation before purchasing; applying power to new wiring; connecting a battery, motor, or servo to power; introducing, storing, pressurizing, preloading, or releasing hazardous energy; uploading movement-capable firmware; the first physical movement; first body contact for a wearable, haptic, or body-contact robot; increasing force, speed, or range; autonomous or floor movement; enabling cameras, always-listening microphones, or sensitive-data transmission; dangerous tools; mains voltage; high-current systems; custom battery packs; or any step with unresolved voltage, current, polarity, or compatibility.
 
 Never connect AI output directly to actuators. Require deterministic command validation and independent firmware safety enforcement.
 

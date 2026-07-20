@@ -59,6 +59,27 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_same_file_and_cross_file_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Setup\n\n[same](#setup) [cross](guide.md#details)\n", encoding="utf-8"
+            )
+            (root / "guide.md").write_text("# Details\n", encoding="utf-8")
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_reports_stale_same_file_and_cross_file_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Setup\n\n[same](#old-setup) [cross](guide.md#old-details)\n",
+                encoding="utf-8",
+            )
+            (root / "guide.md").write_text("# Details\n", encoding="utf-8")
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(all("broken Markdown fragment" in error for error in errors))
+
     def test_accepts_angle_bracketed_destination_with_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -234,8 +255,28 @@ class SafetyDocumentationTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("motion capable of injury or material property damage requires", readme)
 
+    def test_first_body_contact_is_a_mandatory_gate(self) -> None:
+        skill = (REPOSITORY_ROOT / "build-robot-project" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        safety = (
+            REPOSITORY_ROOT
+            / "build-robot-project"
+            / "references"
+            / "robotics-safety.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("first body contact", skill)
+        self.assertIn("first body contact", safety)
+
 
 class RepositoryTests(unittest.TestCase):
+    def test_requires_executable_unit_test_module(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            errors = validator.validate_repository(Path(directory))
+            self.assertIn(
+                "missing required repository file: tests/test_validate_repository.py", errors
+            )
+
     def test_current_repository_passes(self) -> None:
         self.assertEqual([], validator.validate_repository(REPOSITORY_ROOT))
 
