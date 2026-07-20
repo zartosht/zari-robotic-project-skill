@@ -159,6 +159,20 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#second-line", errors[0])
 
+    def test_excludes_reference_definition_from_setext_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guide.md").write_text("guide\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[docs]: guide.md\n"
+                "---\n"
+                "[stale](#docs-guidemd)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#docs-guidemd", errors[0])
+
     def test_strips_reference_style_markup_from_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -268,6 +282,14 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 "[example](missing file.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_inline_link_crossing_blank_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[example](missing.md\n\n)\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
 
@@ -599,6 +621,16 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("#inline-anchor" in error for error in errors))
             self.assertTrue(any("#commented-anchor" in error for error in errors))
 
+    def test_preserves_link_after_escaped_html_comment_opener(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "\\<!-- [guide](missing.md) -->\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_excludes_commented_headings_but_keeps_inline_code_headings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -660,6 +692,20 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_ignores_attribute_like_text_inside_quoted_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "<img alt='src=\"missing.png\"'>\n"
+                "<div title='id=\"phantom\"'>\n"
+                "\n"
+                "[phantom](#phantom)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#phantom", errors[0])
+
     def test_rejects_raw_html_src_targeting_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -696,6 +742,19 @@ class LinkTests(unittest.TestCase):
             (root / "README.md").write_text(
                 "> <script>\n"
                 '> const example = "[literal](ignored.md)";\n'
+                "[guide](missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_stops_standard_raw_html_block_when_container_ends(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> <div>\n"
+                "> literal body\n"
                 "[guide](missing.md)\n",
                 encoding="utf-8",
             )
