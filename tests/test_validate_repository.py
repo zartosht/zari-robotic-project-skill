@@ -78,6 +78,21 @@ class LinkTests(unittest.TestCase):
             (root / "guide.md").write_text("# Details\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_preserves_literal_underscores_in_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# motor_driver\n"
+                "# Motor _controller_\n"
+                "[underscore](#motor_driver)\n"
+                "[emphasis](#motor-controller)\n"
+                "[wrong](#motordriver)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#motordriver", errors[0])
+
     def test_accepts_headings_inside_markdown_containers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -219,6 +234,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
 
+    def test_rejects_markdown_image_targeting_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "assets").mkdir()
+            (root / "README.md").write_text(
+                "![diagram](assets/)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("image target is not a file", errors[0])
+
     def test_scans_common_markdown_filename_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -237,6 +263,26 @@ class LinkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_reports_link_between_escaped_backticks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "\\`[guide](missing.md)\\`\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_reports_percent_encoded_nul_as_broken_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide](missing%00.md)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("broken relative link", errors[0])
 
     def test_ignores_indented_markdown_code_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -289,6 +289,9 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
         if masked[index] != "`":
             index += 1
             continue
+        if markdown_character_is_escaped(masked, index):
+            index += 1
+            continue
         run_end = index
         while run_end < len(masked) and masked[run_end] == "`":
             run_end += 1
@@ -302,7 +305,11 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             before_is_tick = candidate > 0 and masked[candidate - 1] == "`"
             after = candidate + len(delimiter)
             after_is_tick = after < len(masked) and masked[after] == "`"
-            if not before_is_tick and not after_is_tick:
+            if (
+                not markdown_character_is_escaped(masked, candidate)
+                and not before_is_tick
+                and not after_is_tick
+            ):
                 closing = candidate
                 break
             search_from = candidate + len(delimiter)
@@ -335,6 +342,17 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             characters[index] = " "
 
     return "".join(characters)
+
+
+def markdown_character_is_escaped(text: str, index: int) -> bool:
+    """Return whether a Markdown punctuation character has an odd escape prefix."""
+
+    preceding_backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        preceding_backslashes += 1
+        cursor -= 1
+    return preceding_backslashes % 2 == 1
 
 
 def html_attribute_values(text: str, pattern: re.Pattern[str]) -> list[str]:
@@ -406,11 +424,11 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
     return None
 
 
-def markdown_link_targets(text: str) -> list[tuple[str, bool]]:
+def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     """Extract Markdown and rendered raw-HTML destinations."""
 
     text = markdown_searchable_text(text)
-    targets: list[tuple[str, bool]] = []
+    targets: list[tuple[str, bool, bool]] = []
     for label_start, character in enumerate(text):
         if character != "[":
             continue
@@ -419,17 +437,23 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool]]:
             continue
         destination = markdown_destination_end(text, label_end + 1)
         if destination is not None:
-            targets.append((destination[0], True))
+            is_image = (
+                label_start > 0
+                and text[label_start - 1] == "!"
+                and not markdown_character_is_escaped(text, label_start - 1)
+            )
+            targets.append((destination[0], True, is_image))
 
     container_text = "\n".join(
         content for _, content in markdown_container_lines(text.splitlines())
     )
     targets.extend(
-        (target, True)
+        (target, True, False)
         for target in MARKDOWN_REFERENCE_DEFINITION.findall(container_text)
     )
     targets.extend(
-        (target, False) for target in html_attribute_values(text, MARKDOWN_HTML_TARGET)
+        (target, False, False)
+        for target in html_attribute_values(text, MARKDOWN_HTML_TARGET)
     )
     return targets
 
@@ -440,7 +464,13 @@ def github_heading_slug(heading: str) -> str:
     heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
-    heading = re.sub(r"[\*_~`]", "", heading).lower()
+    heading = re.sub(
+        r"(?<![\w\\])(?P<delimiter>_{1,2})(?=\S)(?P<content>.+?\S)"
+        r"(?P=delimiter)(?!\w)",
+        r"\g<content>",
+        heading,
+    )
+    heading = re.sub(r"[*~`]", "", heading).lower()
     characters = [
         character
         for character in heading
@@ -513,7 +543,7 @@ def find_broken_links(root: Path) -> list[str]:
     fragment_cache: dict[Path, set[str]] = {}
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
-        for raw_target, is_markdown in markdown_link_targets(text):
+        for raw_target, is_markdown, is_image in markdown_link_targets(text):
             target = raw_target.strip()
             if is_markdown:
                 if target.startswith("<") and ">" in target:
@@ -527,7 +557,18 @@ def find_broken_links(root: Path) -> list[str]:
             parsed_target = urlsplit(target)
             path_target = unquote(parsed_target.path)
             fragment = unquote(parsed_target.fragment)
-            resolved = (path.parent / path_target).resolve() if path_target else path.resolve()
+            if "\x00" in path_target:
+                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                continue
+            try:
+                resolved = (
+                    (path.parent / path_target).resolve()
+                    if path_target
+                    else path.resolve()
+                )
+            except (OSError, ValueError):
+                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                continue
             if path.resolve().is_relative_to(skill_root) and not resolved.is_relative_to(skill_root):
                 errors.append(
                     f"{path.relative_to(root)}: relative link escapes distributable skill "
@@ -536,6 +577,11 @@ def find_broken_links(root: Path) -> list[str]:
                 continue
             if not resolved.exists():
                 errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                continue
+            if is_image and not resolved.is_file():
+                errors.append(
+                    f"{path.relative_to(root)}: image target is not a file {raw_target!r}"
+                )
                 continue
             if fragment and resolved.is_file() and resolved.suffix.lower() in {".md", ".markdown"}:
                 if resolved not in fragment_cache:
