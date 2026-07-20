@@ -51,6 +51,12 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_empty_same_document_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("[top]()\n", encoding="utf-8")
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_mixed_case_external_uri_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -105,6 +111,27 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("#a-amp-b", errors[0])
+
+    def test_strips_reference_style_markup_from_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guide.md").write_text("guide\n", encoding="utf-8")
+            (root / "diagram.png").write_bytes(b"diagram")
+            (root / "README.md").write_text(
+                "# [Setup][docs]\n"
+                "# ![Robot][image]\n"
+                "[docs]: guide.md\n"
+                "[image]: diagram.png\n"
+                "[rendered](#setup)\n"
+                "[rendered-image](#robot)\n"
+                "[wrong](#setupdocs)\n"
+                "[wrong-image](#robotimage)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("#setupdocs" in error for error in errors))
+            self.assertTrue(any("#robotimage" in error for error in errors))
 
     def test_accepts_headings_inside_markdown_containers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -307,6 +334,20 @@ class LinkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_scans_indented_paragraph_continuation_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "paragraph\n"
+                "    [rendered](rendered-missing.md)\n"
+                "\n"
+                "    [code](code-missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("rendered-missing.md", errors[0])
 
     def test_distinguishes_list_continuations_from_indented_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -593,6 +634,22 @@ class RepositoryTests(unittest.TestCase):
             errors = validator.validate_repository(Path(directory))
             self.assertIn(
                 "missing required repository file: tests/test_validate_repository.py", errors
+            )
+
+    def test_rejects_required_skill_resource_symlink_outside_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "repository"
+            references = root / "build-robot-project" / "references"
+            references.mkdir(parents=True)
+            outside = workspace / "outside.md"
+            outside.write_text("outside\n", encoding="utf-8")
+            (references / "discovery-interview.md").symlink_to(outside)
+            errors = validator.validate_repository(root)
+            self.assertIn(
+                "required skill file resolves outside distributable skill directory: "
+                "build-robot-project/references/discovery-interview.md",
+                errors,
             )
 
     def test_current_repository_passes(self) -> None:

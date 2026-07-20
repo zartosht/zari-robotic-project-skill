@@ -163,11 +163,21 @@ def is_ignored_repository_path(path: Path, root: Path) -> bool:
     return any(part in IGNORED_DIRECTORY_NAMES for part in path.relative_to(root).parts)
 
 
+def path_resolves_within(path: Path, root: Path) -> bool:
+    """Return whether a path resolves inside the expected repository boundary."""
+
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
 def markdown_files(root: Path) -> list[Path]:
     return sorted(
         path
         for path in root.rglob("*")
         if path.is_file()
+        and path_resolves_within(path, root)
         and path.suffix.lower() in {".md", ".markdown"}
         and not is_ignored_repository_path(path, root)
     )
@@ -179,6 +189,15 @@ def markdown_list_prefix_end(match: re.Match[str]) -> int:
     padding = match.group("padding")
     consumed_padding = 1 if len(padding) > 4 else len(padding)
     return match.start("padding") + consumed_padding
+
+
+def markdown_line_starts_list_item(line: str) -> bool:
+    """Return whether a line directly opens a list item, including in blockquotes."""
+
+    content = line
+    while blockquote := MARKDOWN_BLOCKQUOTE_PREFIX.match(content):
+        content = content[blockquote.end() :]
+    return MARKDOWN_LIST_PREFIX.match(content) is not None
 
 
 def markdown_container_content(line: str) -> tuple[tuple[str, ...], str]:
@@ -250,12 +269,20 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
     offset = 0
     fence_character: str | None = None
     fence_length = 0
+    open_paragraph_containers: tuple[str, ...] | None = None
 
     container_lines = markdown_container_lines(
         [line.rstrip("\r\n") for line in lines_with_endings]
     )
-    for line, (_, container_content) in zip(lines_with_endings, container_lines):
-        indented_code = MARKDOWN_INDENTED_CODE.match(container_content) is not None
+    for line, (containers, container_content) in zip(lines_with_endings, container_lines):
+        indented_candidate = MARKDOWN_INDENTED_CODE.match(container_content) is not None
+        indented_code = (
+            indented_candidate
+            and (
+                open_paragraph_containers != containers
+                or markdown_line_starts_list_item(line.rstrip("\r\n"))
+            )
+        )
         if fence_character is None:
             match = (
                 None if indented_code else MARKDOWN_FENCE_START.match(container_content)
@@ -272,14 +299,25 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
                 fence_character = None
                 fence_length = 0
 
-        if (
+        literal_block = (
             indented_code
             or fence_character is not None
             or MARKDOWN_FENCE_START.match(container_content)
-        ):
+        )
+        if literal_block:
             for index in range(offset, offset + len(line)):
                 if characters[index] not in "\r\n":
                     characters[index] = " "
+
+        if (
+            not container_content.strip()
+            or literal_block
+            or MARKDOWN_ATX_HEADING.match(container_content)
+            or MARKDOWN_SETEXT_HEADING.match(container_content)
+        ):
+            open_paragraph_containers = None
+        else:
+            open_paragraph_containers = containers
         offset += len(line)
 
     literal_characters = characters.copy()
@@ -461,6 +499,8 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
 def github_heading_slug(heading: str) -> str:
     """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
 
+    heading = re.sub(r"!\[([^\]]*)\]\s*\[[^\]]*\]", r"\1", heading)
+    heading = re.sub(r"\[([^\]]+)\]\s*\[[^\]]*\]", r"\1", heading)
     heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
@@ -547,6 +587,8 @@ def find_broken_links(root: Path) -> list[str]:
         text = path.read_text(encoding="utf-8")
         for raw_target, is_markdown, is_image in markdown_link_targets(text):
             target = raw_target.strip()
+            if not target:
+                continue
             if is_markdown:
                 if target.startswith("<") and ">" in target:
                     target = target[1 : target.index(">")]
@@ -610,7 +652,11 @@ def find_portability_violations(skill_root: Path) -> list[str]:
     portable_paths.extend((skill_root / "references").rglob("*"))
     portable_paths.extend((skill_root / "assets").rglob("*"))
     portable_paths.extend((skill_root / "scripts").rglob("*"))
-    for path in sorted(path for path in portable_paths if path.is_file()):
+    for path in sorted(
+        path
+        for path in portable_paths
+        if path.is_file() and path_resolves_within(path, skill_root)
+    ):
         data = path.read_bytes()
         try:
             text = data.decode("utf-8")
@@ -648,6 +694,7 @@ def find_secret_like_content(root: Path) -> list[str]:
         path
         for path in root.rglob("*")
         if path.is_file()
+        and path_resolves_within(path, root)
         and not is_ignored_repository_path(path, root)
         and not is_ignored_secret_file(path)
     ):
@@ -675,7 +722,10 @@ def is_ignored_secret_file(path: Path) -> bool:
 def find_empty_resources(root: Path) -> list[str]:
     errors: list[str] = []
     for path in sorted(
-        path for path in root.rglob("*") if not is_ignored_repository_path(path, root)
+        path
+        for path in root.rglob("*")
+        if path_resolves_within(path, root)
+        and not is_ignored_repository_path(path, root)
     ):
         if path.is_file() and path.stat().st_size == 0:
             errors.append(f"empty file: {path.relative_to(root)}")
@@ -687,16 +737,29 @@ def find_empty_resources(root: Path) -> list[str]:
 def validate_repository(root: Path) -> list[str]:
     errors: list[str] = []
     skill_root = root / "build-robot-project"
+    repository_boundary = root.resolve()
+    skill_boundary = skill_root.resolve()
 
     for relative in REQUIRED_ROOT_FILES:
-        if not (root / relative).is_file():
+        required = root / relative
+        if not required.is_file():
             errors.append(f"missing required repository file: {relative}")
+        elif not path_resolves_within(required, repository_boundary):
+            errors.append(
+                f"required repository file resolves outside repository: {relative}"
+            )
     for relative in REQUIRED_SKILL_FILES:
-        if not (skill_root / relative).is_file():
+        required = skill_root / relative
+        if not required.is_file():
             errors.append(f"missing required skill file: build-robot-project/{relative}")
+        elif not path_resolves_within(required, skill_boundary):
+            errors.append(
+                "required skill file resolves outside distributable skill directory: "
+                f"build-robot-project/{relative}"
+            )
 
     skill_file = skill_root / "SKILL.md"
-    if skill_file.is_file():
+    if skill_file.is_file() and path_resolves_within(skill_file, skill_boundary):
         data, body, frontmatter_errors = parse_frontmatter(skill_file)
         errors.extend(frontmatter_errors)
         if set(data) != {"name", "description"}:
