@@ -51,6 +51,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_accepts_mixed_case_external_uri_scheme(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[external](HTTPS://example.com)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_angle_bracketed_destination_with_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -82,6 +90,27 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
+
+    def test_reports_missing_outer_link_around_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "diagram.png").write_bytes(b"diagram")
+            (root / "README.md").write_text(
+                "[![diagram](assets/diagram.png)](references/missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("references/missing.md", errors[0])
+
+    def test_scans_common_markdown_filename_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "GUIDE.MD").write_text("[missing](first.md)\n", encoding="utf-8")
+            (root / "notes.markdown").write_text("[missing](second.md)\n", encoding="utf-8")
+            self.assertEqual(2, len(validator.find_broken_links(root)))
 
     def test_ignores_literal_markdown_link_examples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -198,6 +227,12 @@ class InstallationDocumentationTests(unittest.TestCase):
         self.assertEqual(len(checks), len(copies))
         self.assertTrue(all(line.endswith(" &&") for line in checks))
         self.assertTrue(all(line.strip().endswith(" &&") for line in copies))
+
+
+class SafetyDocumentationTests(unittest.TestCase):
+    def test_readme_requires_physical_stop_for_all_hazardous_motion(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("motion capable of injury or material property damage requires", readme)
 
 
 class RepositoryTests(unittest.TestCase):

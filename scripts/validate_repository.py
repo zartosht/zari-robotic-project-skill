@@ -68,11 +68,11 @@ SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
 
-MARKDOWN_LINK_START = re.compile(r"!?\[[^\]\n]*\]\(")
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|[^\s\n]+)"
 )
 MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 
 
@@ -122,7 +122,11 @@ def is_ignored_repository_path(path: Path, root: Path) -> bool:
 
 def markdown_files(root: Path) -> list[Path]:
     return sorted(
-        path for path in root.rglob("*.md") if not is_ignored_repository_path(path, root)
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in {".md", ".markdown"}
+        and not is_ignored_repository_path(path, root)
     )
 
 
@@ -202,49 +206,78 @@ def markdown_searchable_text(text: str) -> str:
     return "".join(characters)
 
 
+def markdown_label_end(text: str, start: int) -> int | None:
+    """Find a label's closing bracket while respecting nested image/link labels."""
+
+    depth = 1
+    index = start + 1
+    while index < len(text):
+        character = text[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
+    """Extract a parenthesized destination with balanced nested parentheses."""
+
+    start = opening + 1
+    index = start
+    depth = 1
+    in_angle_destination = False
+    title_quote: str | None = None
+
+    while index < len(text):
+        character = text[index]
+        if character == "\\":
+            index += 2
+            continue
+        if in_angle_destination:
+            if character == ">":
+                in_angle_destination = False
+            index += 1
+            continue
+        if title_quote:
+            if character == title_quote:
+                title_quote = None
+            index += 1
+            continue
+        if character == "<" and not text[start:index].strip():
+            in_angle_destination = True
+        elif character in {'"', "'"} and index > start and text[index - 1].isspace():
+            title_quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:index], index
+        index += 1
+    return None
+
+
 def markdown_link_targets(text: str) -> list[str]:
-    """Extract inline Markdown destinations while respecting balanced parentheses."""
+    """Extract inline and reference-style Markdown destinations."""
 
     text = markdown_searchable_text(text)
     targets: list[str] = []
-    cursor = 0
-    while match := MARKDOWN_LINK_START.search(text, cursor):
-        start = match.end()
-        index = start
-        depth = 1
-        in_angle_destination = False
-        title_quote: str | None = None
-
-        while index < len(text):
-            character = text[index]
-            if character == "\\":
-                index += 2
-                continue
-            if in_angle_destination:
-                if character == ">":
-                    in_angle_destination = False
-                index += 1
-                continue
-            if title_quote:
-                if character == title_quote:
-                    title_quote = None
-                index += 1
-                continue
-            if character == "<" and not text[start:index].strip():
-                in_angle_destination = True
-            elif character in {'"', "'"} and index > start and text[index - 1].isspace():
-                title_quote = character
-            elif character == "(":
-                depth += 1
-            elif character == ")":
-                depth -= 1
-                if depth == 0:
-                    targets.append(text[start:index])
-                    cursor = index + 1
-                    break
-            index += 1
-        else:
-            cursor = match.end()
+    for label_start, character in enumerate(text):
+        if character != "[":
+            continue
+        label_end = markdown_label_end(text, label_start)
+        if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":
+            continue
+        destination = markdown_destination_end(text, label_end + 1)
+        if destination is not None:
+            targets.append(destination[0])
 
     targets.extend(MARKDOWN_REFERENCE_DEFINITION.findall(text))
     return targets
@@ -261,7 +294,7 @@ def find_broken_links(root: Path) -> list[str]:
                 target = target[1 : target.index(">")]
             else:
                 target = target.split(" ", 1)[0]
-            if not target or target.startswith(("#", "http://", "https://", "mailto:")):
+            if not target or target.startswith(("#", "//")) or URI_SCHEME.match(target):
                 continue
             target = unquote(target.split("#", 1)[0])
             resolved = (path.parent / target).resolve()
