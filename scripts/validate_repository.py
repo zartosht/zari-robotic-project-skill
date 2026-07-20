@@ -72,8 +72,8 @@ SECRET_PATTERNS = {
 }
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[(?!\^)[^\]\n]+\]:[ \t]*"
-    r"(?:\n[ \t]{1,3})?(<[^>\n]+>|[^\s\n]+)"
+    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>[^\]\n]+)\]:[ \t]*"
+    r"(?:\n[ \t]{1,3})?(?P<target><[^>\n]+>|[^\s\n]+)"
 )
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
@@ -85,11 +85,22 @@ MARKDOWN_FENCE_START = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 MARKDOWN_HTML_TAG = re.compile(r"<[A-Za-z][^<>]*>", re.DOTALL)
-MARKDOWN_RAW_HTML_BLOCK = re.compile(
-    r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>])[^>]*>"
-    r"(?P<body>.*?)(?:</(?P=tag)[ \t]*>|(?=\Z))",
-    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+MARKDOWN_RAW_HTML_TYPE_1 = re.compile(
+    r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>]|\Z)", re.IGNORECASE
 )
+MARKDOWN_RAW_HTML_TYPE_6 = re.compile(
+    r"^[ \t]{0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|"
+    r"center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|"
+    r"figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|"
+    r"li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|"
+    r"section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[\s/>]|\Z)",
+    re.IGNORECASE,
+)
+MARKDOWN_RAW_HTML_TYPE_7 = re.compile(
+    r"^[ \t]{0,3}</?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^<>]*)?[ \t]*/?>[ \t]*$"
+)
+MARKDOWN_CODE_SPAN_LT = "\ue000"
+MARKDOWN_CODE_SPAN_GT = "\ue001"
 MARKDOWN_AUTOLINK = re.compile(
     r"<((?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)|(?:[^<>\s@]+@[^<>\s@]+))>"
 )
@@ -181,6 +192,26 @@ def path_resolves_within(path: Path, root: Path) -> bool:
         return False
 
 
+def decode_text_data(data: bytes) -> str | None:
+    """Decode UTF-8 or BOM-marked Unicode text without guessing binary data."""
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        for byte_order_mark, encoding in (
+            (b"\xff\xfe\x00\x00", "utf-32"),
+            (b"\x00\x00\xfe\xff", "utf-32"),
+            (b"\xff\xfe", "utf-16"),
+            (b"\xfe\xff", "utf-16"),
+        ):
+            if data.startswith(byte_order_mark):
+                try:
+                    return data.decode(encoding)
+                except UnicodeDecodeError:
+                    return None
+        return None
+
+
 def markdown_files(root: Path) -> list[Path]:
     return sorted(
         path
@@ -258,6 +289,129 @@ def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], st
     return normalized
 
 
+def markdown_fence_opening(content: str) -> re.Match[str] | None:
+    """Return a valid CommonMark fenced-code opener, if present."""
+
+    match = MARKDOWN_FENCE_START.match(content)
+    if not match:
+        return None
+    fence = match.group(1)
+    info_string = content[match.end() :]
+    if fence[0] == "`" and "`" in info_string:
+        return None
+    return match
+
+
+def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
+    """Mask CommonMark raw HTML block bodies while retaining opening tags."""
+
+    text = "".join(characters)
+    lines_with_endings = text.splitlines(keepends=True)
+    container_lines = markdown_container_lines(
+        [line.rstrip("\r\n") for line in lines_with_endings]
+    )
+    offset = 0
+    skip_until = 0
+    blank_block_start: int | None = None
+    open_paragraph_containers: tuple[str, ...] | None = None
+
+    def mask(start: int, end: int) -> None:
+        for position in range(start, end):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+
+    def mask_except_html_tags(start: int, end: int) -> None:
+        cursor = start
+        for tag in MARKDOWN_HTML_TAG.finditer(text, start, end):
+            mask(cursor, tag.start())
+            cursor = tag.end()
+        mask(cursor, end)
+
+    for line, (containers, content) in zip(lines_with_endings, container_lines):
+        line_body = line.rstrip("\r\n")
+        content_start = offset + len(line_body) - len(content)
+        content_end = offset + len(line_body)
+
+        if offset < skip_until:
+            open_paragraph_containers = None
+            offset += len(line)
+            continue
+
+        if blank_block_start is not None:
+            if not content.strip():
+                mask_except_html_tags(blank_block_start, content_start)
+                blank_block_start = None
+            open_paragraph_containers = None
+            offset += len(line)
+            continue
+
+        stripped = content.lstrip(" \t")
+        type_1 = MARKDOWN_RAW_HTML_TYPE_1.match(content)
+        special_end: tuple[str, int] | None = None
+        if stripped.startswith("<!--"):
+            special_end = (r"-->", content.find("<!--"))
+        elif stripped.startswith("<?"):
+            special_end = (r"\?>", content.find("<?"))
+        elif stripped.startswith("<![CDATA["):
+            special_end = (r"\]\]>", content.find("<![CDATA["))
+        elif re.match(r"<![A-Z]", stripped):
+            special_end = (r">", content.find("<!"))
+
+        if type_1:
+            opening_end = text.find(">", content_start + type_1.end())
+            closing = re.compile(
+                rf"</{re.escape(type_1.group('tag'))}[ \t]*>", re.IGNORECASE
+            )
+            if opening_end < 0:
+                mask(content_start, len(text))
+                skip_until = len(text)
+            else:
+                closing_match = closing.search(text, opening_end + 1)
+                raw_end = closing_match.end() if closing_match else len(text)
+                line_end = text.find("\n", raw_end)
+                skip_until = len(text) if line_end < 0 else line_end + 1
+                mask(opening_end + 1, skip_until)
+            open_paragraph_containers = None
+        elif special_end:
+            marker, block_start = special_end
+            absolute_start = content_start + block_start
+            marker_match = re.compile(marker).search(text, absolute_start)
+            raw_end = marker_match.end() if marker_match else len(text)
+            line_end = text.find("\n", raw_end)
+            skip_until = len(text) if line_end < 0 else line_end + 1
+            mask(absolute_start, skip_until)
+            open_paragraph_containers = None
+        else:
+            type_6 = MARKDOWN_RAW_HTML_TYPE_6.match(content)
+            type_7 = (
+                MARKDOWN_RAW_HTML_TYPE_7.match(content)
+                if open_paragraph_containers != containers
+                else None
+            )
+            raw_tag = type_6 or type_7
+            if raw_tag:
+                opening_end = content.find(">", raw_tag.end())
+                body_start = content_start + (
+                    opening_end + 1 if opening_end >= 0 else len(content)
+                )
+                blank_block_start = body_start
+                open_paragraph_containers = None
+            elif not content.strip():
+                open_paragraph_containers = None
+            elif (
+                MARKDOWN_ATX_HEADING.match(content)
+                or MARKDOWN_SETEXT_HEADING.match(content)
+            ):
+                open_paragraph_containers = None
+            else:
+                open_paragraph_containers = containers
+
+        offset += len(line)
+
+    if blank_block_start is not None:
+        mask_except_html_tags(blank_block_start, len(text))
+
+
 def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str:
     """Mask literal Markdown regions while preserving offsets and line structure."""
 
@@ -292,14 +446,14 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
                 or markdown_line_starts_list_item(line.rstrip("\r\n"))
             )
         )
+        fence_line = fence_character is not None
         if fence_character is None:
-            match = (
-                None if indented_code else MARKDOWN_FENCE_START.match(container_content)
-            )
+            match = None if indented_code else markdown_fence_opening(container_content)
             if match:
                 fence = match.group(1)
                 fence_character = fence[0]
                 fence_length = len(fence)
+                fence_line = True
         else:
             closing_fence = re.compile(
                 rf"^[ \t]{{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$"
@@ -308,11 +462,7 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
                 fence_character = None
                 fence_length = 0
 
-        literal_block = (
-            indented_code
-            or fence_character is not None
-            or MARKDOWN_FENCE_START.match(container_content)
-        )
+        literal_block = indented_code or fence_line
         if literal_block:
             for index in range(offset, offset + len(line)):
                 if characters[index] not in "\r\n":
@@ -329,11 +479,7 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             open_paragraph_containers = containers
         offset += len(line)
 
-    block_search_text = "".join(characters)
-    for html_block in MARKDOWN_RAW_HTML_BLOCK.finditer(block_search_text):
-        for index in range(*html_block.span("body")):
-            if characters[index] not in "\r\n":
-                characters[index] = " "
+    mask_markdown_raw_html_blocks(characters)
 
     literal_characters = characters.copy()
     masked = "".join(literal_characters)
@@ -408,6 +554,143 @@ def markdown_character_is_escaped(text: str, index: int) -> bool:
     return preceding_backslashes % 2 == 1
 
 
+def markdown_normalize_reference_label(label: str) -> str:
+    """Normalize a reference label for case-insensitive CommonMark matching."""
+
+    label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", label)
+    return " ".join(html_unescape(label).split()).casefold()
+
+
+def markdown_image_reference_labels(text: str) -> set[str]:
+    """Collect labels whose reference definitions are used by images."""
+
+    labels: set[str] = set()
+    index = 0
+    while index + 1 < len(text):
+        if (
+            text[index] != "!"
+            or text[index + 1] != "["
+            or markdown_character_is_escaped(text, index)
+        ):
+            index += 1
+            continue
+        label_start = index + 1
+        label_end = markdown_label_end(text, label_start)
+        if label_end is None:
+            index += 2
+            continue
+        primary_label = text[label_start + 1 : label_end]
+        cursor = label_end + 1
+        if (
+            cursor < len(text)
+            and text[cursor] == "("
+            and markdown_destination_end(text, cursor) is not None
+        ):
+            index = label_end + 1
+            continue
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor < len(text) and text[cursor] == "[":
+            reference_end = markdown_label_end(text, cursor)
+            if reference_end is None:
+                index = label_end + 1
+                continue
+            reference_label = text[cursor + 1 : reference_end] or primary_label
+            labels.add(markdown_normalize_reference_label(reference_label))
+            index = reference_end + 1
+            continue
+        labels.add(markdown_normalize_reference_label(primary_label))
+        index = label_end + 1
+    return labels
+
+
+def markdown_label_contains_active_link(
+    text: str,
+    label_start: int,
+    label_end: int,
+    reference_labels: set[str],
+) -> bool:
+    """Return whether a link label contains a nested link that deactivates it."""
+
+    index = label_start + 1
+    while index < label_end:
+        if text[index] != "[" or markdown_character_is_escaped(text, index):
+            index += 1
+            continue
+        is_image = (
+            index > 0
+            and text[index - 1] == "!"
+            and not markdown_character_is_escaped(text, index - 1)
+        )
+        nested_end = markdown_label_end(text, index)
+        if nested_end is None or nested_end > label_end:
+            index += 1
+            continue
+        if is_image:
+            index = nested_end + 1
+            continue
+        if markdown_label_contains_active_link(
+            text, index, nested_end, reference_labels
+        ):
+            return True
+
+        cursor = nested_end + 1
+        if cursor < label_end and text[cursor] == "(":
+            destination = markdown_destination_end(text, cursor)
+            if destination is not None and destination[1] < label_end:
+                return True
+        while cursor < label_end and text[cursor].isspace():
+            cursor += 1
+        if cursor < label_end and text[cursor] == "[":
+            reference_end = markdown_label_end(text, cursor)
+            if reference_end is not None and reference_end < label_end:
+                reference_label = text[cursor + 1 : reference_end]
+                if not reference_label:
+                    reference_label = text[index + 1 : nested_end]
+                if markdown_normalize_reference_label(reference_label) in reference_labels:
+                    return True
+        elif (
+            markdown_normalize_reference_label(text[index + 1 : nested_end])
+            in reference_labels
+        ):
+            return True
+        index = nested_end + 1
+    return False
+
+
+def markdown_protect_code_span_angles(text: str) -> str:
+    """Protect visible angle brackets in code spans from HTML-tag stripping."""
+
+    characters = list(text)
+    index = 0
+    while index < len(text):
+        if text[index] != "`" or markdown_character_is_escaped(text, index):
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(text) and text[run_end] == "`":
+            run_end += 1
+        delimiter = text[index:run_end]
+        closing = text.find(delimiter, run_end)
+        while closing >= 0:
+            before_is_tick = closing > 0 and text[closing - 1] == "`"
+            after = closing + len(delimiter)
+            after_is_tick = after < len(text) and text[after] == "`"
+            if not before_is_tick and not after_is_tick:
+                break
+            closing = text.find(delimiter, closing + len(delimiter))
+        if closing < 0:
+            index = run_end
+            continue
+        for position in range(run_end, closing):
+            if characters[position] == "<":
+                characters[position] = MARKDOWN_CODE_SPAN_LT
+            elif characters[position] == ">":
+                characters[position] = MARKDOWN_CODE_SPAN_GT
+        index = closing + len(delimiter)
+    return "".join(characters)
+
+
 def html_attribute_values(text: str, pattern: re.Pattern[str]) -> list[str]:
     """Collect matching HTML attribute values from rendered raw tags."""
 
@@ -480,7 +763,24 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
 def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     """Extract Markdown and rendered raw-HTML destinations."""
 
-    text = markdown_searchable_text(text)
+    rendered_text = markdown_searchable_text(text)
+    markdown_characters = list(rendered_text)
+    for tag in MARKDOWN_HTML_TAG.finditer(rendered_text):
+        for position in range(*tag.span()):
+            if markdown_characters[position] not in "\r\n":
+                markdown_characters[position] = " "
+    text = "".join(markdown_characters)
+    container_text = "\n".join(
+        content for _, content in markdown_container_lines(text.splitlines())
+    )
+    reference_definitions = list(
+        MARKDOWN_REFERENCE_DEFINITION.finditer(container_text)
+    )
+    reference_labels = {
+        markdown_normalize_reference_label(match.group("label"))
+        for match in reference_definitions
+    }
+    image_reference_labels = markdown_image_reference_labels(text)
     targets: list[tuple[str, bool, bool]] = []
     for label_start, character in enumerate(text):
         if character != "[":
@@ -495,18 +795,24 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
                 and text[label_start - 1] == "!"
                 and not markdown_character_is_escaped(text, label_start - 1)
             )
+            if not is_image and markdown_label_contains_active_link(
+                text, label_start, label_end, reference_labels
+            ):
+                continue
             targets.append((destination[0], True, is_image))
 
-    container_text = "\n".join(
-        content for _, content in markdown_container_lines(text.splitlines())
-    )
     targets.extend(
-        (target, True, False)
-        for target in MARKDOWN_REFERENCE_DEFINITION.findall(container_text)
+        (
+            match.group("target"),
+            True,
+            markdown_normalize_reference_label(match.group("label"))
+            in image_reference_labels,
+        )
+        for match in reference_definitions
     )
     targets.extend(
         (target, False, False)
-        for target in html_attribute_values(text, MARKDOWN_HTML_TARGET)
+        for target in html_attribute_values(rendered_text, MARKDOWN_HTML_TARGET)
     )
     return targets
 
@@ -514,12 +820,16 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
 def github_heading_slug(heading: str) -> str:
     """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
 
+    heading = markdown_protect_code_span_angles(heading)
     heading = re.sub(r"!\[([^\]]*)\]\s*\[[^\]]*\]", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\s*\[[^\]]*\]", r"\1", heading)
     heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
     heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
     heading = MARKDOWN_AUTOLINK.sub(r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
+    heading = heading.replace(MARKDOWN_CODE_SPAN_LT, "<").replace(
+        MARKDOWN_CODE_SPAN_GT, ">"
+    )
     heading = html_unescape(heading)
     heading = re.sub(
         r"(?<![\w\\])(?P<delimiter>_{1,2})(?=\S)(?P<content>.+?\S)"
@@ -677,28 +987,13 @@ def find_portability_violations(skill_root: Path) -> list[str]:
         if path.is_file() and path_resolves_within(path, skill_root)
     ):
         data = path.read_bytes()
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = ""
-            for byte_order_mark, encoding in (
-                (b"\xff\xfe\x00\x00", "utf-32"),
-                (b"\x00\x00\xfe\xff", "utf-32"),
-                (b"\xff\xfe", "utf-16"),
-                (b"\xfe\xff", "utf-16"),
-            ):
-                if data.startswith(byte_order_mark):
-                    try:
-                        text = data.decode(encoding)
-                    except UnicodeDecodeError:
-                        pass
-                    break
-            if not text:
-                if path.suffix.lower() in PORTABLE_TEXT_SUFFIXES:
-                    errors.append(
-                        f"{path.relative_to(skill_root)}: undecodable textual resource"
-                    )
-                continue
+        text = decode_text_data(data)
+        if text is None:
+            if path.suffix.lower() in PORTABLE_TEXT_SUFFIXES:
+                errors.append(
+                    f"{path.relative_to(skill_root)}: undecodable textual resource"
+                )
+            continue
         for label, pattern in PORTABILITY_PATTERNS.items():
             match = pattern.search(text)
             if match:
@@ -717,9 +1012,10 @@ def find_secret_like_content(root: Path) -> list[str]:
         and not is_ignored_repository_path(path, root)
         and not is_ignored_secret_file(path)
     ):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        text = decode_text_data(path.read_bytes())
+        if text is None:
+            if path.suffix.lower() in PORTABLE_TEXT_SUFFIXES:
+                errors.append(f"{path.relative_to(root)}: undecodable textual resource")
             continue
         for label, pattern in SECRET_PATTERNS.items():
             if pattern.search(text):

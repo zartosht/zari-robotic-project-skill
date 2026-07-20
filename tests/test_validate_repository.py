@@ -326,6 +326,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("image target is not a file", errors[0])
 
+    def test_rejects_reference_image_targeting_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "assets").mkdir()
+            (root / "README.md").write_text(
+                "![diagram][asset]\n\n[asset]: assets/\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("image target is not a file", errors[0])
+
     def test_scans_common_markdown_filename_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -342,6 +353,25 @@ class LinkTests(unittest.TestCase):
                 "```markdown\n[fenced](missing.md)\n```\n"
                 "> ```markdown\n> [quoted-fenced](missing.md)\n> ```\n",
                 encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_rejects_link_after_invalid_backtick_fence_opener(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "``` bad ` info\n[guide](missing.md)\n```\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_ignores_deactivated_outer_link_opener(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "valid.md").write_text("valid\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[outer [inner](valid.md)](missing.md)\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
 
@@ -440,6 +470,14 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("#removed-section" in error for error in errors))
             self.assertTrue(any("#removed-setext" in error for error in errors))
 
+    def test_keeps_html_looking_code_span_text_in_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Use `<div>`\n\n[section](#use-div)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_rendered_raw_html_targets_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -478,6 +516,49 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("#hidden-heading", errors[0])
+
+    def test_preserves_multiline_raw_html_opening_tag_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "<script\n"
+                '  src="missing.js">\n'
+                'const example = "[example](ignored-missing.md)";\n'
+                "</script>\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.js", errors[0])
+
+    def test_masks_standard_raw_html_block_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "<div>\n"
+                "[literal example](missing.md)\n"
+                "</div>\n"
+                "\n"
+                "[rendered](rendered-missing.md)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("rendered-missing.md", errors[0])
+
+    def test_validates_html_targets_inside_standard_raw_html_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "<div>\n"
+                '<a href="missing.md">missing</a>\n'
+                "[literal example](ignored-missing.md)\n"
+                "</div>\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_rejects_skill_link_that_escapes_distributable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -611,6 +692,17 @@ class SecretTests(unittest.TestCase):
             root = Path(directory)
             (root / "config.txt").write_text("GITHUB_TOKEN is provided by CI.\n", encoding="utf-8")
             self.assertEqual([], validator.find_secret_like_content(root))
+
+    def test_detects_secret_in_utf16_text_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = "github_" + "pat_1234567890abcdefghijklmnop"
+            (root / "script.ps1").write_text(
+                f"token={token}\n", encoding="utf-16"
+            )
+            errors = validator.find_secret_like_content(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("script.ps1", errors[0])
 
     def test_ignores_local_credentials_but_scans_env_example(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
