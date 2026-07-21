@@ -60,7 +60,9 @@ PORTABILITY_PATTERNS = {
         r"(?:/home/[^/\s]+(?=/|[\s)\]}>.,;:!?]|$)|"
         r"/root(?=/|[\s)\]}>.,;:!?]|$))"
     ),
-    "machine-specific Windows path": re.compile(r"[A-Za-z]:\\Users\\", re.IGNORECASE),
+    "machine-specific Windows path": re.compile(
+        r"[A-Za-z]:[\\/]Users[\\/]", re.IGNORECASE
+    ),
     "shell-specific preapproval syntax": re.compile(r"\bBash\([^\n]*\)"),
 }
 
@@ -383,29 +385,40 @@ def markdown_container_content(line: str) -> tuple[tuple[str, ...], str]:
 
 
 def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], str]]:
-    """Normalize direct containers and single-list continuation indentation."""
+    """Normalize direct containers and nested-list continuation indentation."""
 
     normalized: list[tuple[tuple[str, ...], str]] = []
-    active_list_indent: int | None = None
+    active_list_indents: list[int] = []
     active_list_parent: tuple[str, ...] | None = None
     for line in lines:
         parent_containers, parent_content = markdown_blockquote_content(line)
-        continuation_content = (
-            markdown_strip_indent_columns(parent_content, active_list_indent)
-            if active_list_indent is not None
-            else None
-        )
+        continuation_content: str | None = None
+        continuation_depth = 0
+        if active_list_parent == parent_containers and parent_content.strip():
+            for depth in range(len(active_list_indents), 0, -1):
+                candidate = markdown_strip_indent_columns(
+                    parent_content, active_list_indents[depth - 1]
+                )
+                if candidate is not None:
+                    continuation_content = candidate
+                    continuation_depth = depth
+                    break
         is_continuation = (
-            active_list_indent is not None
+            continuation_depth > 0
             and active_list_parent == parent_containers
             and continuation_content is not None
             and bool(parent_content.strip())
         )
         if is_continuation:
+            active_list_indents = active_list_indents[:continuation_depth]
             nested_containers, content = markdown_container_content(continuation_content)
             normalized.append(
                 (
-                    (*parent_containers, "list", *nested_containers),
+                    (
+                        *parent_containers,
+                        *("list" for _ in range(continuation_depth)),
+                        *nested_containers,
+                    ),
                     content,
                 )
             )
@@ -414,10 +427,17 @@ def markdown_container_lines(lines: list[str]) -> list[tuple[tuple[str, ...], st
 
         list_item = MARKDOWN_LIST_PREFIX.match(parent_content)
         if list_item:
-            active_list_indent = markdown_list_prefix_columns(list_item)
+            active_list_indents = [markdown_list_prefix_columns(list_item)]
             active_list_parent = parent_containers
+        elif is_continuation and continuation_content is not None:
+            nested_list_item = MARKDOWN_LIST_PREFIX.match(continuation_content)
+            if nested_list_item:
+                active_list_indents.append(
+                    active_list_indents[-1]
+                    + markdown_list_prefix_columns(nested_list_item)
+                )
         elif parent_content.strip() and not is_continuation:
-            active_list_indent = None
+            active_list_indents = []
             active_list_parent = None
 
     return normalized
@@ -493,14 +513,20 @@ def markdown_fence_opening(content: str) -> re.Match[str] | None:
     return match
 
 
-def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
+def mask_markdown_raw_html_blocks(
+    characters: list[str],
+    reference_definition_lines: set[int] | None = None,
+) -> None:
     """Mask CommonMark raw HTML block bodies while retaining opening tags."""
 
     text = "".join(characters)
     lines_with_endings = text.splitlines(keepends=True)
-    container_lines = markdown_container_lines(
-        [line.rstrip("\r\n") for line in lines_with_endings]
-    )
+    lines = [line.rstrip("\r\n") for line in lines_with_endings]
+    container_lines = markdown_container_lines(lines)
+    if reference_definition_lines is None:
+        _, reference_definition_lines = markdown_reference_definitions_with_lines(
+            lines, container_lines
+        )
     line_offsets: list[int] = []
     running_offset = 0
     for line in lines_with_endings:
@@ -629,6 +655,7 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
                 MARKDOWN_ATX_HEADING.match(content)
                 or MARKDOWN_SETEXT_HEADING.match(content)
                 or MARKDOWN_THEMATIC_BREAK.match(content)
+                or line_index in reference_definition_lines
             ):
                 open_paragraph_containers = None
             else:
@@ -683,10 +710,14 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
     fence_container_spec: tuple[tuple[str, int], ...] = ()
     open_paragraph_containers: tuple[str, ...] | None = None
 
-    container_lines = markdown_container_lines(
-        [line.rstrip("\r\n") for line in lines_with_endings]
+    lines = [line.rstrip("\r\n") for line in lines_with_endings]
+    container_lines = markdown_container_lines(lines)
+    _, reference_definition_lines = markdown_reference_definitions_with_lines(
+        lines, container_lines
     )
-    for line, (containers, container_content) in zip(lines_with_endings, container_lines):
+    for line_index, (line, (containers, container_content)) in enumerate(
+        zip(lines_with_endings, container_lines)
+    ):
         line_body = line.rstrip("\r\n")
         indented_candidate = MARKDOWN_INDENTED_CODE.match(container_content) is not None
         indented_code = (
@@ -752,13 +783,14 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             or MARKDOWN_ATX_HEADING.match(container_content)
             or MARKDOWN_SETEXT_HEADING.match(container_content)
             or MARKDOWN_THEMATIC_BREAK.match(container_content)
+            or line_index in reference_definition_lines
         ):
             open_paragraph_containers = None
         else:
             open_paragraph_containers = containers
         offset += len(line)
 
-    mask_markdown_raw_html_blocks(characters)
+    mask_markdown_raw_html_blocks(characters, reference_definition_lines)
 
     literal_characters = characters.copy()
     masked = "".join(literal_characters)
@@ -928,7 +960,8 @@ def markdown_normalize_reference_label(label: str) -> str:
     """Normalize a reference label for case-insensitive CommonMark matching."""
 
     label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", label)
-    return " ".join(markdown_unescape(label).split()).casefold()
+    label = re.sub(r"[ \t\r\n]+", " ", markdown_unescape(label))
+    return label.strip(" ").casefold()
 
 
 def markdown_inline_whitespace_end(
@@ -958,14 +991,18 @@ def markdown_inline_whitespace_end(
     return index
 
 
-def markdown_reference_definitions(
-    text: str,
-) -> list[re.Match[str]]:
-    """Return definitions that occur where a new Markdown block may begin."""
+def markdown_reference_definitions_with_lines(
+    lines: list[str],
+    container_lines: list[tuple[tuple[str, ...], str]] | None = None,
+) -> tuple[list[re.Match[str]], set[int]]:
+    """Return active definitions and every normalized line they occupy."""
 
-    lines = text.splitlines()
-    container_lines = markdown_container_lines(lines)
+    if container_lines is None:
+        container_lines = markdown_container_lines(lines)
     container_text = "\n".join(content for _, content in container_lines)
+    container_line_endings = [
+        index for index, character in enumerate(container_text) if character == "\n"
+    ]
     definitions: list[re.Match[str]] = []
     definition_lines: set[int] = set()
     for match in MARKDOWN_REFERENCE_DEFINITION.finditer(container_text):
@@ -977,10 +1014,10 @@ def markdown_reference_definitions(
             target
         ):
             continue
-        line_index = container_text.count("\n", 0, match.start())
+        line_index = bisect_left(container_line_endings, match.start())
         containers, _ = container_lines[line_index]
-        end_line_index = container_text.count(
-            "\n", 0, max(match.start(), match.end() - 1)
+        end_line_index = bisect_left(
+            container_line_endings, max(match.start(), match.end() - 1)
         )
         if any(
             continued_containers != containers
@@ -1010,6 +1047,15 @@ def markdown_reference_definitions(
         ):
             definitions.append(match)
             definition_lines.update(range(line_index, end_line_index + 1))
+    return definitions, definition_lines
+
+
+def markdown_reference_definitions(
+    text: str,
+) -> list[re.Match[str]]:
+    """Return definitions that occur where a new Markdown block may begin."""
+
+    definitions, _ = markdown_reference_definitions_with_lines(text.splitlines())
     return definitions
 
 
@@ -1050,6 +1096,8 @@ def markdown_bare_destination_is_balanced(destination: str) -> bool:
     index = 0
     while index < len(destination):
         character = destination[index]
+        if ord(character) < 0x20 or ord(character) == 0x7F:
+            return False
         if character == "\\":
             index += 2
             continue
@@ -1511,6 +1559,8 @@ def markdown_destination_end(
         depth = 0
         while index < paragraph_end:
             character = text[index]
+            if ord(character) < 0x20 or ord(character) == 0x7F:
+                return None
             if character == "\\":
                 escape = MARKDOWN_BACKSLASH_ESCAPE.match(text, index)
                 if escape is not None:

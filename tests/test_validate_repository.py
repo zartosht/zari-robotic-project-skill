@@ -447,6 +447,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_bare_destination_with_ascii_control_character(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide](missing\x01.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_backslash_escaped_punctuation_in_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -532,6 +540,20 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("quoted-missing.md" in error for error in errors))
             self.assertTrue(any("listed-missing.md" in error for error in errors))
 
+    def test_reports_reference_definition_in_nested_list_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "- outer\n"
+                "    - inner\n\n"
+                "      [r]: missing.md\n"
+                "      [x][r]\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_reports_reference_destination_continued_on_next_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -595,6 +617,15 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 "[guide][" + (" " * 999) + "a]\n\n[a]: missing.md\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_preserves_non_commonmark_whitespace_in_reference_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[foo bar]: missing.md\n[x][foo\u00a0bar]\n",
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
@@ -709,6 +740,15 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(400, len(targets))
         self.assertLess(counted_ranges.iterations, 10)
         self.assertLess(paragraph_end.call_count, 10)
+
+    def test_indexes_reference_definition_lines_with_binary_search(self) -> None:
+        text = "".join(f"[ref-{index}]: README.md\n" for index in range(500))
+        with mock.patch.object(
+            validator, "bisect_left", wraps=validator.bisect_left
+        ) as bisect:
+            definitions = validator.markdown_reference_definitions(text)
+        self.assertEqual(500, len(definitions))
+        self.assertEqual(1000, bisect.call_count)
 
     def test_rejects_markdown_image_targeting_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1319,6 +1359,18 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("rendered-missing.md", errors[0])
 
+    def test_reference_definition_ends_paragraph_before_type_seven_html(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[r]: README.md\n"
+                "<custom>\n"
+                "[guide](missing.md)\n"
+                "</custom>\n\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_html_targets_inside_standard_raw_html_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1564,6 +1616,18 @@ class PortabilityTests(unittest.TestCase):
             (root / "assets").mkdir()
             (root / "SKILL.md").write_text(
                 r"Open C:\Users\alice\robot-project." + "\n", encoding="utf-8"
+            )
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("machine-specific Windows path", errors[0])
+
+    def test_detects_forward_slash_windows_user_home_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            (root / "assets").mkdir()
+            (root / "SKILL.md").write_text(
+                "Open C:/users/alice/robot-project.\n", encoding="utf-8"
             )
             errors = validator.find_portability_violations(root)
             self.assertEqual(1, len(errors))
