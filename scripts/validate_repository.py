@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import sys
 import unicodedata
@@ -209,14 +210,68 @@ MARKDOWN_HTML_SRC_TAGS = frozenset(
         "video",
     }
 )
+MARKDOWN_HTML_EMBEDDED_DOCUMENT_SRC_TAGS = frozenset(
+    {"embed", "frame", "iframe"}
+)
 MARKDOWN_HTML_INPUT_TAGS = frozenset({"input"})
 MARKDOWN_HTML_IMAGE_INPUT_TYPES = frozenset({"image"})
 MARKDOWN_HTML_DATA_TAGS = frozenset({"object"})
+MARKDOWN_HTML_EMBEDDED_DOCUMENT_DATA_TAGS = frozenset({"object"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
 MARKDOWN_HTML_BACKGROUND_TAGS = frozenset(
     {"body", "table", "tbody", "td", "tfoot", "th", "thead", "tr"}
 )
 MARKDOWN_HTML_MAP_TAGS = frozenset({"map"})
+CSS_RESOURCE_PROPERTIES = frozenset(
+    {
+        "-moz-binding",
+        "-webkit-backdrop-filter",
+        "-webkit-border-image",
+        "-webkit-box-reflect",
+        "-webkit-mask",
+        "-webkit-mask-box-image",
+        "-webkit-mask-box-image-source",
+        "-webkit-mask-image",
+        "backdrop-filter",
+        "background",
+        "background-image",
+        "border-image",
+        "border-image-source",
+        "clip-path",
+        "content",
+        "cue",
+        "cue-after",
+        "cue-before",
+        "cursor",
+        "fill",
+        "filter",
+        "list-style",
+        "list-style-image",
+        "marker",
+        "marker-end",
+        "marker-mid",
+        "marker-start",
+        "mask",
+        "mask-border",
+        "mask-border-source",
+        "mask-box-image",
+        "mask-box-image-source",
+        "mask-image",
+        "offset-path",
+        "play-during",
+        "shape-outside",
+        "stroke",
+    }
+)
+CSS_RESOURCE_DESCRIPTORS = {
+    "additive-symbols": frozenset({"counter-style"}),
+    "negative": frozenset({"counter-style"}),
+    "pad": frozenset({"counter-style"}),
+    "prefix": frozenset({"counter-style"}),
+    "src": frozenset({"color-profile", "font-face"}),
+    "suffix": frozenset({"counter-style"}),
+    "symbols": frozenset({"counter-style"}),
+}
 MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
 MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img"})
 MARKDOWN_HTML_IMAGESRCSET_ATTRIBUTES = frozenset({"imagesrcset"})
@@ -2685,13 +2740,15 @@ def css_used_custom_properties(
     texts: list[str],
     initially_used: set[str] | frozenset[str] = frozenset(),
 ) -> set[str]:
-    """Return custom properties consumed across a collection of style sources."""
+    """Return custom properties consumed by resource-bearing declarations."""
 
     dependencies: dict[str, set[str]] = {}
     used = set(initially_used)
     for text in texts:
         declarations = css_custom_property_declarations(text)
         starts = [start for _, start, _ in declarations]
+        resource_ranges = css_direct_resource_declaration_value_ranges(text)
+        resource_starts = [start for start, _ in resource_ranges]
         for name, position in css_variable_references(text):
             declaration_index = bisect_right(starts, position) - 1
             if (
@@ -2701,7 +2758,12 @@ def css_used_custom_properties(
                 owner = declarations[declaration_index][0]
                 dependencies.setdefault(owner, set()).add(name)
             else:
-                used.add(name)
+                resource_index = bisect_right(resource_starts, position) - 1
+                if (
+                    resource_index >= 0
+                    and position < resource_ranges[resource_index][1]
+                ):
+                    used.add(name)
     pending = list(used)
     while pending:
         name = pending.pop()
@@ -2729,6 +2791,133 @@ def css_unused_custom_property_value_ranges(
     ]
 
 
+def css_declaration_value_ranges(text: str) -> list[tuple[str, int, int]]:
+    """Return syntactic declaration names and their value ranges."""
+
+    declarations: list[tuple[str, int, int]] = []
+    index = 0
+    while index < len(text):
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        previous = text[index - 1] if index else ""
+        if (
+            not (css_name_character(text[index]) or text[index] == "\\")
+            or css_name_character(previous)
+            or not css_is_declaration_start(text, index)
+        ):
+            index += 1
+            continue
+        identifier = css_identifier_value(text, index)
+        if identifier is None:
+            index += 1
+            continue
+        colon = css_skip_whitespace_and_comments(text, identifier[1])
+        if colon >= len(text) or text[colon] != ":":
+            index = identifier[1]
+            continue
+        value_start = colon + 1
+        value_end = css_declaration_value_end(text, value_start)
+        if (
+            css_at_rule_block_start(text[value_start:value_end], 0)
+            is not None
+        ):
+            # A top-level block after the colon belongs to a nested selector,
+            # not a property declaration such as ``background:hover {...}``.
+            index = identifier[1]
+            continue
+        declarations.append((identifier[0], value_start, value_end))
+        index = value_end + (value_end < len(text))
+    return declarations
+
+
+def css_enclosing_at_rule(text: str, position: int) -> str | None:
+    """Return the innermost at-rule whose block contains one position."""
+
+    contexts: list[str | None] = []
+    statement_starts = [0]
+    parentheses = 0
+    brackets = 0
+    index = 0
+    while index < min(position, len(text)):
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        if text[index] == "\\":
+            escaped = css_escape_value(text, index)
+            index = index + 1 if escaped is None else escaped[1]
+            continue
+        if text[index] == "(":
+            parentheses += 1
+        elif text[index] == ")" and parentheses:
+            parentheses -= 1
+        elif text[index] == "[":
+            brackets += 1
+        elif text[index] == "]" and brackets:
+            brackets -= 1
+        elif not parentheses and not brackets:
+            if text[index] == "{":
+                header_start = css_skip_whitespace_and_comments(
+                    text, statement_starts[-1]
+                )
+                at_rule: str | None = None
+                if header_start < index and text[header_start] == "@":
+                    identifier = css_identifier_value(text, header_start + 1)
+                    if identifier is not None:
+                        at_rule = identifier[0].casefold()
+                contexts.append(at_rule)
+                statement_starts.append(index + 1)
+            elif text[index] == ";":
+                statement_starts[-1] = index + 1
+            elif text[index] == "}" and contexts:
+                contexts.pop()
+                statement_starts.pop()
+                statement_starts[-1] = index + 1
+        index += 1
+    return contexts[-1] if contexts else None
+
+
+def css_direct_resource_declaration_value_ranges(
+    text: str,
+) -> list[tuple[int, int]]:
+    """Return direct property or descriptor ranges that can consume URLs."""
+
+    ranges: list[tuple[int, int]] = []
+    for name, start, end in css_declaration_value_ranges(text):
+        canonical_name = name.casefold()
+        descriptor_rules = CSS_RESOURCE_DESCRIPTORS.get(canonical_name)
+        if canonical_name in CSS_RESOURCE_PROPERTIES or (
+            descriptor_rules is not None
+            and css_enclosing_at_rule(text, start) in descriptor_rules
+        ):
+            ranges.append((start, end))
+    return ranges
+
+
+def css_resource_declaration_value_ranges(
+    text: str,
+    used_custom_properties: set[str] | frozenset[str] = frozenset(),
+) -> list[tuple[int, int]]:
+    """Return declaration ranges whose values may consume URL resources."""
+
+    used_custom = css_used_custom_properties([text], used_custom_properties)
+    ranges = css_direct_resource_declaration_value_ranges(text)
+    for name, start, end in css_declaration_value_ranges(text):
+        if name.startswith("--") and name in used_custom:
+            ranges.append((start, end))
+    return sorted(ranges)
+
+
 def css_resource_references(
     text: str,
     *,
@@ -2748,12 +2937,25 @@ def css_resource_references(
     unused_custom_property_starts = [
         start for start, _ in unused_custom_property_ranges
     ]
+    resource_declaration_ranges = css_resource_declaration_value_ranges(
+        text, used_custom_properties
+    )
+    resource_declaration_starts = [
+        start for start, _ in resource_declaration_ranges
+    ]
 
     def inside_unused_custom_property(position: int) -> bool:
         range_index = bisect_right(unused_custom_property_starts, position) - 1
         return (
             range_index >= 0
             and position < unused_custom_property_ranges[range_index][1]
+        )
+
+    def inside_resource_declaration(position: int) -> bool:
+        range_index = bisect_right(resource_declaration_starts, position) - 1
+        return (
+            range_index >= 0
+            and position < resource_declaration_ranges[range_index][1]
         )
 
     index = 0
@@ -2779,6 +2981,7 @@ def css_resource_references(
             and not css_name_character(previous)
             and index >= ignored_supports_condition_end
             and not inside_unused_custom_property(index)
+            and inside_resource_declaration(index)
         ):
             targets.extend(
                 (target, True)
@@ -2889,6 +3092,10 @@ def css_resource_references(
                             index not in ignored_url_starts
                             and index >= ignored_supports_condition_end
                             and not inside_unused_custom_property(index)
+                            and (
+                                index in forced_file_url_starts
+                                or inside_resource_declaration(index)
+                            )
                         ):
                             if (
                                 imported_targets is not None
@@ -2948,6 +3155,10 @@ def css_resource_references(
                         and index not in ignored_url_starts
                         and index >= ignored_supports_condition_end
                         and not inside_unused_custom_property(index)
+                        and (
+                            index in forced_file_url_starts
+                            or inside_resource_declaration(index)
+                        )
                     ):
                         if (
                             imported_targets is not None
@@ -3200,6 +3411,7 @@ class HTMLContextResourceParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.targets: list[tuple[str, bool, bool]] = []
+        self.embedded_document_targets: list[str] = []
         self.base_hrefs: list[str] = []
         self.formaction_candidates: list[tuple[str, str | None, bool]] = []
         self.first_id_elements: dict[str, tuple[str, str]] = {}
@@ -3287,6 +3499,8 @@ class HTMLContextResourceParser(HTMLParser):
             )
         ):
             self.targets.append((values["src"], False, True))
+            if canonical_tag in MARKDOWN_HTML_EMBEDDED_DOCUMENT_SRC_TAGS:
+                self.embedded_document_targets.append(values["src"])
         if (
             canonical_tag in MARKDOWN_HTML_INPUT_TAGS
             and namespace == HTML_NAMESPACE
@@ -3318,6 +3532,8 @@ class HTMLContextResourceParser(HTMLParser):
             and "data" in values
         ):
             self.targets.append((values["data"], False, True))
+            if canonical_tag in MARKDOWN_HTML_EMBEDDED_DOCUMENT_DATA_TAGS:
+                self.embedded_document_targets.append(values["data"])
         if (
             canonical_tag in MARKDOWN_HTML_POSTER_TAGS
             and namespace == HTML_NAMESPACE
@@ -3372,12 +3588,16 @@ class HTMLContextResourceParser(HTMLParser):
         )
 
 
-def html_context_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
+def html_context_resource_targets(
+    text: str, *, embedded_document_targets: list[str] | None = None
+) -> list[tuple[str, bool, bool]]:
     """Return resource targets that require HTML ancestor context."""
 
     parser = HTMLContextResourceParser()
     parser.feed(text)
     parser.close()
+    if embedded_document_targets is not None:
+        embedded_document_targets.extend(parser.embedded_document_targets)
     return parser.targets + html_owned_formaction_targets(
         parser.formaction_candidates, parser.first_id_elements
     )
@@ -3400,6 +3620,7 @@ class HTMLFragmentResourceParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.targets: list[tuple[str, bool, bool]] = []
+        self.embedded_document_targets: list[str] = []
         self.srcdocs: list[str] = []
         self.base_href: str | None = None
         self.style_content: list[str] | None = None
@@ -3541,6 +3762,8 @@ class HTMLFragmentResourceParser(HTMLParser):
             )
         ):
             self.targets.append((values["src"], False, True))
+            if canonical_tag in MARKDOWN_HTML_EMBEDDED_DOCUMENT_SRC_TAGS:
+                self.embedded_document_targets.append(values["src"])
         if (
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
@@ -3561,6 +3784,8 @@ class HTMLFragmentResourceParser(HTMLParser):
             and "data" in values
         ):
             self.targets.append((values["data"], False, True))
+            if canonical_tag in MARKDOWN_HTML_EMBEDDED_DOCUMENT_DATA_TAGS:
+                self.embedded_document_targets.append(values["data"])
         if (
             canonical_tag in MARKDOWN_HTML_POSTER_TAGS
             and namespace == HTML_NAMESPACE
@@ -3803,6 +4028,7 @@ def html_fragment_resource_targets(
     *,
     inherited_base: str = "",
     stylesheet_targets: list[str] | None = None,
+    embedded_document_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Collect targets from HTML parsed inside an iframe srcdoc document."""
 
@@ -3837,6 +4063,17 @@ def html_fragment_resource_targets(
                     [
                         (target, False, True)
                         for target in parser.stylesheet_targets
+                    ],
+                    effective_base,
+                )
+            )
+        if embedded_document_targets is not None:
+            embedded_document_targets.extend(
+                target
+                for target, _, _ in resolve_html_targets(
+                    [
+                        (target, False, True)
+                        for target in parser.embedded_document_targets
                     ],
                     effective_base,
                 )
@@ -4098,6 +4335,7 @@ def html_resource_targets(
     *,
     additional_style_sources: list[str] | None = None,
     stylesheet_targets: list[str] | None = None,
+    embedded_document_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Collect navigations and resource requests from rendered HTML."""
 
@@ -4107,6 +4345,7 @@ def html_resource_targets(
     text = mask_html_template_contents(text)
     effective_base = html_effective_base(text)
     targets: list[tuple[str, bool, bool]] = []
+    document_resource_targets: list[str] = []
     document_stylesheet_targets = [
         html_attribute_unescape(target)
         for target in html_attribute_values(
@@ -4116,7 +4355,12 @@ def html_resource_targets(
             required_attribute_tokens={"rel": frozenset({"stylesheet"})},
         )
     ]
-    targets.extend(html_context_resource_targets(text))
+    targets.extend(
+        html_context_resource_targets(
+            text,
+            embedded_document_targets=document_resource_targets,
+        )
+    )
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
@@ -4201,6 +4445,17 @@ def html_resource_targets(
             targets.append((refresh_target, False, False))
 
     targets = resolve_html_targets(targets, effective_base)
+    if embedded_document_targets is not None:
+        embedded_document_targets.extend(
+            target
+            for target, _, _ in resolve_html_targets(
+                [
+                    (target, False, True)
+                    for target in document_resource_targets
+                ],
+                effective_base,
+            )
+        )
     if stylesheet_targets is not None:
         stylesheet_targets.extend(
             target
@@ -4223,6 +4478,7 @@ def html_resource_targets(
                 html_attribute_unescape(srcdoc),
                 inherited_base=effective_base,
                 stylesheet_targets=stylesheet_targets,
+                embedded_document_targets=embedded_document_targets,
             )
         )
     return targets
@@ -4541,6 +4797,7 @@ def markdown_link_targets(
     text: str,
     *,
     stylesheet_targets: list[str] | None = None,
+    embedded_document_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Extract destinations and whether they require Markdown parsing or a file."""
 
@@ -4676,6 +4933,7 @@ def markdown_link_targets(
             rendered_html_text,
             additional_style_sources=style_contents,
             stylesheet_targets=stylesheet_targets,
+            embedded_document_targets=embedded_document_targets,
         )
     )
     return targets
@@ -5098,8 +5356,8 @@ def find_broken_links(root: Path) -> list[str]:
                 )
         return decoded_text_cache[path]
 
-    seen_stylesheets: set[Path] = set()
-    seen_html_documents: set[Path] = set()
+    seen_stylesheets: set[tuple[Path, Path]] = set()
+    seen_html_documents: set[tuple[Path, Path]] = set()
     for path in markdown_files(root):
         text = read_text_resource(path)
         if text is None:
@@ -5110,10 +5368,14 @@ def find_broken_links(root: Path) -> list[str]:
                 f"{fragment_target!r}"
             )
         stylesheet_targets: list[str] = []
+        embedded_document_targets: list[str] = []
         link_targets = markdown_link_targets(
-            text, stylesheet_targets=stylesheet_targets
+            text,
+            stylesheet_targets=stylesheet_targets,
+            embedded_document_targets=embedded_document_targets,
         )
         stylesheet_target_set = set(stylesheet_targets)
+        embedded_document_target_set = set(embedded_document_targets)
         pending_targets = [
             (
                 path,
@@ -5121,6 +5383,7 @@ def find_broken_links(root: Path) -> list[str]:
                 is_markdown,
                 requires_file,
                 raw_target in stylesheet_target_set,
+                raw_target in embedded_document_target_set,
             )
             for raw_target, is_markdown, requires_file in link_targets
         ]
@@ -5130,6 +5393,7 @@ def find_broken_links(root: Path) -> list[str]:
             is_markdown,
             requires_file,
             scan_stylesheet,
+            scan_html_document,
         ) in pending_targets:
             target = raw_target.strip("\t\n\f\r ")
             if not target:
@@ -5177,11 +5441,14 @@ def find_broken_links(root: Path) -> list[str]:
                 )
                 continue
             try:
-                resolved = (
-                    (source_path.parent / path_target).resolve()
-                    if path_target
-                    else source_path.resolve()
+                lexical_path = Path(
+                    os.path.normpath(
+                        source_path.parent / path_target
+                        if path_target
+                        else source_path
+                    )
                 )
+                resolved = lexical_path.resolve()
             except (OSError, ValueError):
                 errors.append(
                     f"{display_path(source_path)}: broken relative link {raw_target!r}"
@@ -5220,9 +5487,9 @@ def find_broken_links(root: Path) -> list[str]:
             if (
                 scan_stylesheet
                 and resolved.is_file()
-                and resolved not in seen_stylesheets
+                and (resolved, lexical_path) not in seen_stylesheets
             ):
-                seen_stylesheets.add(resolved)
+                seen_stylesheets.add((resolved, lexical_path))
                 stylesheet_text = read_text_resource(resolved)
                 if stylesheet_text is not None:
                     imported_targets: list[str] = []
@@ -5233,42 +5500,47 @@ def find_broken_links(root: Path) -> list[str]:
                     imported_target_set = set(imported_targets)
                     pending_targets.extend(
                         (
-                            resolved,
+                            lexical_path,
                             stylesheet_target,
                             False,
                             stylesheet_requires_file,
                             stylesheet_target in imported_target_set,
+                            False,
                         )
                         for stylesheet_target, stylesheet_requires_file
                         in stylesheet_references
                     )
             if (
-                not requires_file
+                (not requires_file or scan_html_document)
                 and resolved.is_file()
                 and resolved.suffix.lower() in HTML_SUFFIXES
-                and resolved not in seen_html_documents
+                and (resolved, lexical_path) not in seen_html_documents
             ):
-                seen_html_documents.add(resolved)
+                seen_html_documents.add((resolved, lexical_path))
                 html_text = read_text_resource(resolved)
                 if html_text is not None:
                     for fragment_target in html_srcdoc_fragment_errors(html_text):
                         errors.append(
-                            f"{display_path(resolved)}: broken srcdoc fragment "
+                            f"{display_path(lexical_path)}: broken srcdoc fragment "
                             f"{fragment_target!r}"
                         )
                     html_stylesheet_targets: list[str] = []
+                    html_document_targets: list[str] = []
                     html_targets = html_resource_targets(
                         html_text,
                         stylesheet_targets=html_stylesheet_targets,
+                        embedded_document_targets=html_document_targets,
                     )
                     html_stylesheet_target_set = set(html_stylesheet_targets)
+                    html_document_target_set = set(html_document_targets)
                     pending_targets.extend(
                         (
-                            resolved,
+                            lexical_path,
                             html_target,
                             html_is_markdown,
                             html_requires_file,
                             html_target in html_stylesheet_target_set,
+                            html_target in html_document_target_set,
                         )
                         for html_target, html_is_markdown, html_requires_file
                         in html_targets

@@ -86,6 +86,40 @@ class LinkTests(unittest.TestCase):
             self.assertIn("nested.html", errors[0])
             self.assertIn("missing.js", errors[0])
 
+    def test_scans_resources_in_embedded_html_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<iframe src="frame.html"></iframe>\n'
+                '<object data="object.html"></object>\n'
+                '<img src="image.html">\n'
+                '<iframe srcdoc="<iframe src=&quot;nested.html&quot;>'
+                '</iframe>"></iframe>\n',
+                encoding="utf-8",
+            )
+            (root / "frame.html").write_text(
+                '<img src="missing-frame.png">\n', encoding="utf-8"
+            )
+            (root / "object.html").write_text(
+                '<script src="missing-object.js"></script>\n', encoding="utf-8"
+            )
+            (root / "nested.html").write_text(
+                '<link rel="stylesheet" href="missing-nested.css">\n',
+                encoding="utf-8",
+            )
+            (root / "image.html").write_text(
+                '<img src="ignored-image-payload.png">\n', encoding="utf-8"
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            self.assertTrue(any("missing-frame.png" in error for error in errors))
+            self.assertTrue(any("missing-object.js" in error for error in errors))
+            self.assertTrue(any("missing-nested.css" in error for error in errors))
+            self.assertFalse(
+                any("ignored-image-payload.png" in error for error in errors)
+            )
+
     def test_accepts_existing_relative_link_and_external_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2566,6 +2600,41 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_ignores_urls_in_non_resource_css_declarations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>.ignored { example: url(ignored-unknown.png); '
+                'color: url(ignored-invalid.png); '
+                '--color-url: url(ignored-custom.png); '
+                'color: var(--color-url); '
+                'example-image: image-set("ignored-set.png" 1x); } '
+                '.valid { background-image: url(missing-background.png); '
+                'filter: url(missing-filter.svg); } '
+                '.adjacent-one { background: url(missing-adjacent-one.png) } '
+                '.adjacent-two { background: url(missing-adjacent-two.png) } '
+                '@font-face { src: url(missing-font.woff2); } '
+                '@counter-style images { system: symbolic; '
+                'symbols: url(missing-symbol.svg); }</style>\n'
+                '<div style="example:url(ignored-inline.png); '
+                'background:url(missing-inline.png)"></div>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(7, len(errors))
+            for target in (
+                "missing-background.png",
+                "missing-filter.svg",
+                "missing-adjacent-one.png",
+                "missing-adjacent-two.png",
+                "missing-font.woff2",
+                "missing-symbol.svg",
+                "missing-inline.png",
+            ):
+                self.assertTrue(any(target in error for error in errors))
+            self.assertFalse(any("ignored-" in error for error in errors))
+
     def test_ignores_resources_in_unused_css_custom_properties(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2761,6 +2830,34 @@ class LinkTests(unittest.TestCase):
                     "styles/nested/child.css: broken relative link "
                     "'missing.png'"
                 ],
+                validator.find_broken_links(root),
+            )
+
+    def test_uses_lexical_url_base_for_symlinked_stylesheets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = root / "shared"
+            first_alias = root / "first"
+            second_alias = root / "second"
+            shared.mkdir()
+            first_alias.mkdir()
+            second_alias.mkdir()
+            (root / "README.md").write_text(
+                '<link rel="stylesheet" href="first/theme.css">\n'
+                '<link rel="stylesheet" href="second/theme.css">\n',
+                encoding="utf-8",
+            )
+            (shared / "theme.css").write_text(
+                'body { background-image: url(asset.png); }\n',
+                encoding="utf-8",
+            )
+            (first_alias / "theme.css").symlink_to("../shared/theme.css")
+            (second_alias / "theme.css").symlink_to("../shared/theme.css")
+            (first_alias / "asset.png").write_bytes(b"ok")
+            (shared / "asset.png").write_bytes(b"wrong canonical base")
+
+            self.assertEqual(
+                ["second/theme.css: broken relative link 'asset.png'"],
                 validator.find_broken_links(root),
             )
 
