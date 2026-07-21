@@ -255,6 +255,54 @@ SVG_NAMESPACE = "svg"
 MATHML_NAMESPACE = "mathml"
 SVG_HTML_INTEGRATION_POINTS = frozenset({"desc", "foreignobject", "title"})
 MATHML_TEXT_INTEGRATION_POINTS = frozenset({"mi", "mn", "mo", "ms", "mtext"})
+HTML_FOREIGN_CONTENT_BREAKOUT_START_TAGS = frozenset(
+    {
+        "b",
+        "big",
+        "blockquote",
+        "body",
+        "br",
+        "center",
+        "code",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "embed",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "hr",
+        "i",
+        "img",
+        "li",
+        "listing",
+        "menu",
+        "meta",
+        "nobr",
+        "ol",
+        "p",
+        "pre",
+        "ruby",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "strike",
+        "sub",
+        "sup",
+        "table",
+        "tt",
+        "u",
+        "ul",
+        "var",
+    }
+)
 HTML_JAVASCRIPT_MIME_TYPE_ESSENCES = frozenset(
     {
         "application/ecmascript",
@@ -2504,6 +2552,176 @@ def css_top_level_import_starts(text: str) -> set[int]:
     return starts
 
 
+def css_is_declaration_start(text: str, start: int) -> bool:
+    """Return whether an identifier begins after a declaration boundary."""
+
+    index = start
+    while index:
+        index -= 1
+        if text[index] in HTML_ASCII_WHITESPACE:
+            continue
+        if index and text[index - 1 : index + 1] == "*/":
+            comment_start = text.rfind("/*", 0, index - 1)
+            if comment_start < 0:
+                return False
+            index = comment_start
+            continue
+        return text[index] in "{;"
+    return True
+
+
+def css_declaration_value_end(text: str, start: int) -> int:
+    """Return the first top-level declaration delimiter after a value start."""
+
+    parentheses = 0
+    brackets = 0
+    braces = 0
+    index = start
+    while index < len(text):
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        if text[index] == "\\":
+            escaped = css_escape_value(text, index)
+            index = index + 1 if escaped is None else escaped[1]
+            continue
+        if text[index] == "(":
+            parentheses += 1
+        elif text[index] == ")" and parentheses:
+            parentheses -= 1
+        elif text[index] == "[":
+            brackets += 1
+        elif text[index] == "]" and brackets:
+            brackets -= 1
+        elif text[index] == "{":
+            braces += 1
+        elif text[index] == "}":
+            if braces:
+                braces -= 1
+            elif not parentheses and not brackets:
+                return index
+        elif (
+            text[index] == ";"
+            and not parentheses
+            and not brackets
+            and not braces
+        ):
+            return index
+        index += 1
+    return len(text)
+
+
+def css_custom_property_declarations(text: str) -> list[tuple[str, int, int]]:
+    """Return custom-property names and their value ranges."""
+
+    declarations: list[tuple[str, int, int]] = []
+    index = 0
+    while index < len(text):
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        if not text.startswith("--", index) or not css_is_declaration_start(
+            text, index
+        ):
+            index += 1
+            continue
+        identifier = css_identifier_value(text, index)
+        if identifier is None or not identifier[0].startswith("--"):
+            index += 2
+            continue
+        colon = css_skip_whitespace_and_comments(text, identifier[1])
+        if colon >= len(text) or text[colon] != ":":
+            index = identifier[1]
+            continue
+        value_start = colon + 1
+        value_end = css_declaration_value_end(text, value_start)
+        declarations.append((identifier[0], value_start, value_end))
+        index = value_end + (value_end < len(text))
+    return declarations
+
+
+def css_variable_references(text: str) -> list[tuple[str, int]]:
+    """Return decoded custom-property names referenced by var() functions."""
+
+    references: list[tuple[str, int]] = []
+    index = 0
+    while index < len(text):
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        previous = text[index - 1] if index else ""
+        identifier = (
+            css_identifier_value(text, index)
+            if (css_name_character(text[index]) or text[index] == "\\")
+            and not css_name_character(previous)
+            else None
+        )
+        if identifier is None:
+            index += 1
+            continue
+        if (
+            identifier[0].casefold() == "var"
+            and identifier[1] < len(text)
+            and text[identifier[1]] == "("
+        ):
+            name_start = css_skip_whitespace_and_comments(
+                text, identifier[1] + 1
+            )
+            name = css_identifier_value(text, name_start)
+            if name is not None and name[0].startswith("--"):
+                references.append((name[0], index))
+        index = max(index + 1, identifier[1])
+    return references
+
+
+def css_unused_custom_property_value_ranges(text: str) -> list[tuple[int, int]]:
+    """Return value ranges for custom properties never referenced by live CSS."""
+
+    declarations = css_custom_property_declarations(text)
+    if not declarations:
+        return []
+    starts = [start for _, start, _ in declarations]
+    dependencies: dict[str, set[str]] = {}
+    used: set[str] = set()
+    for name, position in css_variable_references(text):
+        declaration_index = bisect_right(starts, position) - 1
+        if (
+            declaration_index >= 0
+            and position < declarations[declaration_index][2]
+        ):
+            owner = declarations[declaration_index][0]
+            dependencies.setdefault(owner, set()).add(name)
+        else:
+            used.add(name)
+    pending = list(used)
+    while pending:
+        name = pending.pop()
+        for dependency in dependencies.get(name, set()):
+            if dependency not in used:
+                used.add(dependency)
+                pending.append(dependency)
+    return [
+        (start, end)
+        for name, start, end in declarations
+        if name not in used
+    ]
+
+
 def css_resource_references(text: str) -> list[tuple[str, bool]]:
     """Extract CSS resource URLs and whether each requires a file path."""
 
@@ -2512,6 +2730,18 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
     ignored_url_starts: set[int] = set()
     ignored_supports_condition_end = -1
     valid_import_starts = css_top_level_import_starts(text)
+    unused_custom_property_ranges = css_unused_custom_property_value_ranges(text)
+    unused_custom_property_starts = [
+        start for start, _ in unused_custom_property_ranges
+    ]
+
+    def inside_unused_custom_property(position: int) -> bool:
+        range_index = bisect_right(unused_custom_property_starts, position) - 1
+        return (
+            range_index >= 0
+            and position < unused_custom_property_ranges[range_index][1]
+        )
+
     index = 0
     while index < len(text):
         if text.startswith("/*", index):
@@ -2534,6 +2764,7 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
             and text[function_identifier[1]] == "("
             and not css_name_character(previous)
             and index >= ignored_supports_condition_end
+            and not inside_unused_custom_property(index)
         ):
             targets.extend(
                 (target, True)
@@ -2641,6 +2872,7 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                         if (
                             index not in ignored_url_starts
                             and index >= ignored_supports_condition_end
+                            and not inside_unused_custom_property(index)
                         ):
                             targets.append(
                                 (
@@ -2683,6 +2915,7 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                         and not has_internal_whitespace
                         and index not in ignored_url_starts
                         and index >= ignored_supports_condition_end
+                        and not inside_unused_custom_property(index)
                     ):
                         targets.append(
                             (
@@ -2748,12 +2981,56 @@ def html_slash_closes_context(tag: str, *, inside_foreign: bool) -> bool:
     return inside_foreign or tag in {"math", "svg"} or tag in HTML_VOID_TAGS
 
 
+def html_element_is_integration_point(
+    tag: str, namespace: str, attributes: dict[str, str]
+) -> bool:
+    """Return whether foreign content re-enters HTML below this element."""
+
+    return (
+        namespace == SVG_NAMESPACE and tag in SVG_HTML_INTEGRATION_POINTS
+    ) or (
+        namespace == MATHML_NAMESPACE
+        and (
+            tag in MATHML_TEXT_INTEGRATION_POINTS
+            or (
+                tag == "annotation-xml"
+                and attributes.get("encoding", "").strip().casefold()
+                in {"application/xhtml+xml", "text/html"}
+            )
+        )
+    )
+
+
+def html_start_tag_breaks_out_of_foreign_content(
+    tag: str, attributes: dict[str, str]
+) -> bool:
+    """Return whether an HTML start tag exits the current foreign subtree."""
+
+    return tag in HTML_FOREIGN_CONTENT_BREAKOUT_START_TAGS or (
+        tag == "font"
+        and any(name in attributes for name in {"color", "face", "size"})
+    )
+
+
 def html_start_tag_namespace(
     element_stack: list[tuple[str, str, dict[str, str]]],
     tag: str,
     attributes: dict[str, str],
 ) -> str:
     """Return the namespace assigned by the HTML tree builder to a start tag."""
+
+    if (
+        element_stack
+        and element_stack[-1][1] != HTML_NAMESPACE
+        and not html_element_is_integration_point(*element_stack[-1])
+        and html_start_tag_breaks_out_of_foreign_content(tag, attributes)
+    ):
+        while (
+            element_stack
+            and element_stack[-1][1] != HTML_NAMESPACE
+            and not html_element_is_integration_point(*element_stack[-1])
+        ):
+            element_stack.pop()
 
     if not element_stack:
         parent_namespace = HTML_NAMESPACE
@@ -2762,22 +3039,12 @@ def html_start_tag_namespace(
     else:
         parent_tag, parent_namespace, parent_attributes = element_stack[-1]
 
-    enters_html = (
-        parent_namespace == SVG_NAMESPACE
-        and parent_tag in SVG_HTML_INTEGRATION_POINTS
-    ) or (
+    enters_html = html_element_is_integration_point(
+        parent_tag, parent_namespace, parent_attributes
+    ) and not (
         parent_namespace == MATHML_NAMESPACE
-        and (
-            (
-                parent_tag in MATHML_TEXT_INTEGRATION_POINTS
-                and tag not in {"malignmark", "mglyph"}
-            )
-            or (
-                parent_tag == "annotation-xml"
-                and parent_attributes.get("encoding", "").strip().casefold()
-                in {"application/xhtml+xml", "text/html"}
-            )
-        )
+        and parent_tag in MATHML_TEXT_INTEGRATION_POINTS
+        and tag in {"malignmark", "mglyph"}
     )
     if parent_namespace == HTML_NAMESPACE or enters_html:
         if tag == "svg":
@@ -3379,6 +3646,71 @@ def html_srcdoc_fragment_errors(text: str) -> list[str]:
     return missing_fragments
 
 
+def mask_html_raw_text_element_contents(text: str) -> str:
+    """Mask HTML raw-text/RCDATA bodies while preserving tags and line endings."""
+
+    characters = list(text)
+    element_stack: list[tuple[str, str, dict[str, str]]] = []
+    search_from = 0
+    while search_from < len(text):
+        tag_match = HTML_RAW_BLOCK_TAG_OR_CLOSING.search(text, search_from)
+        if tag_match is None:
+            break
+        value = tag_match.group(0)
+        name_match = re.match(r"</?([A-Za-z][A-Za-z0-9-]*)", value)
+        if name_match is None:
+            search_from = tag_match.end()
+            continue
+        tag = name_match.group(1).casefold()
+        if value.startswith("</"):
+            html_pop_element_context(element_stack, tag)
+            search_from = tag_match.end()
+            continue
+
+        attributes: dict[str, str] = {}
+        encoding_values = html_attribute_values(value, frozenset({"encoding"}))
+        if encoding_values:
+            attributes["encoding"] = html_attribute_unescape(encoding_values[0])
+        namespace = html_start_tag_namespace(element_stack, tag, attributes)
+        canonical_tag = html_canonical_tag_name(tag, namespace)
+        html_push_element_context(element_stack, tag, namespace, attributes)
+
+        is_self_closing = value.rstrip().endswith("/>") and html_slash_closes_context(
+            canonical_tag, inside_foreign=namespace != HTML_NAMESPACE
+        )
+        if is_self_closing:
+            html_pop_element_context(element_stack, tag)
+            search_from = tag_match.end()
+            continue
+        if (
+            namespace != HTML_NAMESPACE
+            or tag not in MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS
+        ):
+            search_from = tag_match.end()
+            continue
+
+        closing_match: re.Match[str] | None = None
+        for candidate in HTML_RAW_BLOCK_TAG_OR_CLOSING.finditer(
+            text, tag_match.end()
+        ):
+            if re.fullmatch(
+                rf"</{re.escape(tag)}[ \t\f\r\n]*>",
+                candidate.group(0),
+                re.IGNORECASE,
+            ):
+                closing_match = candidate
+                break
+        if closing_match is None:
+            break
+        content_end = closing_match.start()
+        for position in range(tag_match.end(), content_end):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+        html_pop_element_context(element_stack, tag)
+        search_from = closing_match.end()
+    return "".join(characters)
+
+
 def mask_html_template_contents(text: str) -> str:
     """Mask inert template bodies while preserving their surrounding tags."""
 
@@ -3514,6 +3846,9 @@ def resolve_html_targets(
 def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     """Collect navigations and resource requests from rendered HTML."""
 
+    attribute_text = mask_html_template_contents(
+        mask_html_raw_text_element_contents(text)
+    )
     text = mask_html_template_contents(text)
     effective_base = html_effective_base(text)
     targets: list[tuple[str, bool, bool]] = []
@@ -3521,7 +3856,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_HREF_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_NAVIGATION_HREF_TAGS,
         )
@@ -3529,7 +3864,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_HREF_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_LINK_TAGS,
             excluded_attribute_tokens={
@@ -3540,7 +3875,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_HREF_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_LINK_TAGS,
             required_attribute_tokens={
@@ -3551,7 +3886,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_ACTION_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_FORM_TAGS,
         )
@@ -3559,7 +3894,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_FORMACTION_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_BUTTON_TAGS,
             excluded_attribute_values={
@@ -3570,7 +3905,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_FORMACTION_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_INPUT_TAGS,
             required_attribute_values={
@@ -3581,7 +3916,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_SRC_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_SRC_TAGS,
             excluded_attribute_names_by_tag={
@@ -3593,7 +3928,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_SRC_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_INPUT_TAGS,
             required_attribute_values={"type": MARKDOWN_HTML_IMAGE_INPUT_TYPES},
@@ -3602,7 +3937,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_DATA_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_DATA_TAGS,
         )
@@ -3610,7 +3945,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_POSTER_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_POSTER_TAGS,
         )
@@ -3618,7 +3953,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (candidate, False, True)
         for value in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_SRCSET_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_SRCSET_TAGS,
         )
@@ -3627,7 +3962,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (candidate, False, True)
         for value in html_attribute_values(
-            text,
+            attribute_text,
             MARKDOWN_HTML_IMAGESRCSET_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_LINK_TAGS,
             required_attribute_values={
@@ -3643,7 +3978,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             for target, requires_file in css_resource_references(style_content)
         )
     for style_attribute in html_attribute_values(
-        text,
+        attribute_text,
         MARKDOWN_HTML_STYLE_ATTRIBUTES,
     ):
         targets.extend(
@@ -3653,7 +3988,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             )
         )
     for content in html_attribute_values(
-        text,
+        attribute_text,
         MARKDOWN_HTML_CONTENT_ATTRIBUTES,
         tag_names=MARKDOWN_HTML_META_TAGS,
         required_attribute_values={"http-equiv": frozenset({"refresh"})},
@@ -3667,7 +4002,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets = resolve_html_targets(targets, effective_base)
 
     for srcdoc in html_attribute_values(
-        text,
+        attribute_text,
         MARKDOWN_HTML_SRCDOC_ATTRIBUTES,
         tag_names=MARKDOWN_HTML_SRCDOC_TAGS,
     ):

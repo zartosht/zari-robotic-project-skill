@@ -2041,6 +2041,24 @@ class LinkTests(unittest.TestCase):
                 any("ignored-srcdoc-svg.png" in error for error in errors)
             )
 
+    def test_reprocesses_html_breakout_tags_inside_foreign_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><div><picture><source srcset="missing-breakout.png 1x">'
+                '</picture></div></svg>\n'
+                '<iframe srcdoc="<svg><div><picture><source '
+                'srcset=\047missing-srcdoc-breakout.png 1x\047></picture>'
+                '</div></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-breakout.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-breakout.png" in error for error in errors)
+            )
+
     def test_validates_src_only_for_resource_loading_elements(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2105,6 +2123,23 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
+
+    def test_ignores_apparent_resource_tags_inside_inline_raw_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                'prefix <textarea><img src="ignored-textarea.png"></textarea>\n'
+                'prefix <script><img src="ignored-script.png"></script>\n'
+                'prefix <style>.hero { background: url(missing-style.png); } '
+                '<img src="ignored-style.png"></style>\n'
+                'prefix <textarea>done</textarea><img src="missing-live.png">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-style.png" in error for error in errors))
+            self.assertTrue(any("missing-live.png" in error for error in errors))
+            self.assertFalse(any("ignored-" in error for error in errors))
 
     def test_ignores_resource_tags_inside_raw_html_comments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2362,6 +2397,24 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
+
+    def test_ignores_resources_in_unused_css_custom_properties(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div style="--unused-inline:url(ignored-inline.png); '
+                '--used-inline:url(missing-inline.png); '
+                'background:var(--used-inline)"></div>\n\n'
+                '<style>:root { --unused: url(ignored-block.png); '
+                '--used: url(missing-block.png); --chain: var(--used); '
+                'background-image: var(--chain); }</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-block.png" in error for error in errors))
+            self.assertTrue(any("missing-inline.png" in error for error in errors))
+            self.assertFalse(any("ignored-" in error for error in errors))
 
     def test_decodes_escaped_css_resource_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
