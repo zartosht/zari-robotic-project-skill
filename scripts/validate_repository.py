@@ -13,7 +13,7 @@ from html import unescape as html_unescape
 from html.entities import html5 as HTML5_ENTITIES
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 
 REQUIRED_ROOT_FILES = (
@@ -187,6 +187,7 @@ MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
 MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img", "source"})
 MARKDOWN_HTML_SRCDOC_ATTRIBUTES = frozenset({"srcdoc"})
 MARKDOWN_HTML_SRCDOC_TAGS = frozenset({"iframe"})
+MARKDOWN_HTML_STYLE_ATTRIBUTES = frozenset({"style"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -209,6 +210,7 @@ HTML_CHARACTER_REFERENCE_MAX_LENGTH = max(len(name) for name in HTML5_ENTITIES)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 CSS_IMPORT_RULE = re.compile(r"@import(?![-_A-Za-z0-9])", re.IGNORECASE)
 CSS_URL_FUNCTION = re.compile(r"url\(", re.IGNORECASE)
+PERCENT_ENCODED_PATH_SEPARATOR = re.compile(r"(%(?:2[fF]|5[cC]))")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 MARKDOWN_SUFFIXES = frozenset(
     {
@@ -866,7 +868,7 @@ def mask_markdown_raw_html_blocks(
 
 
 def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
-    """Return the end offset of recognized scalar frontmatter, if present."""
+    """Return the end offset of recognized mapping frontmatter, if present."""
 
     if not lines_with_endings or lines_with_endings[0].strip() != "---":
         return 0
@@ -880,12 +882,15 @@ def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
             return offset if keys else 0
         if not stripped or stripped.startswith("#"):
             continue
-        if ":" not in line or line.startswith((" ", "\t", "-")):
+        if line.startswith((" ", "\t")):
+            if not keys:
+                return 0
+            continue
+        if ":" not in line or line.startswith("-"):
             return 0
-        key, value = line.split(":", 1)
+        key, _ = line.split(":", 1)
         key = key.strip()
-        value = value.strip()
-        if not key or not value or key in keys:
+        if not key or key in keys:
             return 0
         keys.add(key)
     return 0
@@ -1598,6 +1603,7 @@ def html_attribute_values(
     *,
     tag_names: frozenset[str] | None = None,
     required_attribute_values: dict[str, frozenset[str]] | None = None,
+    excluded_attribute_names_by_tag: dict[str, frozenset[str]] | None = None,
 ) -> list[str]:
     """Collect top-level HTML attribute values without scanning quoted values."""
 
@@ -1665,11 +1671,17 @@ def html_attribute_values(
             attributes.setdefault(name, value)
             if is_first_attribute and name in names:
                 tag_values.append(value)
-        if required_attribute_values is None or all(
+        required_values_match = required_attribute_values is None or all(
             html_attribute_unescape(attributes.get(name, "")).casefold()
             in allowed_values
             for name, allowed_values in required_attribute_values.items()
-        ):
+        )
+        excluded_names = (
+            excluded_attribute_names_by_tag.get(tag_name, frozenset())
+            if excluded_attribute_names_by_tag is not None
+            else frozenset()
+        )
+        if required_values_match and not excluded_names.intersection(attributes):
             values.extend(tag_values)
     return values
 
@@ -1857,7 +1869,9 @@ class HTMLFragmentResourceParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.targets: list[tuple[str, bool, bool]] = []
         self.srcdocs: list[str] = []
+        self.base_href: str | None = None
         self.style_content: list[str] | None = None
+        self.template_depth = 0
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
@@ -1867,9 +1881,25 @@ class HTMLFragmentResourceParser(HTMLParser):
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
 
+        if tag == "template":
+            self.template_depth += 1
+            return
+        if self.template_depth:
+            return
+        if tag == "base" and self.base_href is None and "href" in values:
+            try:
+                urlsplit(values["href"])
+            except ValueError:
+                pass
+            else:
+                self.base_href = values["href"]
         if tag in MARKDOWN_HTML_HREF_TAGS and "href" in values:
             self.targets.append((values["href"], False, False))
-        if tag in MARKDOWN_HTML_SRC_TAGS and "src" in values:
+        if (
+            tag in MARKDOWN_HTML_SRC_TAGS
+            and "src" in values
+            and not (tag == "iframe" and "srcdoc" in values)
+        ):
             self.targets.append((values["src"], False, True))
         if (
             tag in MARKDOWN_HTML_INPUT_TAGS
@@ -1888,6 +1918,11 @@ class HTMLFragmentResourceParser(HTMLParser):
             )
         if tag in MARKDOWN_HTML_SRCDOC_TAGS and "srcdoc" in values:
             self.srcdocs.append(values["srcdoc"])
+        if "style" in values:
+            self.targets.extend(
+                (target, False, True)
+                for target in css_resource_targets(values["style"])
+            )
         if tag == "style":
             self.style_content = []
 
@@ -1901,7 +1936,13 @@ class HTMLFragmentResourceParser(HTMLParser):
             self.style_content.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.casefold() == "style" and self.style_content is not None:
+        tag = tag.casefold()
+        if tag == "template" and self.template_depth:
+            self.template_depth -= 1
+            return
+        if self.template_depth:
+            return
+        if tag == "style" and self.style_content is not None:
             self.targets.extend(
                 (target, False, True)
                 for target in css_resource_targets("".join(self.style_content))
@@ -1919,23 +1960,66 @@ class HTMLFragmentResourceParser(HTMLParser):
 
 
 def html_fragment_resource_targets(
-    text: str, *, srcdoc_depth: int
+    text: str, *, srcdoc_depth: int, inherited_base: str = ""
 ) -> list[tuple[str, bool, bool]]:
     """Collect targets from HTML parsed inside an iframe srcdoc document."""
 
     parser = HTMLFragmentResourceParser()
     parser.feed(text)
     parser.finish()
-    targets = parser.targets
+    effective_base = inherited_base
+    if parser.base_href is not None:
+        try:
+            effective_base = urljoin(inherited_base, parser.base_href)
+            urlsplit(effective_base)
+        except ValueError:
+            effective_base = inherited_base
+
+    targets: list[tuple[str, bool, bool]] = []
+    for target, is_markdown, requires_file in parser.targets:
+        try:
+            resolved_target = urljoin(effective_base, target)
+        except ValueError:
+            resolved_target = target
+        targets.append((resolved_target, is_markdown, requires_file))
     if srcdoc_depth >= 8:
         return targets
     for srcdoc in parser.srcdocs:
         targets.extend(
             html_fragment_resource_targets(
-                srcdoc, srcdoc_depth=srcdoc_depth + 1
+                srcdoc,
+                srcdoc_depth=srcdoc_depth + 1,
+                inherited_base=effective_base,
             )
         )
     return targets
+
+
+def mask_html_template_contents(text: str) -> str:
+    """Mask inert template bodies while preserving their surrounding tags."""
+
+    characters = list(text)
+    content_starts: list[int] = []
+    for tag in MARKDOWN_HTML_TAG_OR_CLOSING.finditer(text):
+        value = tag.group(0)
+        name_match = re.match(r"</?([A-Za-z][A-Za-z0-9-]*)", value)
+        if name_match is None or name_match.group(1).casefold() != "template":
+            continue
+        if value.startswith("</"):
+            if not content_starts:
+                continue
+            content_start = content_starts.pop()
+            if not content_starts:
+                for position in range(content_start, tag.start()):
+                    if characters[position] not in "\r\n":
+                        characters[position] = " "
+        else:
+            content_starts.append(tag.end())
+    if content_starts:
+        for position in range(content_starts[0], len(characters)):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+    return "".join(characters)
 
 
 def html_style_contents(text: str) -> list[str]:
@@ -1959,6 +2043,7 @@ def html_style_contents(text: str) -> list[str]:
 def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     """Collect navigations and resource requests from rendered HTML."""
 
+    text = mask_html_template_contents(text)
     targets: list[tuple[str, bool, bool]] = []
     targets.extend(
         (html_attribute_unescape(target), False, False)
@@ -1974,6 +2059,9 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             text,
             MARKDOWN_HTML_SRC_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_SRC_TAGS,
+            excluded_attribute_names_by_tag={
+                "iframe": MARKDOWN_HTML_SRCDOC_ATTRIBUTES
+            },
         )
     )
     targets.extend(
@@ -2014,6 +2102,16 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
         targets.extend(
             (target, False, True)
             for target in css_resource_targets(style_content)
+        )
+    for style_attribute in html_attribute_values(
+        text,
+        MARKDOWN_HTML_STYLE_ATTRIBUTES,
+    ):
+        targets.extend(
+            (target, False, True)
+            for target in css_resource_targets(
+                html_attribute_unescape(style_attribute)
+            )
         )
 
     for srcdoc in html_attribute_values(
@@ -2095,12 +2193,22 @@ def markdown_label_pairs(text: str) -> dict[int, int]:
     return pairs
 
 
-def markdown_label_end(text: str, start: int) -> int | None:
+def markdown_label_end(
+    text: str,
+    start: int,
+    context: tuple[
+        list[str],
+        list[int],
+        list[tuple[tuple[str, ...], str]],
+        list[int],
+    ]
+    | None = None,
+) -> int | None:
     """Find a label's closing bracket while respecting nested image/link labels."""
 
     depth = 1
     index = start + 1
-    inline_block_end = markdown_inline_block_end(text, start)
+    inline_block_end = markdown_inline_block_end(text, start, context)
     while index < inline_block_end:
         character = text[index]
         if character == "\\":
@@ -2475,6 +2583,7 @@ def markdown_strip_inline_link_destinations(text: str) -> str:
 
     result: list[str] = []
     index = 0
+    inline_context = markdown_inline_block_context(text)
     while index < len(text):
         is_image = (
             text.startswith("![", index)
@@ -2489,7 +2598,7 @@ def markdown_strip_inline_link_destinations(text: str) -> str:
             index += 1
             continue
 
-        label_end = markdown_label_end(text, label_start)
+        label_end = markdown_label_end(text, label_start, inline_context)
         if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":
             result.append(text[index])
             index += 1
@@ -2536,6 +2645,7 @@ def markdown_strip_active_reference_links(
 
     result: list[str] = []
     index = 0
+    inline_context = markdown_inline_block_context(text)
     while index < len(text):
         is_image = (
             text.startswith("![", index)
@@ -2551,7 +2661,7 @@ def markdown_strip_active_reference_links(
             index += 1
             continue
 
-        label_end = markdown_label_end(text, label_start)
+        label_end = markdown_label_end(text, label_start, inline_context)
         reference_start = None if label_end is None else label_end + 1
         if (
             reference_start is None
@@ -2561,7 +2671,7 @@ def markdown_strip_active_reference_links(
             result.append(text[index])
             index += 1
             continue
-        reference_end = markdown_label_end(text, reference_start)
+        reference_end = markdown_label_end(text, reference_start, inline_context)
         if reference_end is None:
             result.append(text[index])
             index += 1
@@ -2845,6 +2955,17 @@ def markdown_heading_fragments(text: str) -> set[str]:
     return fragments
 
 
+def unquote_url_path(path: str) -> str:
+    """Decode URL paths without turning encoded separators into directories."""
+
+    return "".join(
+        piece
+        if PERCENT_ENCODED_PATH_SEPARATOR.fullmatch(piece)
+        else unquote(piece)
+        for piece in PERCENT_ENCODED_PATH_SEPARATOR.split(path)
+    )
+
+
 def find_broken_links(root: Path) -> list[str]:
     errors: list[str] = []
     repository_root = root.resolve()
@@ -2893,8 +3014,14 @@ def find_broken_links(root: Path) -> list[str]:
             if not target or target.startswith("/") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)
-            path_target = unquote(parsed_target.path)
+            path_target = unquote_url_path(parsed_target.path)
             fragment = unquote(parsed_target.fragment)
+            if requires_file and not path_target:
+                errors.append(
+                    f"{path.relative_to(root)}: resource target has no file path "
+                    f"{raw_target!r}"
+                )
+                continue
             if "\x00" in path_target:
                 errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
                 continue

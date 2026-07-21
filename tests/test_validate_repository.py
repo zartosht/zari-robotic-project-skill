@@ -384,6 +384,16 @@ class LinkTests(unittest.TestCase):
         self.assertIn("foo-6001", fragments)
         self.assertLess(elapsed, 2.0)
 
+    def test_reuses_inline_context_for_many_footnote_definitions(self) -> None:
+        text = "".join(f"[^note-{index}]: value\n" for index in range(400))
+        with mock.patch.object(
+            validator,
+            "markdown_inline_block_context",
+            wraps=validator.markdown_inline_block_context,
+        ) as inline_context:
+            validator.markdown_heading_fragments(text)
+        self.assertLess(inline_context.call_count, 20)
+
     def test_reports_stale_same_file_and_cross_file_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -411,6 +421,19 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(2, len(errors))
             self.assertTrue(all("broken Markdown fragment" in error for error in errors))
+
+    def test_masks_nested_yaml_frontmatter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "---\n"
+                "aliases:\n"
+                '  - "[guide](missing.md)"\n'
+                "---\n\n"
+                "# Real heading\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_keeps_heading_between_thematic_breaks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1320,6 +1343,18 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("broken relative link", errors[0])
 
+    def test_preserves_percent_encoded_path_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs").mkdir()
+            (root / "docs" / "guide.md").write_text("guide\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide](docs%2Fguide.md)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("docs%2Fguide.md", errors[0])
+
     def test_ignores_indented_markdown_code_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1744,6 +1779,18 @@ class LinkTests(unittest.TestCase):
                     )
                     self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_resources_inside_template_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<template>\n<img src="inert.png">\n</template>\n'
+                '<img src="live.png">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("live.png", errors[0])
+
     def test_ignores_markup_inside_html_raw_text_element_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1862,6 +1909,55 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
+
+    def test_iframe_srcdoc_suppresses_src_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<iframe src="missing.html" srcdoc="<p>ok</p>"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_resolves_iframe_srcdoc_resources_against_first_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "picture.png").write_bytes(b"image")
+            (root / "other").mkdir()
+            (root / "other" / "picture.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<iframe srcdoc="<base href=\047docs/\047>'
+                '<base href=\047other/\047>'
+                '<img src=\047picture.png\047>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("docs/picture.png", errors[0])
+
+    def test_validates_inline_style_attribute_resource_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div style="background-image:url(missing.png)"></div>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
+
+    def test_rejects_fragment_only_file_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Heading\n\n![bad](#heading)\n<img src=\"#heading\">\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                all("resource target has no file path" in error for error in errors)
+            )
 
     def test_validates_style_block_resource_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
