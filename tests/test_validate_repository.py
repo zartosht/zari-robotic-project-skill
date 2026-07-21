@@ -277,6 +277,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#docs-guidemd", errors[0])
 
+    def test_excludes_footnote_definition_from_setext_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[^1]: note\n"
+                "---\n"
+                "[stale](#1-note)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#1-note", errors[0])
+
     def test_strips_reference_style_markup_from_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -598,6 +611,18 @@ class LinkTests(unittest.TestCase):
                     self.assertEqual(1, len(errors))
                     self.assertIn("missing.md", errors[0])
 
+    def test_scans_link_label_across_empty_ordered_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for marker in ("1.", "1)", "1.   ", "1)   "):
+                with self.subTest(marker=repr(marker)):
+                    (root / "README.md").write_text(
+                        f"[guide\n{marker}\n](missing.md)\n", encoding="utf-8"
+                    )
+                    errors = validator.find_broken_links(root)
+                    self.assertEqual(1, len(errors))
+                    self.assertIn("missing.md", errors[0])
+
     def test_scans_link_label_across_lazy_blockquote_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -701,6 +726,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#user-content-fnref-1", errors[0])
 
+    def test_stops_code_spans_at_markdown_block_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "before `\n"
+                "- [guide](missing.md)\n"
+                "` after\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_ignores_footnote_reference_text_inside_link_title(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -775,6 +813,24 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 "[guide][a\\]]\n\n[a\\]]: missing.md\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
+    def test_rejects_unescaped_opening_bracket_in_reference_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[a[b]: README.md\n"
+                "---\n"
+                "[heading](#ab-readmemd)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+            (root / "README.md").write_text(
+                "[guide][a\\[]\n\n[a\\[]: missing.md\n", encoding="utf-8"
             )
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
@@ -1063,6 +1119,18 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("resource target is not a file", errors[0])
+
+    def test_rejects_directory_form_url_that_resolves_to_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[bad](README.md/)\n"
+                "![bad](README.md/)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(all("README.md/" in error for error in errors))
 
     def test_accepts_empty_angle_reference_image_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

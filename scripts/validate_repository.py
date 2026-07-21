@@ -82,7 +82,7 @@ SECRET_PATTERNS = {
 }
 
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n]|\n(?![ \t]*\n))+)\]:[ \t]*"
+    r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\[\]\\\n]|\n(?![ \t]*\n))+)\]:[ \t]*"
     r"(?:\n[ \t]{0,3})?"
     r"(?P<target><(?:\\.|[^<>\\\n])*>|(?:\\.|[^\s\\<>])+)"
     r"(?:(?:[ \t]+|\n[ \t]{0,3})(?:"
@@ -842,6 +842,7 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
 
     literal_characters = characters.copy()
     masked = "".join(literal_characters)
+    inline_context = markdown_inline_block_context(masked)
     index = 0
     while index < len(masked):
         if masked[index] != "`":
@@ -855,10 +856,10 @@ def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str
             run_end += 1
         delimiter = masked[index:run_end]
         search_from = run_end
-        paragraph_end = markdown_paragraph_end(masked, index)
+        inline_block_end = markdown_inline_block_end(masked, index, inline_context)
         closing = -1
         while True:
-            candidate = masked.find(delimiter, search_from, paragraph_end)
+            candidate = masked.find(delimiter, search_from, inline_block_end)
             if candidate == -1:
                 break
             before_is_tick = candidate > 0 and masked[candidate - 1] == "`"
@@ -1703,15 +1704,18 @@ def markdown_inline_block_end(
             and int(direct_list_item.group("marker")[:-1]) != 1
             and parent_containers == start_containers
         )
-        empty_unordered_item = (
+        empty_noninterrupting_list_item = (
             direct_list_item is not None
-            and direct_list_item.group("marker") in {"*", "+"}
+            and (
+                direct_list_item.group("marker") in {"*", "+"}
+                or direct_list_item.group("marker")[0].isdigit()
+            )
             and not parent_content[
                 markdown_list_prefix_end(direct_list_item) :
             ].strip()
             and parent_containers == start_containers
         )
-        if non_one_ordered_item or empty_unordered_item:
+        if non_one_ordered_item or empty_noninterrupting_list_item:
             containers = parent_containers
             content = parent_content
         interrupts_paragraph = markdown_line_interrupts_paragraph(content)
@@ -2329,8 +2333,12 @@ def markdown_heading_fragments(text: str) -> set[str]:
     )
     footnote_text = markdown_strip_inline_link_destinations(footnote_text)
     reference_definition_lines: set[int] = set()
+    footnote_definition_lines: set[int] = set()
     footnote_labels: set[str] = set()
     for footnote in MARKDOWN_FOOTNOTE_DEFINITION.finditer(footnote_text):
+        footnote_definition_lines.add(
+            footnote_text.count("\n", 0, footnote.start())
+        )
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
         normalized_label = markdown_unescape(label).casefold()
         footnote_labels.add(normalized_label)
@@ -2388,7 +2396,10 @@ def markdown_heading_fragments(text: str) -> set[str]:
         )
         if lazy_continuation:
             containers = setext_candidate[0]
-        if line_index in reference_definition_lines:
+        if (
+            line_index in reference_definition_lines
+            or line_index in footnote_definition_lines
+        ):
             setext_candidate = None
             continue
         atx_heading = MARKDOWN_ATX_HEADING.match(structure_content)
@@ -2479,6 +2490,9 @@ def find_broken_links(root: Path) -> list[str]:
                 )
                 continue
             if not resolved.exists():
+                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                continue
+            if path_target.endswith("/") and resolved.is_file():
                 errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
                 continue
             if requires_file and not resolved.is_file():
