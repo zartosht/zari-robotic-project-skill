@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zari Robot Project Builder"
+  short_description: "Plan and safely start robotics projects"
+  default_prompt: "Use $build-robot-project to interview me, scaffold my robot project, and begin its safest first phase."
