@@ -120,6 +120,151 @@ class LinkTests(unittest.TestCase):
                 any("ignored-image-payload.png" in error for error in errors)
             )
 
+    def test_recursively_scans_linked_svg_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[diagram](diagram.svg)\n", encoding="utf-8"
+            )
+            (root / "diagram.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<a href="nested.svg"><text>nested</text></a></svg>\n',
+                encoding="utf-8",
+            )
+            (root / "nested.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<a href="diagram.svg"><text>back</text></a>'
+                '<image href="missing.png"/></svg>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("nested.svg", errors[0])
+            self.assertIn("missing.png", errors[0])
+
+    def test_restricts_link_resources_to_the_html_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><link rel="stylesheet" href="ignored.css"></link></svg>\n'
+                '<iframe srcdoc="<svg><link rel=\047stylesheet\047 '
+                'href=\047ignored-srcdoc.css\047></link></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_validates_svg_presentation_attribute_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><rect fill="url(missing-fill.svg#paint)" '
+                'filter="url(missing-filter.svg#fx)"></rect></svg>\n'
+                '<iframe srcdoc="<svg><path '
+                'stroke=\047url(missing-stroke.svg#paint)\047>'
+                '</path></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            for target in {
+                "missing-fill.svg#paint",
+                "missing-filter.svg#fx",
+                "missing-stroke.svg#paint",
+            }:
+                self.assertTrue(any(target in error for error in errors))
+
+    def test_accepts_the_special_top_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text("<p>page</p>\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[same](#ToP) [page](page.html#TOP)\n"
+                '<iframe srcdoc="<a href=\047#tOp\047>up</a>"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_traverses_static_imports_from_module_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<script type="module" src="main.js"></script>\n'
+                "[page](page.html)\n"
+                '<iframe srcdoc="<script type=\047module\047 '
+                'src=\047srcdoc.js\047></script>"></iframe>\n',
+                encoding="utf-8",
+            )
+            (root / "page.html").write_text(
+                '<script type="module" src="page.js"></script>\n',
+                encoding="utf-8",
+            )
+            (root / "main.js").write_text(
+                'import "./nested.js";\n', encoding="utf-8"
+            )
+            (root / "nested.js").write_text(
+                'import "./main.js";\n'
+                "export const present = 1\n"
+                'export { missing } from "./missing.js";\n',
+                encoding="utf-8",
+            )
+            (root / "page.js").write_text(
+                'import "./missing-page.js";\n', encoding="utf-8"
+            )
+            (root / "srcdoc.js").write_text(
+                'export * from "./missing-srcdoc.js";\n', encoding="utf-8"
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            for target in {
+                "missing.js",
+                "missing-page.js",
+                "missing-srcdoc.js",
+            }:
+                self.assertTrue(any(target in error for error in errors))
+
+    def test_parses_xhtml_targets_with_xml_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.xhtml)\n", encoding="utf-8"
+            )
+            (root / "page.xhtml").write_text(
+                '<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                '<SCRIPT SRC="ignored-uppercase.js"/>'
+                '<script src="missing-lowercase.js"/>'
+                '</head><body/></html>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing-lowercase.js", errors[0])
+            self.assertFalse(any("ignored-uppercase.js" in error for error in errors))
+
+    def test_ignores_non_static_module_specifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<script type="module" src="main.js"></script>\n',
+                encoding="utf-8",
+            )
+            (root / "main.js").write_text(
+                'const text = \'import "./ignored-string.js"\';\n'
+                '// import "./ignored-comment.js";\n'
+                'const pattern = /import "\\.\\/ignored-regex\\.js"/;\n'
+                'import("./ignored-dynamic.js");\n'
+                'import.meta.resolve("./ignored-meta.js");\n'
+                'import "bare-package";\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_existing_relative_link_and_external_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
