@@ -192,7 +192,7 @@ MARKDOWN_HTML_LINK_RESOURCE_RELATIONS = frozenset(
     }
 )
 MARKDOWN_SVG_RESOURCE_HREF_ATTRIBUTES = frozenset({"href", "xlink:href"})
-MARKDOWN_SVG_RESOURCE_HREF_TAGS = frozenset({"image", "use"})
+MARKDOWN_SVG_RESOURCE_HREF_TAGS = frozenset({"feimage", "image", "use"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_HTML_SRC_TAGS = frozenset(
     {
@@ -2286,8 +2286,19 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
             and import_identifier[0].casefold() == "import"
         ):
             value_start = import_identifier[1]
-            while value_start < len(text) and text[value_start] in HTML_ASCII_WHITESPACE:
-                value_start += 1
+            while value_start < len(text):
+                while (
+                    value_start < len(text)
+                    and text[value_start] in HTML_ASCII_WHITESPACE
+                ):
+                    value_start += 1
+                if not text.startswith("/*", value_start):
+                    break
+                comment_end = text.find("*/", value_start + 2)
+                if comment_end < 0:
+                    value_start = len(text)
+                    break
+                value_start = comment_end + 2
             if value_start < len(text) and text[value_start] in {'"', "'"}:
                 string = css_string_value(text, value_start)
                 if string is not None:
@@ -2340,17 +2351,29 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                         continue
             else:
                 value_end = value_start
+                has_internal_whitespace = False
                 while value_end < len(text) and text[value_end] != ")":
                     if text[value_end] in {'"', "'", "("}:
                         break
                     if text[value_end] == "\\" and value_end + 1 < len(text):
                         value_end += 2
                         continue
+                    if text[value_end] in HTML_ASCII_WHITESPACE:
+                        whitespace_end = value_end + 1
+                        while (
+                            whitespace_end < len(text)
+                            and text[whitespace_end] in HTML_ASCII_WHITESPACE
+                        ):
+                            whitespace_end += 1
+                        if whitespace_end >= len(text) or text[whitespace_end] != ")":
+                            has_internal_whitespace = True
+                        value_end = whitespace_end
+                        continue
                     value_end += 1
                 if value_end < len(text) and text[value_end] == ")":
                     value = text[value_start:value_end].rstrip(" \t\r\n\f")
                     decoded = css_unescape(value)
-                    if decoded:
+                    if decoded and not has_internal_whitespace:
                         targets.append(
                             (
                                 decoded,
@@ -2619,14 +2642,20 @@ def html_fragment_resource_targets(
         effective_base = parent_base
         if parser.base_href is not None:
             try:
-                effective_base = urljoin(parent_base, parser.base_href)
+                effective_base = urljoin(
+                    html_url_for_resolution(parent_base),
+                    html_url_for_resolution(parser.base_href),
+                )
                 urlsplit(effective_base)
             except ValueError:
                 effective_base = parent_base
 
         for target, is_markdown, requires_file in parser.targets:
             try:
-                resolved_target = urljoin(effective_base, target)
+                resolved_target = urljoin(
+                    html_url_for_resolution(effective_base),
+                    html_url_for_resolution(target),
+                )
             except ValueError:
                 resolved_target = target
             targets.append((resolved_target, is_markdown, requires_file))
@@ -2690,12 +2719,27 @@ def html_effective_base(text: str, inherited_base: str = "") -> str:
         tag_names=MARKDOWN_HTML_BASE_TAGS,
     ):
         try:
-            candidate = urljoin(inherited_base, html_attribute_unescape(value))
+            candidate = urljoin(
+                html_url_for_resolution(inherited_base),
+                html_url_for_resolution(html_attribute_unescape(value)),
+            )
             urlsplit(candidate)
         except ValueError:
             continue
         return candidate
     return inherited_base
+
+
+def html_url_for_resolution(target: str) -> str:
+    """Normalize browser path separators before resolving an HTML URL."""
+
+    suffix_positions = [
+        position
+        for separator in ("?", "#")
+        if (position := target.find(separator)) >= 0
+    ]
+    path_end = min(suffix_positions, default=len(target))
+    return target[:path_end].replace("\\", "/") + target[path_end:]
 
 
 def resolve_html_targets(
@@ -2706,7 +2750,10 @@ def resolve_html_targets(
     resolved: list[tuple[str, bool, bool]] = []
     for target, is_markdown, requires_file in targets:
         try:
-            target = urljoin(base_url, target)
+            target = urljoin(
+                html_url_for_resolution(base_url),
+                html_url_for_resolution(target),
+            )
         except ValueError:
             pass
         resolved.append((target, is_markdown, requires_file))
@@ -3758,15 +3805,7 @@ def find_broken_links(root: Path) -> list[str]:
             target = markdown_unescape(target) if is_markdown else target
             if not is_markdown:
                 target = target.translate(URL_INTERNAL_ASCII_WHITESPACE_TRANSLATION)
-                suffix_positions = [
-                    position
-                    for separator in ("?", "#")
-                    if (position := target.find(separator)) >= 0
-                ]
-                path_end = min(suffix_positions, default=len(target))
-                target = (
-                    target[:path_end].replace("\\", "/") + target[path_end:]
-                )
+                target = html_url_for_resolution(target)
             if not target:
                 if requires_file:
                     errors.append(

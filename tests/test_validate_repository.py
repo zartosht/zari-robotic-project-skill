@@ -1841,13 +1841,17 @@ class LinkTests(unittest.TestCase):
             (root / "README.md").write_text(
                 '<svg><symbol id="present"></symbol>'
                 '<image href="missing.png"></image>'
+                '<feImage href="missing-filter.png"></feImage>'
                 '<use href="missing.svg#icon"></use>'
                 '<use href="#present"></use></svg>\n',
                 encoding="utf-8",
             )
             errors = validator.find_broken_links(root)
-            self.assertEqual(2, len(errors))
+            self.assertEqual(3, len(errors))
             self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-filter.png" in error for error in errors)
+            )
             self.assertTrue(any("missing.svg#icon" in error for error in errors))
 
     def test_validates_src_only_for_resource_loading_elements(self) -> None:
@@ -2181,15 +2185,31 @@ class LinkTests(unittest.TestCase):
                 '.example::before { content: "url(string.png)"; }\n'
                 "@import url('missing.css');\n"
                 '@import "missing-theme.css";\n'
+                '@import/* note */"missing-commented.css";\n'
                 ".example { background-image: url(missing.png); }\n"
                 "</style>\n",
                 encoding="utf-8",
             )
             errors = validator.find_broken_links(root)
-            self.assertEqual(3, len(errors))
+            self.assertEqual(4, len(errors))
             self.assertTrue(any("missing.css" in error for error in errors))
             self.assertTrue(any("missing-theme.css" in error for error in errors))
+            self.assertTrue(
+                any("missing-commented.css" in error for error in errors)
+            )
             self.assertTrue(any("missing.png" in error for error in errors))
+
+    def test_ignores_malformed_unquoted_css_urls_with_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>.bad { background: url(foo bar.png); } '
+                '.good { background: url(missing.png); }</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
 
     def test_decodes_css_escapes_in_resource_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2225,6 +2245,17 @@ class LinkTests(unittest.TestCase):
 
             (root / "docs").mkdir()
             (root / "docs" / "picture.png").write_bytes(b"docs image")
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_normalizes_backslashes_before_resolving_html_base_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs").mkdir()
+            (root / "docs" / "picture.png").write_bytes(b"docs image")
+            (root / "README.md").write_text(
+                '<base href="docs\\\\"><img src="picture.png">\n',
+                encoding="utf-8",
+            )
             self.assertEqual([], validator.find_broken_links(root))
 
     def test_validates_base_resolved_meta_refresh_targets(self) -> None:
