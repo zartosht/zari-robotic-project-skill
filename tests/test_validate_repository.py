@@ -654,6 +654,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#user-content-fnref-1", errors[0])
 
+    def test_ignores_footnote_reference_text_inside_link_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '[outer](README.md "[^1]")\n\n'
+                "[^1]: Footnote text\n\n"
+                "[stale](#user-content-fnref-1)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#user-content-fnref-1", errors[0])
+
     def test_ignores_footnote_definition_inside_code_fence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -776,6 +789,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_reference_with_unclosed_angle_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[r]: <missing.md\n[x][r]\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_ignores_reference_with_non_punctuation_escape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -836,6 +857,15 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 '[guide][foo]\n\n[foo]: README.md "[example](missing.md)"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_html_resource_in_reference_definition_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '[guide][foo]\n\n[foo]: README.md "<img src=missing.png>"\n',
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
@@ -1322,6 +1352,19 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_strips_opening_and_closing_html_tags_from_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# <span>Foo</span>\n"
+                "[rendered](#foo)\n"
+                "[stale](#foospan)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#foospan", errors[0])
+
     def test_normalizes_code_span_whitespace_in_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1383,6 +1426,23 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("missing-large.png" in error for error in errors))
             self.assertTrue(any("missing-wide.png" in error for error in errors))
 
+    def test_decodes_srcset_entities_before_parsing_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<img srcset="missing.png&#x20;nope">\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_decodes_html_resource_attributes_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a&amp;.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<img srcset="a&amp;amp;.png 1x">\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_discards_srcset_candidates_with_invalid_descriptors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1418,6 +1478,32 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.pdf", errors[0])
+
+    def test_validates_src_only_for_resource_loading_elements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "image.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<div src="ignored-div.png"></div>\n'
+                '<input type="text" src="ignored-text.png">\n'
+                '<input src="ignored-default.png">\n'
+                '<input src="image.png" type="image">\n'
+                '<input src="missing-image.png" type="image">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing-image.png", errors[0])
+
+    def test_preserves_resource_tags_inside_pre_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<pre>\n<img src="missing.png">\n</pre>\n', encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
 
     def test_ignores_html_resources_inside_image_description(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
