@@ -53,6 +53,39 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
 
+    def test_scans_resources_in_linked_html_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[demo](page.html)\n", encoding="utf-8"
+            )
+            (root / "page.html").write_text(
+                '<img src="missing.png">\n', encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("page.html", errors[0])
+            self.assertIn("missing.png", errors[0])
+
+    def test_recursively_scans_linked_html_with_cycle_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[demo](page.html)\n", encoding="utf-8"
+            )
+            (root / "page.html").write_text(
+                '<a href="nested.html">nested</a>\n', encoding="utf-8"
+            )
+            (root / "nested.html").write_text(
+                '<a href="page.html">back</a>'
+                '<script src="missing.js"></script>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("nested.html", errors[0])
+            self.assertIn("missing.js", errors[0])
+
     def test_accepts_existing_relative_link_and_external_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2379,6 +2412,42 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
+
+    def test_validates_legacy_html_background_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<table background="missing-outer.png"></table>\n'
+                '<svg><tbody background="ignored-outer.png"></tbody></svg>\n'
+                '<iframe srcdoc="<table '
+                'background=\047missing-srcdoc.png\047></table>'
+                '<svg><tbody background=\047ignored-srcdoc.png\047>'
+                '</tbody></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-outer.png" in error for error in errors))
+            self.assertTrue(any("missing-srcdoc.png" in error for error in errors))
+            self.assertFalse(any("ignored-outer.png" in error for error in errors))
+            self.assertFalse(any("ignored-srcdoc.png" in error for error in errors))
+
+    def test_validates_area_links_only_inside_html_maps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<area href="ignored-outer.html">\n'
+                '<map><area href="missing-outer.html"></map>\n'
+                '<iframe srcdoc="<area href=\047ignored-srcdoc.html\047>'
+                '<map><area href=\047missing-srcdoc.html\047></map>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-outer.html" in error for error in errors))
+            self.assertTrue(any("missing-srcdoc.html" in error for error in errors))
+            self.assertFalse(any("ignored-outer.html" in error for error in errors))
+            self.assertFalse(any("ignored-srcdoc.html" in error for error in errors))
 
     def test_ignores_poster_on_foreign_video_elements(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

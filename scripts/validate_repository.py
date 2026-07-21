@@ -213,6 +213,10 @@ MARKDOWN_HTML_INPUT_TAGS = frozenset({"input"})
 MARKDOWN_HTML_IMAGE_INPUT_TYPES = frozenset({"image"})
 MARKDOWN_HTML_DATA_TAGS = frozenset({"object"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
+MARKDOWN_HTML_BACKGROUND_TAGS = frozenset(
+    {"body", "table", "tbody", "td", "tfoot", "th", "thead", "tr"}
+)
+MARKDOWN_HTML_MAP_TAGS = frozenset({"map"})
 MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
 MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img"})
 MARKDOWN_HTML_IMAGESRCSET_ATTRIBUTES = frozenset({"imagesrcset"})
@@ -3261,6 +3265,13 @@ class HTMLContextResourceParser(HTMLParser):
         if tag == "base" and "href" in values and namespace == HTML_NAMESPACE:
             self.base_hrefs.append(values["href"])
         if (
+            canonical_tag == "area"
+            and namespace == HTML_NAMESPACE
+            and "href" in values
+            and html_has_ancestor(self.element_stack, MARKDOWN_HTML_MAP_TAGS)
+        ):
+            self.targets.append((values["href"], False, False))
+        if (
             canonical_tag in MARKDOWN_HTML_SRC_TAGS
             and namespace == HTML_NAMESPACE
             and "src" in values
@@ -3313,6 +3324,12 @@ class HTMLContextResourceParser(HTMLParser):
             and "poster" in values
         ):
             self.targets.append((values["poster"], False, True))
+        if (
+            canonical_tag in MARKDOWN_HTML_BACKGROUND_TAGS
+            and namespace == HTML_NAMESPACE
+            and values.get("background", "")
+        ):
+            self.targets.append((values["background"], False, True))
         if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
             target = values.get("href", values.get("xlink:href"))
             if target is not None:
@@ -3457,7 +3474,18 @@ class HTMLFragmentResourceParser(HTMLParser):
                 pass
             else:
                 self.base_href = values["href"]
-        if tag in MARKDOWN_HTML_NAVIGATION_HREF_TAGS and "href" in values:
+        if (
+            canonical_tag == "a"
+            and namespace == HTML_NAMESPACE
+            and "href" in values
+        ):
+            self.targets.append((values["href"], False, False))
+        if (
+            canonical_tag == "area"
+            and namespace == HTML_NAMESPACE
+            and "href" in values
+            and html_has_ancestor(self.element_stack, MARKDOWN_HTML_MAP_TAGS)
+        ):
             self.targets.append((values["href"], False, False))
         if tag in MARKDOWN_HTML_LINK_TAGS:
             relations = frozenset(
@@ -3539,6 +3567,12 @@ class HTMLFragmentResourceParser(HTMLParser):
             and "poster" in values
         ):
             self.targets.append((values["poster"], False, True))
+        if (
+            canonical_tag in MARKDOWN_HTML_BACKGROUND_TAGS
+            and namespace == HTML_NAMESPACE
+            and values.get("background", "")
+        ):
+            self.targets.append((values["background"], False, True))
         if (
             canonical_tag in MARKDOWN_HTML_SRCSET_TAGS
             and namespace == HTML_NAMESPACE
@@ -4088,7 +4122,7 @@ def html_resource_targets(
         for target in html_attribute_values(
             attribute_text,
             MARKDOWN_HTML_HREF_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_NAVIGATION_HREF_TAGS,
+            tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
         )
     )
     targets.extend(
@@ -5065,6 +5099,7 @@ def find_broken_links(root: Path) -> list[str]:
         return decoded_text_cache[path]
 
     seen_stylesheets: set[Path] = set()
+    seen_html_documents: set[Path] = set()
     for path in markdown_files(root):
         text = read_text_resource(path)
         if text is None:
@@ -5206,6 +5241,37 @@ def find_broken_links(root: Path) -> list[str]:
                         )
                         for stylesheet_target, stylesheet_requires_file
                         in stylesheet_references
+                    )
+            if (
+                not requires_file
+                and resolved.is_file()
+                and resolved.suffix.lower() in HTML_SUFFIXES
+                and resolved not in seen_html_documents
+            ):
+                seen_html_documents.add(resolved)
+                html_text = read_text_resource(resolved)
+                if html_text is not None:
+                    for fragment_target in html_srcdoc_fragment_errors(html_text):
+                        errors.append(
+                            f"{display_path(resolved)}: broken srcdoc fragment "
+                            f"{fragment_target!r}"
+                        )
+                    html_stylesheet_targets: list[str] = []
+                    html_targets = html_resource_targets(
+                        html_text,
+                        stylesheet_targets=html_stylesheet_targets,
+                    )
+                    html_stylesheet_target_set = set(html_stylesheet_targets)
+                    pending_targets.extend(
+                        (
+                            resolved,
+                            html_target,
+                            html_is_markdown,
+                            html_requires_file,
+                            html_target in html_stylesheet_target_set,
+                        )
+                        for html_target, html_is_markdown, html_requires_file
+                        in html_targets
                     )
             if fragment and resolved.is_file():
                 suffix = resolved.suffix.lower()
