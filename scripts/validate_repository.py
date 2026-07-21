@@ -147,6 +147,9 @@ MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS = frozenset(
         "xmp",
     }
 )
+HTML_SCRIPTING_ENABLED_RAW_TEXT_TAGS = (
+    MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS | frozenset({"noscript"})
+)
 MARKDOWN_RAW_HTML_TYPE_1 = re.compile(
     r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>]|\Z)", re.IGNORECASE
 )
@@ -222,7 +225,6 @@ MARKDOWN_HTML_STYLE_ATTRIBUTES = frozenset({"style"})
 MARKDOWN_HTML_BASE_TAGS = frozenset({"base"})
 MARKDOWN_HTML_META_TAGS = frozenset({"meta"})
 MARKDOWN_HTML_CONTENT_ATTRIBUTES = frozenset({"content"})
-MARKDOWN_HTML_ACTION_ATTRIBUTES = frozenset({"action"})
 MARKDOWN_HTML_FORM_TAGS = frozenset({"form"})
 MARKDOWN_HTML_FORMACTION_ATTRIBUTES = frozenset({"formaction"})
 MARKDOWN_HTML_BUTTON_TAGS = frozenset({"button"})
@@ -2744,6 +2746,7 @@ def css_resource_references(
     text: str,
     *,
     used_custom_properties: set[str] | frozenset[str] = frozenset(),
+    imported_targets: list[str] | None = None,
 ) -> list[tuple[str, bool]]:
     """Extract CSS resource URLs and whether each requires a file path."""
 
@@ -2820,6 +2823,8 @@ def css_resource_references(
                 string = css_string_value(text, value_start)
                 if string is not None:
                     targets.append((string[0], True))
+                    if imported_targets is not None:
+                        imported_targets.append(string[0])
                     index = string[1]
                     continue
             import_url_identifier = (
@@ -2898,6 +2903,11 @@ def css_resource_references(
                             and index >= ignored_supports_condition_end
                             and not inside_unused_custom_property(index)
                         ):
+                            if (
+                                imported_targets is not None
+                                and index in forced_file_url_starts
+                            ):
+                                imported_targets.append(value)
                             targets.append(
                                 (
                                     value,
@@ -2941,6 +2951,11 @@ def css_resource_references(
                         and index >= ignored_supports_condition_end
                         and not inside_unused_custom_property(index)
                     ):
+                        if (
+                            imported_targets is not None
+                            and index in forced_file_url_starts
+                        ):
+                            imported_targets.append(decoded)
                         targets.append(
                             (
                                 decoded,
@@ -3142,12 +3157,13 @@ def html_has_direct_parent(
 class HTMLContextResourceParser(HTMLParser):
     """Collect resources whose HTML meaning depends on ancestor context."""
 
-    CDATA_CONTENT_ELEMENTS = tuple(MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS)
+    CDATA_CONTENT_ELEMENTS = tuple(HTML_SCRIPTING_ENABLED_RAW_TEXT_TAGS)
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.targets: list[tuple[str, bool, bool]] = []
         self.base_hrefs: list[str] = []
+        self.form_active = False
         self.template_depth = 0
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
@@ -3169,6 +3185,12 @@ class HTMLContextResourceParser(HTMLParser):
         if tag == "template" and namespace == HTML_NAMESPACE:
             self.template_depth = 1
             return
+        if canonical_tag in MARKDOWN_HTML_FORM_TAGS and namespace == HTML_NAMESPACE:
+            if self.form_active:
+                return
+            self.form_active = True
+            if "action" in values:
+                self.targets.append((values["action"], False, False))
         picture_parent = html_has_direct_parent(
             self.element_stack, frozenset({"picture"})
         )
@@ -3240,6 +3262,10 @@ class HTMLContextResourceParser(HTMLParser):
             return
         if self.template_depth:
             return
+        if tag == "form":
+            if not self.form_active:
+                return
+            self.form_active = False
         html_pop_element_context(self.element_stack, tag)
 
 
@@ -3264,7 +3290,7 @@ def html_context_base_hrefs(text: str) -> list[str]:
 class HTMLFragmentResourceParser(HTMLParser):
     """Collect browser-loaded targets from an iframe srcdoc HTML fragment."""
 
-    CDATA_CONTENT_ELEMENTS = tuple(MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS)
+    CDATA_CONTENT_ELEMENTS = tuple(HTML_SCRIPTING_ENABLED_RAW_TEXT_TAGS)
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -3273,6 +3299,8 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.base_href: str | None = None
         self.style_content: list[str] | None = None
         self.style_sources: list[str] = []
+        self.stylesheet_targets: list[str] = []
+        self.form_active = False
         self.template_depth = 0
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
@@ -3293,6 +3321,12 @@ class HTMLFragmentResourceParser(HTMLParser):
         if tag == "template" and namespace == HTML_NAMESPACE:
             self.template_depth = 1
             return
+        if canonical_tag in MARKDOWN_HTML_FORM_TAGS and namespace == HTML_NAMESPACE:
+            if self.form_active:
+                return
+            self.form_active = True
+            if "action" in values:
+                self.targets.append((values["action"], False, False))
         picture_parent = html_has_direct_parent(
             self.element_stack, frozenset({"picture"})
         )
@@ -3331,6 +3365,8 @@ class HTMLFragmentResourceParser(HTMLParser):
                         ),
                     )
                 )
+                if "stylesheet" in relations:
+                    self.stylesheet_targets.append(values["href"])
             if (
                 "preload" in relations
                 and values.get("as", "").casefold()
@@ -3349,8 +3385,6 @@ class HTMLFragmentResourceParser(HTMLParser):
                 self.targets.append(
                     (target, False, html_target_requires_file(target))
                 )
-        if tag in MARKDOWN_HTML_FORM_TAGS and "action" in values:
-            self.targets.append((values["action"], False, False))
         if (
             tag in MARKDOWN_HTML_BUTTON_TAGS
             and "formaction" in values
@@ -3468,6 +3502,10 @@ class HTMLFragmentResourceParser(HTMLParser):
             return
         if self.template_depth:
             return
+        if tag == "form":
+            if not self.form_active:
+                return
+            self.form_active = False
         if tag == "style" and self.style_content is not None:
             self.style_sources.append("".join(self.style_content))
             self.style_content = None
@@ -3487,12 +3525,15 @@ class HTMLFragmentResourceParser(HTMLParser):
                 for target, requires_file in css_resource_references(
                     style_source,
                     used_custom_properties=used_custom_properties,
+                    imported_targets=self.stylesheet_targets,
                 )
             )
 
 
 class HTMLDocumentFragmentParser(HTMLParser):
     """Collect addressable fragments from a standalone HTML document."""
+
+    CDATA_CONTENT_ELEMENTS = tuple(HTML_SCRIPTING_ENABLED_RAW_TEXT_TAGS)
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -3608,7 +3649,10 @@ def html_same_document_fragment(target: str) -> str | None:
 
 
 def html_fragment_resource_targets(
-    text: str, *, inherited_base: str = ""
+    text: str,
+    *,
+    inherited_base: str = "",
+    stylesheet_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Collect targets from HTML parsed inside an iframe srcdoc document."""
 
@@ -3635,6 +3679,18 @@ def html_fragment_resource_targets(
                 urlsplit(effective_base)
             except ValueError:
                 effective_base = parent_base
+
+        if stylesheet_targets is not None:
+            stylesheet_targets.extend(
+                target
+                for target, _, _ in resolve_html_targets(
+                    [
+                        (target, False, True)
+                        for target in parser.stylesheet_targets
+                    ],
+                    effective_base,
+                )
+            )
 
         for target, is_markdown, requires_file in parser.targets:
             if html_same_document_fragment(target) is not None:
@@ -3726,7 +3782,7 @@ def mask_html_raw_text_element_contents(text: str) -> str:
             continue
         if (
             namespace != HTML_NAMESPACE
-            or tag not in MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS
+            or tag not in HTML_SCRIPTING_ENABLED_RAW_TEXT_TAGS
         ):
             search_from = tag_match.end()
             continue
@@ -3889,6 +3945,7 @@ def html_resource_targets(
     text: str,
     *,
     additional_style_sources: list[str] | None = None,
+    stylesheet_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Collect navigations and resource requests from rendered HTML."""
 
@@ -3898,6 +3955,15 @@ def html_resource_targets(
     text = mask_html_template_contents(text)
     effective_base = html_effective_base(text)
     targets: list[tuple[str, bool, bool]] = []
+    document_stylesheet_targets = [
+        html_attribute_unescape(target)
+        for target in html_attribute_values(
+            attribute_text,
+            MARKDOWN_HTML_HREF_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_LINK_TAGS,
+            required_attribute_tokens={"rel": frozenset({"stylesheet"})},
+        )
+    ]
     targets.extend(html_context_resource_targets(text))
     targets.extend(
         (html_attribute_unescape(target), False, False)
@@ -3927,14 +3993,6 @@ def html_resource_targets(
             required_attribute_tokens={
                 "rel": MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
             },
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, False)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_ACTION_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_FORM_TAGS,
         )
     )
     targets.extend(
@@ -4026,6 +4084,7 @@ def html_resource_targets(
             for target, requires_file in css_resource_references(
                 style_source,
                 used_custom_properties=used_custom_properties,
+                imported_targets=document_stylesheet_targets,
             )
         )
     for content in html_attribute_values(
@@ -4041,6 +4100,17 @@ def html_resource_targets(
             targets.append((refresh_target, False, False))
 
     targets = resolve_html_targets(targets, effective_base)
+    if stylesheet_targets is not None:
+        stylesheet_targets.extend(
+            target
+            for target, _, _ in resolve_html_targets(
+                [
+                    (target, False, True)
+                    for target in document_stylesheet_targets
+                ],
+                effective_base,
+            )
+        )
 
     for srcdoc in html_attribute_values(
         attribute_text,
@@ -4051,6 +4121,7 @@ def html_resource_targets(
             html_fragment_resource_targets(
                 html_attribute_unescape(srcdoc),
                 inherited_base=effective_base,
+                stylesheet_targets=stylesheet_targets,
             )
         )
     return targets
@@ -4365,7 +4436,11 @@ def markdown_active_image_label_ranges(
     return ranges
 
 
-def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
+def markdown_link_targets(
+    text: str,
+    *,
+    stylesheet_targets: list[str] | None = None,
+) -> list[tuple[str, bool, bool]]:
     """Extract destinations and whether they require Markdown parsing or a file."""
 
     style_content_spans: list[tuple[int, int]] = []
@@ -4499,6 +4574,7 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         html_resource_targets(
             rendered_html_text,
             additional_style_sources=style_contents,
+            stylesheet_targets=stylesheet_targets,
         )
     )
     return targets
@@ -4906,15 +4982,22 @@ def find_broken_links(root: Path) -> list[str]:
     fragment_cache: dict[Path, set[str]] = {}
     decoded_text_cache: dict[Path, str | None] = {}
 
+    def display_path(path: Path) -> Path:
+        try:
+            return path.relative_to(root)
+        except ValueError:
+            return path.resolve().relative_to(repository_root)
+
     def read_text_resource(path: Path) -> str | None:
         if path not in decoded_text_cache:
             decoded_text_cache[path] = decode_text_data(path.read_bytes())
             if decoded_text_cache[path] is None:
                 errors.append(
-                    f"{path.relative_to(root)}: undecodable textual resource"
+                    f"{display_path(path)}: undecodable textual resource"
                 )
         return decoded_text_cache[path]
 
+    seen_stylesheets: set[Path] = set()
     for path in markdown_files(root):
         text = read_text_resource(path)
         if text is None:
@@ -4924,12 +5007,33 @@ def find_broken_links(root: Path) -> list[str]:
                 f"{path.relative_to(root)}: broken srcdoc fragment "
                 f"{fragment_target!r}"
             )
-        for raw_target, is_markdown, requires_file in markdown_link_targets(text):
+        stylesheet_targets: list[str] = []
+        link_targets = markdown_link_targets(
+            text, stylesheet_targets=stylesheet_targets
+        )
+        stylesheet_target_set = set(stylesheet_targets)
+        pending_targets = [
+            (
+                path,
+                raw_target,
+                is_markdown,
+                requires_file,
+                raw_target in stylesheet_target_set,
+            )
+            for raw_target, is_markdown, requires_file in link_targets
+        ]
+        for (
+            source_path,
+            raw_target,
+            is_markdown,
+            requires_file,
+            scan_stylesheet,
+        ) in pending_targets:
             target = raw_target.strip("\t\n\f\r ")
             if not target:
                 if requires_file:
                     errors.append(
-                        f"{path.relative_to(root)}: resource target has no file path "
+                        f"{display_path(source_path)}: resource target has no file path "
                         f"{raw_target!r}"
                     )
                 continue
@@ -4950,7 +5054,7 @@ def find_broken_links(root: Path) -> list[str]:
             if not target:
                 if requires_file:
                     errors.append(
-                        f"{path.relative_to(root)}: resource target has no file path "
+                        f"{display_path(source_path)}: resource target has no file path "
                         f"{raw_target!r}"
                     )
                 continue
@@ -4961,45 +5065,81 @@ def find_broken_links(root: Path) -> list[str]:
             fragment = url_element_fragment(unquote(parsed_target.fragment))
             if requires_file and not path_target and not parsed_target.query:
                 errors.append(
-                    f"{path.relative_to(root)}: resource target has no file path "
+                    f"{display_path(source_path)}: resource target has no file path "
                     f"{raw_target!r}"
                 )
                 continue
             if "\x00" in path_target:
-                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                errors.append(
+                    f"{display_path(source_path)}: broken relative link {raw_target!r}"
+                )
                 continue
             try:
                 resolved = (
-                    (path.parent / path_target).resolve()
+                    (source_path.parent / path_target).resolve()
                     if path_target
-                    else path.resolve()
+                    else source_path.resolve()
                 )
             except (OSError, ValueError):
-                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
-                continue
-            if path.resolve().is_relative_to(skill_root) and not resolved.is_relative_to(skill_root):
                 errors.append(
-                    f"{path.relative_to(root)}: relative link escapes distributable skill "
+                    f"{display_path(source_path)}: broken relative link {raw_target!r}"
+                )
+                continue
+            if source_path.resolve().is_relative_to(
+                skill_root
+            ) and not resolved.is_relative_to(skill_root):
+                errors.append(
+                    f"{display_path(source_path)}: relative link escapes distributable skill "
                     f"directory {raw_target!r}"
                 )
                 continue
             if not resolved.is_relative_to(repository_root):
                 errors.append(
-                    f"{path.relative_to(root)}: relative link escapes repository checkout "
+                    f"{display_path(source_path)}: relative link escapes repository checkout "
                     f"{raw_target!r}"
                 )
                 continue
             if not resolved.exists():
-                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                errors.append(
+                    f"{display_path(source_path)}: broken relative link {raw_target!r}"
+                )
                 continue
             if path_target.endswith("/") and resolved.is_file():
-                errors.append(f"{path.relative_to(root)}: broken relative link {raw_target!r}")
+                errors.append(
+                    f"{display_path(source_path)}: broken relative link {raw_target!r}"
+                )
                 continue
             if requires_file and not resolved.is_file():
                 errors.append(
-                    f"{path.relative_to(root)}: resource target is not a file {raw_target!r}"
+                    f"{display_path(source_path)}: resource target is not a file "
+                    f"{raw_target!r}"
                 )
                 continue
+            if (
+                scan_stylesheet
+                and resolved.is_file()
+                and resolved not in seen_stylesheets
+            ):
+                seen_stylesheets.add(resolved)
+                stylesheet_text = read_text_resource(resolved)
+                if stylesheet_text is not None:
+                    imported_targets: list[str] = []
+                    stylesheet_references = css_resource_references(
+                        stylesheet_text,
+                        imported_targets=imported_targets,
+                    )
+                    imported_target_set = set(imported_targets)
+                    pending_targets.extend(
+                        (
+                            resolved,
+                            stylesheet_target,
+                            False,
+                            stylesheet_requires_file,
+                            stylesheet_target in imported_target_set,
+                        )
+                        for stylesheet_target, stylesheet_requires_file
+                        in stylesheet_references
+                    )
             if fragment and resolved.is_file():
                 suffix = resolved.suffix.lower()
                 fragment_kind: str | None = None
@@ -5022,7 +5162,7 @@ def find_broken_links(root: Path) -> list[str]:
                     fragment_cache[resolved] = fragment_loader(resolved_text)
                 if fragment not in fragment_cache[resolved]:
                     errors.append(
-                        f"{path.relative_to(root)}: broken {fragment_kind} fragment "
+                        f"{display_path(source_path)}: broken {fragment_kind} fragment "
                         f"#{fragment!s} in {raw_target!r}"
                     )
     return errors

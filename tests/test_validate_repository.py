@@ -2614,6 +2614,35 @@ class LinkTests(unittest.TestCase):
             self.assertFalse(any("ignored-late.css" in error for error in errors))
             self.assertFalse(any("ignored-nested.css" in error for error in errors))
 
+    def test_recursively_validates_imported_stylesheets_with_cycle_protection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "styles" / "nested"
+            nested.mkdir(parents=True)
+            (root / "README.md").write_text(
+                '<style>@import url("styles/theme.css");</style>\n',
+                encoding="utf-8",
+            )
+            (root / "styles" / "theme.css").write_text(
+                '@import url("nested/child.css");\n',
+                encoding="utf-8",
+            )
+            (nested / "child.css").write_text(
+                '@import url("../theme.css");\n'
+                '.hero { background-image: url("missing.png"); }\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [
+                    "styles/nested/child.css: broken relative link "
+                    "'missing.png'"
+                ],
+                validator.find_broken_links(root),
+            )
+
     def test_scans_each_css_identifier_once(self) -> None:
         with mock.patch.object(
             validator,
@@ -2828,6 +2857,21 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("docs/missing-button.md" in error for error in errors))
             self.assertTrue(any("docs/missing-input.md" in error for error in errors))
 
+    def test_ignores_action_on_discarded_nested_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.html").write_text("ok\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                '<form action="existing.html">'
+                '<form action="missing-nested.html"></form>'
+                '<iframe srcdoc="<form action=\047existing.html\047>'
+                '<form action=\047missing-srcdoc-nested.html\047></form>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_fragments_in_local_html_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2848,6 +2892,27 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("page.html#hidden" in error for error in errors))
             self.assertTrue(any("page.html#missing" in error for error in errors))
+
+    def test_excludes_ids_inside_scripting_enabled_noscript_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text(
+                '<noscript><div id="fallback"></div></noscript>'
+                '<div id="live"></div>\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                "[fallback](page.html#fallback) [live](page.html#live)\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [
+                    "README.md: broken HTML fragment #fallback in "
+                    "'page.html#fallback'"
+                ],
+                validator.find_broken_links(root),
+            )
 
     def test_recognizes_text_fragment_directives_before_id_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3456,6 +3521,19 @@ class InstallationDocumentationTests(unittest.TestCase):
         self.assertTrue(
             all('"/path/to/robot-project' in line for line in project_commands)
         )
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_checkout_does_not_persist_github_credentials(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "validate.yml").read_text(
+            encoding="utf-8"
+        )
+        checkout_step = workflow[
+            workflow.index("uses: actions/checkout@") : workflow.index(
+                "- name: Set up Python"
+            )
+        ]
+        self.assertIn("persist-credentials: false", checkout_step)
 
 
 class SkillWorkflowTests(unittest.TestCase):
