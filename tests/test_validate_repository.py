@@ -152,6 +152,19 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#motordriver", errors[0])
 
+    def test_strips_triple_underscore_emphasis_from_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# ___foo___\n"
+                "[rendered](#foo)\n"
+                "[stale](#_foo_)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#_foo_", errors[0])
+
     def test_preserves_unicode_combining_marks_in_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -396,6 +409,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_angle_bracketed_destination_with_escaped_line_ending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide](<missing\\\nfile.md>)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_tab_separator_before_link_title(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -515,6 +536,29 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("references/missing.md", errors[0])
+
+    def test_accepts_generated_gfm_footnote_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[^1]: Note\n\n[footnote](#user-content-fn-1)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_footnote_definition_inside_code_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "```markdown\n"
+                "[^1]: Literal example\n"
+                "```\n\n"
+                "[footnote](#user-content-fn-1)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#user-content-fn-1", errors[0])
 
     def test_reports_shortcut_reference_before_paragraph_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

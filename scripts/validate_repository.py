@@ -89,6 +89,9 @@ MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"'(?:\\.|[^'\\\n]|\n(?=[ \t]*\S))*'|"
     r"\((?:\\.|[^()\\\n]|\n(?=[ \t]*\S))*\)))?[ \t]*(?=\n|$)"
 )
+MARKDOWN_FOOTNOTE_DEFINITION = re.compile(
+    r"(?m)^[ \t]{0,3}\[\^(?P<label>(?:\\.|[^\]\\\r\n])+)\]:"
+)
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
     r"^(?P<indent>[ \t]{0,3})(?P<marker>[*+-]|\d{1,9}[.)])"
@@ -1549,7 +1552,10 @@ def markdown_destination_end(
         while index < paragraph_end:
             character = text[index]
             if character == "\\":
-                index += 2
+                escape = MARKDOWN_BACKSLASH_ESCAPE.match(text, index)
+                if escape is None:
+                    return None
+                index = escape.end()
                 continue
             if character in "\r\n<":
                 return None
@@ -1914,7 +1920,7 @@ def github_heading_slug(
     )
     heading = markdown_unescape(heading)
     heading = re.sub(
-        r"(?<![\w\\])(?P<delimiter>_{1,2})(?=\S)(?P<content>.+?\S)"
+        r"(?<![\w\\])(?P<delimiter>_{1,3})(?=\S)(?P<content>.+?\S)"
         r"(?P=delimiter)(?!\w)",
         r"\g<content>",
         heading,
@@ -1973,6 +1979,9 @@ def markdown_heading_fragments(text: str) -> set[str]:
         markdown_normalize_reference_label(definition.group("label"))
         for definition in reference_definitions
     )
+    for footnote in MARKDOWN_FOOTNOTE_DEFINITION.finditer(structure_text):
+        label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
+        fragments.add(f"user-content-fn-{markdown_unescape(label).casefold()}")
     for definition in reference_definitions:
         start_line = structure_text.count("\n", 0, definition.start())
         end_line = structure_text.count(
