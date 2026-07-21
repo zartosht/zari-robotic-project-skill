@@ -539,6 +539,14 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_link_label_crossing_setext_heading_underline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide\n===\n](missing.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_scans_link_label_across_empty_unordered_markers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1270,6 +1278,26 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("#inline-anchor" in error for error in errors))
             self.assertTrue(any("#commented-anchor" in error for error in errors))
 
+    def test_ignores_html_anchors_in_nonrendered_markdown_contexts(self) -> None:
+        documents = {
+            "inline title": '[outer](README.md "<a id=ghost>")\n',
+            "reference title": (
+                '[outer][ref]\n\n[ref]: README.md "<a name=ghost>"\n'
+            ),
+            "image description": "![<a id=ghost>](image.png)\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "image.png").write_bytes(b"image")
+            for context, document in documents.items():
+                with self.subTest(context=context):
+                    (root / "README.md").write_text(
+                        document + "[stale](#ghost)\n", encoding="utf-8"
+                    )
+                    errors = validator.find_broken_links(root)
+                    self.assertEqual(1, len(errors))
+                    self.assertIn("#ghost", errors[0])
+
     def test_preserves_link_after_escaped_html_comment_opener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1400,6 +1428,15 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("references/missing.md" in error for error in errors))
             self.assertTrue(any("assets/missing.png" in error for error in errors))
+
+    def test_ignores_duplicate_html_resource_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "exists.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<img src="exists.png" src="missing.png">\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_validates_html_target_after_quoted_greater_than(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1452,6 +1452,7 @@ def html_attribute_values(
                 index += 1
                 continue
             name = tag[name_start:index].casefold()
+            is_first_attribute = name not in attributes
 
             while index < len(tag) - 1 and tag[index].isspace():
                 index += 1
@@ -1482,7 +1483,7 @@ def html_attribute_values(
                     index += 1
                 value = tag[value_start:index]
             attributes.setdefault(name, value)
-            if name in names:
+            if is_first_attribute and name in names:
                 tag_values.append(value)
         if required_attribute_values is None or all(
             html_attribute_unescape(attributes.get(name, "")).casefold()
@@ -1732,6 +1733,7 @@ def markdown_line_interrupts_paragraph(content: str) -> bool:
     stripped = content.lstrip(" \t")
     return bool(
         MARKDOWN_ATX_HEADING.match(content)
+        or MARKDOWN_SETEXT_HEADING.match(content)
         or MARKDOWN_THEMATIC_BREAK.match(content)
         or markdown_fence_opening(content)
         or MARKDOWN_RAW_HTML_TYPE_1.match(content)
@@ -2194,6 +2196,62 @@ def github_heading_slug(
     return "".join(characters)
 
 
+def markdown_html_anchor_searchable_text(text: str) -> str:
+    """Mask Markdown-only HTML-shaped text before collecting explicit anchors."""
+
+    rendered_text = markdown_searchable_text(text)
+    characters = list(rendered_text)
+    reference_definitions = markdown_reference_definitions(rendered_text)
+    reference_labels = {
+        markdown_normalize_reference_label(definition.group("label"))
+        for definition in reference_definitions
+    }
+    definition_ranges = markdown_reference_definition_ranges(
+        rendered_text, reference_definitions
+    )
+    label_pairs = markdown_label_pairs(rendered_text)
+    image_label_ranges = markdown_active_image_label_ranges(
+        rendered_text, reference_labels, label_pairs
+    )
+
+    for start, end in definition_ranges:
+        for position in range(start, end):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+    for label_start, label_end in image_label_ranges:
+        for position in range(label_start + 1, label_end):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+
+    inline_link_suffix_end = -1
+    paragraph_end = -1
+    for label_start, character in enumerate(rendered_text):
+        if character != "[" or characters[label_start] == " ":
+            continue
+        if label_start < inline_link_suffix_end:
+            continue
+        label_end = label_pairs.get(label_start)
+        if (
+            label_end is None
+            or label_end + 1 >= len(rendered_text)
+            or rendered_text[label_end + 1] != "("
+        ):
+            continue
+        if label_start >= paragraph_end:
+            paragraph_end = markdown_paragraph_end(rendered_text, label_start)
+        destination = markdown_destination_end(
+            rendered_text, label_end + 1, paragraph_end
+        )
+        if destination is None:
+            continue
+        for position in range(label_end + 1, destination[1] + 1):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+        inline_link_suffix_end = destination[1] + 1
+
+    return "".join(characters)
+
+
 def markdown_heading_fragments(text: str) -> set[str]:
     """Collect generated heading fragments and explicit HTML anchors outside fences."""
 
@@ -2276,10 +2334,11 @@ def markdown_heading_fragments(text: str) -> set[str]:
             "\n", 0, max(definition.start(), definition.end() - 1)
         )
         reference_definition_lines.update(range(start_line, end_line + 1))
-    for anchor in html_attribute_values(searchable_text, MARKDOWN_HTML_ID_ATTRIBUTES):
+    anchor_text = markdown_html_anchor_searchable_text(text)
+    for anchor in html_attribute_values(anchor_text, MARKDOWN_HTML_ID_ATTRIBUTES):
         fragments.add(html_attribute_unescape(anchor))
     for anchor in html_attribute_values(
-        searchable_text,
+        anchor_text,
         MARKDOWN_HTML_NAME_ATTRIBUTES,
         tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
     ):
