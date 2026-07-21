@@ -238,6 +238,8 @@ MARKDOWN_HTML_BACKGROUND_TAGS = frozenset(
     {"body", "table", "tbody", "td", "tfoot", "th", "thead", "tr"}
 )
 MARKDOWN_HTML_MAP_TAGS = frozenset({"map"})
+HTML_DECLARATIVE_SHADOW_ROOT_MODES = frozenset({"closed", "open"})
+HTML_FRAMESET_ALLOWED_START_TAGS = frozenset({"frame", "frameset", "noframes"})
 CSS_RESOURCE_PROPERTIES = frozenset(
     {
         "-moz-binding",
@@ -818,6 +820,7 @@ def mask_markdown_raw_html_blocks(
     characters: list[str],
     reference_definition_lines: set[int] | None = None,
     style_content_spans: list[tuple[int, int]] | None = None,
+    module_script_content_spans: list[tuple[int, int]] | None = None,
 ) -> None:
     """Mask CommonMark raw HTML block bodies while retaining opening tags."""
 
@@ -1099,6 +1102,38 @@ def mask_markdown_raw_html_blocks(
                             else raw_container_end,
                         )
                     )
+            if (
+                module_script_content_spans is not None
+                and tag_name == "script"
+                and opening_tag
+            ):
+                script_tag = opening_tag.group(0)
+                type_values = html_attribute_values(
+                    script_tag,
+                    frozenset({"type"}),
+                    tag_names=frozenset({"script"}),
+                )
+                src_values = html_attribute_values(
+                    script_tag,
+                    frozenset({"src"}),
+                    tag_names=frozenset({"script"}),
+                )
+                script_attributes = {
+                    "type": (
+                        html_attribute_unescape(type_values[0])
+                        if type_values
+                        else ""
+                    )
+                }
+                if html_script_is_module(script_attributes) and not src_values:
+                    module_script_content_spans.append(
+                        (
+                            opening_tag.end(),
+                            closing_match.start()
+                            if closing_match
+                            else raw_container_end,
+                        )
+                    )
             skip_until = line_end_after(raw_end, raw_container_end)
             if opening_tag is None:
                 mask(content_start, skip_until)
@@ -1317,6 +1352,7 @@ def markdown_searchable_text(
     *,
     mask_inline_code: bool = True,
     style_content_spans: list[tuple[int, int]] | None = None,
+    module_script_content_spans: list[tuple[int, int]] | None = None,
     _footnote_reference_labels: set[str] | None = None,
 ) -> str:
     """Mask literal Markdown regions while preserving offsets and line structure."""
@@ -1436,7 +1472,10 @@ def markdown_searchable_text(
         offset += len(line)
 
     mask_markdown_raw_html_blocks(
-        characters, reference_definition_lines, style_content_spans
+        characters,
+        reference_definition_lines,
+        style_content_spans,
+        module_script_content_spans,
     )
 
     literal_characters = characters.copy()
@@ -3408,6 +3447,68 @@ def html_has_direct_parent(
     )
 
 
+def html_template_establishes_declarative_shadow_root(
+    element_stack: list[tuple[str, str, dict[str, str]]],
+    namespace: str,
+    attributes: dict[str, str],
+) -> bool:
+    """Return whether a template has an eligible declarative shadow host."""
+
+    if (
+        namespace != HTML_NAMESPACE
+        or attributes.get("shadowrootmode", "").casefold()
+        not in HTML_DECLARATIVE_SHADOW_ROOT_MODES
+        or not element_stack
+    ):
+        return False
+    parent_tag, parent_namespace, _ = element_stack[-1]
+    return (
+        parent_namespace == HTML_NAMESPACE
+        and parent_tag not in HTML_VOID_TAGS
+        and parent_tag not in {"body", "head", "html", "slot", "template"}
+    )
+
+
+HTML_START_TAG_ATTRIBUTE = re.compile(
+    rf"(?P<name>{MARKDOWN_HTML_ATTRIBUTE_NAME})"
+    rf"(?:[ \t\f\r\n]*=[ \t\f\r\n]*"
+    rf"(?P<value>{MARKDOWN_HTML_ATTRIBUTE_VALUE}))?"
+)
+
+
+def html_raw_start_tag_attributes(raw_tag: str) -> dict[str, str]:
+    """Parse raw HTML attributes with deterministic tokenizer unescaping."""
+
+    tag_name = re.match(r"<[A-Za-z][A-Za-z0-9-]*", raw_tag)
+    if tag_name is None:
+        return {}
+    values: dict[str, str] = {}
+    cursor = tag_name.end()
+    while cursor < len(raw_tag):
+        whitespace = re.match(r"[\t\n\f\r ]+", raw_tag[cursor:])
+        if whitespace is None:
+            break
+        cursor += whitespace.end()
+        if raw_tag.startswith((">", "/>"), cursor):
+            break
+        attribute = HTML_START_TAG_ATTRIBUTE.match(raw_tag, cursor)
+        if attribute is None:
+            break
+        raw_value = attribute.group("value") or ""
+        if (
+            len(raw_value) >= 2
+            and raw_value[0] in {'"', "'"}
+            and raw_value[-1] == raw_value[0]
+        ):
+            raw_value = raw_value[1:-1]
+        values.setdefault(
+            attribute.group("name").casefold(),
+            html_attribute_unescape(raw_value),
+        )
+        cursor = attribute.end()
+    return values
+
+
 def html_formaction_value(
     tag: str, namespace: str, attributes: dict[str, str]
 ) -> str | None:
@@ -3459,12 +3560,15 @@ class HTMLContextResourceParser(HTMLParser):
         self.embedded_document_targets: list[str] = []
         self.stylesheet_targets: list[str] = []
         self.module_script_targets: list[str] = []
+        self.module_script_content: list[str] | None = None
         self.base_hrefs: list[str] = []
         self.formaction_candidates: list[tuple[str, str | None, bool]] = []
         self.first_id_elements: dict[str, tuple[str, str]] = {}
         self.form_active = False
         self.template_depth = 0
         self.in_select = False
+        self.frameset_depth = 0
+        self.after_frameset = False
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
@@ -3487,13 +3591,25 @@ class HTMLContextResourceParser(HTMLParser):
             elif tag not in HTML_SELECT_ALLOWED_START_TAGS:
                 return
 
-        values: dict[str, str] = {}
-        for name, value in attributes:
-            values.setdefault(name.casefold(), value or "")
+        values = html_raw_start_tag_attributes(raw_tag or "")
 
         namespace = html_start_tag_namespace(self.element_stack, tag, values)
         canonical_tag = html_canonical_tag_name(tag, namespace)
-        if tag == "template" and namespace == HTML_NAMESPACE:
+        if namespace == HTML_NAMESPACE and (
+            (self.frameset_depth and canonical_tag not in HTML_FRAMESET_ALLOWED_START_TAGS)
+            or (
+                self.after_frameset
+                and canonical_tag not in {"html", "noframes"}
+            )
+        ):
+            return
+        if (
+            tag == "template"
+            and namespace == HTML_NAMESPACE
+            and not html_template_establishes_declarative_shadow_root(
+                self.element_stack, namespace, values
+            )
+        ):
             self.template_depth = 1
             return
         if canonical_tag in MARKDOWN_HTML_FORM_TAGS and namespace == HTML_NAMESPACE:
@@ -3585,6 +3701,13 @@ class HTMLContextResourceParser(HTMLParser):
             if canonical_tag == "script" and html_script_is_module(values):
                 self.module_script_targets.append(values["src"])
         if (
+            canonical_tag == "script"
+            and namespace == HTML_NAMESPACE
+            and "src" not in values
+            and html_script_is_module(values)
+        ):
+            self.module_script_content = []
+        if (
             canonical_tag in MARKDOWN_HTML_INPUT_TAGS
             and namespace == HTML_NAMESPACE
             and values.get("type", "").casefold()
@@ -3644,14 +3767,14 @@ class HTMLContextResourceParser(HTMLParser):
         if tag == "select" and namespace == HTML_NAMESPACE:
             self.in_select = True
         html_push_element_context(self.element_stack, tag, namespace, values)
+        if canonical_tag == "frameset" and namespace == HTML_NAMESPACE:
+            self.frameset_depth += 1
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         tag = tag.casefold()
-        values = {
-            name.casefold(): value or "" for name, value in attributes
-        }
+        values = html_raw_start_tag_attributes(self.get_starttag_text() or "")
         namespace = html_start_tag_namespace(self.element_stack, tag, values)
         self.handle_starttag(tag, attributes)
         if html_slash_closes_context(
@@ -3671,10 +3794,32 @@ class HTMLContextResourceParser(HTMLParser):
             if not self.form_active:
                 return
             self.form_active = False
+        if tag == "script" and self.module_script_content is not None:
+            self.finish_module_script_content()
+        if tag == "frameset" and self.frameset_depth:
+            self.frameset_depth -= 1
+            if not self.frameset_depth:
+                self.after_frameset = True
         html_pop_element_context(self.element_stack, tag)
         self.in_select = html_has_ancestor(
             self.element_stack, frozenset({"select"})
         )
+
+    def handle_data(self, data: str) -> None:
+        if self.module_script_content is not None:
+            self.module_script_content.append(data)
+
+    def finish_module_script_content(self) -> None:
+        """Collect static imports from the current inline module body."""
+
+        if self.module_script_content is None:
+            return
+        for target in javascript_static_module_specifiers(
+            "".join(self.module_script_content)
+        ):
+            self.targets.append((target, False, True))
+            self.module_script_targets.append(target)
+        self.module_script_content = None
 
 
 def html_context_resource_targets(
@@ -3689,6 +3834,7 @@ def html_context_resource_targets(
     parser = HTMLContextResourceParser()
     parser.feed(text)
     parser.close()
+    parser.finish_module_script_content()
     if embedded_document_targets is not None:
         embedded_document_targets.extend(parser.embedded_document_targets)
     if stylesheet_targets is not None:
@@ -3724,20 +3870,29 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.style_sources: list[str] = []
         self.stylesheet_targets: list[str] = []
         self.module_script_targets: list[str] = []
+        self.module_script_content: list[str] | None = None
         self.formaction_candidates: list[tuple[str, str | None, bool]] = []
         self.first_id_elements: dict[str, tuple[str, str]] = {}
         self.form_active = False
         self.template_depth = 0
         self.in_select = False
+        self.frameset_depth = 0
+        self.after_frameset = False
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         tag = tag.casefold()
-        values: dict[str, str] = {}
-        for name, value in attributes:
-            values.setdefault(name.casefold(), value or "")
+        raw_tag = self.get_starttag_text()
+        values = (
+            html_raw_start_tag_attributes(raw_tag)
+            if raw_tag is not None
+            else {
+                name.casefold(): value or ""
+                for name, value in attributes
+            }
+        )
 
         if self.template_depth:
             if tag == "template":
@@ -3753,7 +3908,21 @@ class HTMLFragmentResourceParser(HTMLParser):
                 return
         namespace = html_start_tag_namespace(self.element_stack, tag, values)
         canonical_tag = html_canonical_tag_name(tag, namespace)
-        if tag == "template" and namespace == HTML_NAMESPACE:
+        if namespace == HTML_NAMESPACE and (
+            (self.frameset_depth and canonical_tag not in HTML_FRAMESET_ALLOWED_START_TAGS)
+            or (
+                self.after_frameset
+                and canonical_tag not in {"html", "noframes"}
+            )
+        ):
+            return
+        if (
+            tag == "template"
+            and namespace == HTML_NAMESPACE
+            and not html_template_establishes_declarative_shadow_root(
+                self.element_stack, namespace, values
+            )
+        ):
             self.template_depth = 1
             return
         if canonical_tag in MARKDOWN_HTML_FORM_TAGS and namespace == HTML_NAMESPACE:
@@ -3872,6 +4041,13 @@ class HTMLFragmentResourceParser(HTMLParser):
             if canonical_tag == "script" and html_script_is_module(values):
                 self.module_script_targets.append(values["src"])
         if (
+            canonical_tag == "script"
+            and namespace == HTML_NAMESPACE
+            and "src" not in values
+            and html_script_is_module(values)
+        ):
+            self.module_script_content = []
+        if (
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
             and "src" in values
@@ -3948,14 +4124,22 @@ class HTMLFragmentResourceParser(HTMLParser):
         if tag == "select" and namespace == HTML_NAMESPACE:
             self.in_select = True
         html_push_element_context(self.element_stack, tag, namespace, values)
+        if canonical_tag == "frameset" and namespace == HTML_NAMESPACE:
+            self.frameset_depth += 1
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         tag = tag.casefold()
-        values = {
-            name.casefold(): value or "" for name, value in attributes
-        }
+        raw_tag = self.get_starttag_text()
+        values = (
+            html_raw_start_tag_attributes(raw_tag)
+            if raw_tag is not None
+            else {
+                name.casefold(): value or ""
+                for name, value in attributes
+            }
+        )
         namespace = html_start_tag_namespace(self.element_stack, tag, values)
         self.handle_starttag(tag, attributes)
         if html_slash_closes_context(
@@ -3967,6 +4151,8 @@ class HTMLFragmentResourceParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.style_content is not None:
             self.style_content.append(data)
+        if self.module_script_content is not None:
+            self.module_script_content.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.casefold()
@@ -3982,13 +4168,32 @@ class HTMLFragmentResourceParser(HTMLParser):
         if tag == "style" and self.style_content is not None:
             self.style_sources.append("".join(self.style_content))
             self.style_content = None
+        if tag == "script" and self.module_script_content is not None:
+            self.finish_module_script_content()
+        if tag == "frameset" and self.frameset_depth:
+            self.frameset_depth -= 1
+            if not self.frameset_depth:
+                self.after_frameset = True
         html_pop_element_context(self.element_stack, tag)
         self.in_select = html_has_ancestor(
             self.element_stack, frozenset({"select"})
         )
 
+    def finish_module_script_content(self) -> None:
+        """Collect static imports from the current inline module body."""
+
+        if self.module_script_content is None:
+            return
+        for target in javascript_static_module_specifiers(
+            "".join(self.module_script_content)
+        ):
+            self.targets.append((target, False, True))
+            self.module_script_targets.append(target)
+        self.module_script_content = None
+
     def finish(self) -> None:
         self.close()
+        self.finish_module_script_content()
         self.targets.extend(
             html_owned_formaction_targets(
                 self.formaction_candidates, self.first_id_elements
@@ -4209,57 +4414,208 @@ def svg_xml_element_resource_targets(
     root: ElementTree.Element,
     *,
     stylesheet_targets: list[str] | None = None,
+    embedded_document_targets: list[str] | None = None,
+    module_script_targets: list[str] | None = None,
+    inherited_base: str = "",
 ) -> list[tuple[str, bool, bool]]:
     """Collect browser-loaded targets from an XML-parsed SVG subtree."""
 
     targets: list[tuple[str, bool, bool]] = []
     style_sources: list[tuple[str, str]] = []
     document_stylesheet_targets: list[str] = []
+    document_resource_targets: list[str] = []
+    document_module_script_targets: list[str] = []
+    srcdocs: list[tuple[str, str]] = []
     xlink_href = "{http://www.w3.org/1999/xlink}href"
 
-    def visit(element: ElementTree.Element, inherited_base: str) -> None:
+    def add_target(
+        target: str, base: str, *, requires_file: bool
+    ) -> str:
+        resolved_target = xml_resolve_target(target, base)
+        targets.append((resolved_target, False, requires_file))
+        return resolved_target
+
+    def visit(
+        element: ElementTree.Element,
+        base: str,
+        parent_name: tuple[str, str] = ("", ""),
+        inside_foreign_object: bool = False,
+    ) -> None:
         namespace, tag = xml_expanded_name(element.tag)
         attributes = element.attrib
-        effective_base = inherited_base
+        effective_base = base
         if XML_BASE_ATTRIBUTE in attributes:
             effective_base = xml_resolve_target(
-                attributes[XML_BASE_ATTRIBUTE], inherited_base
+                attributes[XML_BASE_ATTRIBUTE], base
             )
+        descendant_inside_foreign_object = inside_foreign_object or (
+            namespace == SVG_XML_NAMESPACE and tag == "foreignObject"
+        )
         if namespace == SVG_XML_NAMESPACE:
             if tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
                 target = attributes.get("href", attributes.get(xlink_href))
                 if target is not None:
                     resolved_target = xml_resolve_target(target, effective_base)
-                    targets.append(
-                        (
-                            resolved_target,
-                            False,
-                            html_target_requires_file(resolved_target),
-                        )
+                    add_target(
+                        target,
+                        effective_base,
+                        requires_file=html_target_requires_file(
+                            resolved_target
+                        ),
                     )
             if tag in MARKDOWN_SVG_NAVIGATION_HREF_TAGS:
                 target = attributes.get("href", attributes.get(xlink_href))
                 if target is not None:
-                    targets.append(
-                        (xml_resolve_target(target, effective_base), False, False)
+                    add_target(
+                        target, effective_base, requires_file=False
                     )
             for target, _, _ in svg_presentation_resource_targets(attributes):
                 resolved_target = xml_resolve_target(target, effective_base)
-                targets.append(
-                    (
-                        resolved_target,
-                        False,
-                        html_target_requires_file(resolved_target),
-                    )
+                add_target(
+                    target,
+                    effective_base,
+                    requires_file=html_target_requires_file(resolved_target),
                 )
             if "style" in attributes:
                 style_sources.append((attributes["style"], effective_base))
             if tag == "style":
                 style_sources.append(("".join(element.itertext()), effective_base))
+        elif namespace == XHTML_XML_NAMESPACE and inside_foreign_object:
+            if tag == "a" and "href" in attributes:
+                add_target(attributes["href"], effective_base, requires_file=False)
+            if tag == "link":
+                relations = frozenset(
+                    re.findall(
+                        r"[^\t\n\f\r ]+", attributes.get("rel", "").casefold()
+                    )
+                )
+                if "href" in attributes:
+                    is_resource = bool(
+                        relations.intersection(
+                            MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
+                        )
+                    )
+                    resolved_target = add_target(
+                        attributes["href"],
+                        effective_base,
+                        requires_file=is_resource,
+                    )
+                    if "stylesheet" in relations:
+                        document_stylesheet_targets.append(resolved_target)
+                if (
+                    "preload" in relations
+                    and attributes.get("as", "").casefold()
+                    in MARKDOWN_HTML_IMAGE_PRELOAD_AS_VALUES
+                    and "imagesrcset" in attributes
+                ):
+                    for candidate in html_srcset_candidates(
+                        attributes["imagesrcset"]
+                    ):
+                        add_target(candidate, effective_base, requires_file=True)
+            if (
+                tag in MARKDOWN_HTML_SRC_TAGS
+                and "src" in attributes
+                and not (tag == "iframe" and "srcdoc" in attributes)
+                and not (
+                    tag == "img"
+                    and "srcset" in attributes
+                    and html_srcset_overrides_src(attributes["srcset"])
+                )
+                and not (
+                    tag == "script"
+                    and not html_script_attributes_use_src(attributes)
+                )
+            ):
+                resolved_target = add_target(
+                    attributes["src"], effective_base, requires_file=True
+                )
+                if tag in MARKDOWN_HTML_EMBEDDED_DOCUMENT_SRC_TAGS:
+                    document_resource_targets.append(resolved_target)
+                if tag == "script" and html_script_is_module(attributes):
+                    document_module_script_targets.append(resolved_target)
+            if (
+                tag == "script"
+                and "src" not in attributes
+                and html_script_is_module(attributes)
+            ):
+                for target in javascript_static_module_specifiers(
+                    "".join(element.itertext())
+                ):
+                    resolved_target = add_target(
+                        target, effective_base, requires_file=True
+                    )
+                    document_module_script_targets.append(resolved_target)
+            if (
+                tag == "input"
+                and attributes.get("type", "").casefold()
+                in MARKDOWN_HTML_IMAGE_INPUT_TYPES
+                and "src" in attributes
+            ):
+                add_target(attributes["src"], effective_base, requires_file=True)
+            if (
+                tag == "source"
+                and parent_name[0] == XHTML_XML_NAMESPACE
+                and parent_name[1] in {"audio", "video"}
+                and "src" in attributes
+            ):
+                add_target(attributes["src"], effective_base, requires_file=True)
+            if (
+                tag == "source"
+                and parent_name == (XHTML_XML_NAMESPACE, "picture")
+                and "srcset" in attributes
+            ):
+                for candidate in html_srcset_candidates(attributes["srcset"]):
+                    add_target(candidate, effective_base, requires_file=True)
+            if tag == "img" and "srcset" in attributes:
+                for candidate in html_srcset_candidates(attributes["srcset"]):
+                    add_target(candidate, effective_base, requires_file=True)
+            if tag == "object" and "data" in attributes:
+                resolved_target = add_target(
+                    attributes["data"], effective_base, requires_file=True
+                )
+                document_resource_targets.append(resolved_target)
+            if tag == "video" and "poster" in attributes:
+                add_target(attributes["poster"], effective_base, requires_file=True)
+            if (
+                tag in MARKDOWN_HTML_BACKGROUND_TAGS
+                and attributes.get("background", "")
+            ):
+                add_target(
+                    attributes["background"], effective_base, requires_file=True
+                )
+            if tag == "form" and "action" in attributes:
+                add_target(attributes["action"], effective_base, requires_file=False)
+            formaction = html_formaction_value(tag, HTML_NAMESPACE, attributes)
+            if formaction is not None and "form" in attributes:
+                add_target(formaction, effective_base, requires_file=False)
+            if "style" in attributes:
+                style_sources.append((attributes["style"], effective_base))
+            if tag == "style" and html_style_type_uses_css(
+                attributes.get("type", "")
+            ):
+                style_sources.append(("".join(element.itertext()), effective_base))
+            if (
+                tag == "meta"
+                and attributes.get("http-equiv", "").strip().casefold()
+                == "refresh"
+                and "content" in attributes
+            ):
+                refresh_target = html_meta_refresh_target(attributes["content"])
+                if refresh_target is not None:
+                    add_target(
+                        refresh_target, effective_base, requires_file=False
+                    )
+            if tag == "iframe" and "srcdoc" in attributes:
+                srcdocs.append((attributes["srcdoc"], effective_base))
         for child in element:
-            visit(child, effective_base)
+            visit(
+                child,
+                effective_base,
+                (namespace, tag),
+                descendant_inside_foreign_object,
+            )
 
-    visit(root, "")
+    visit(root, inherited_base)
     used_custom_properties = css_used_custom_properties(
         [style_source for style_source, _ in style_sources]
     )
@@ -4284,6 +4640,20 @@ def svg_xml_element_resource_targets(
         )
     if stylesheet_targets is not None:
         stylesheet_targets.extend(document_stylesheet_targets)
+    if embedded_document_targets is not None:
+        embedded_document_targets.extend(document_resource_targets)
+    if module_script_targets is not None:
+        module_script_targets.extend(document_module_script_targets)
+    for srcdoc, srcdoc_base in srcdocs:
+        targets.extend(
+            html_fragment_resource_targets(
+                srcdoc,
+                inherited_base=srcdoc_base,
+                stylesheet_targets=stylesheet_targets,
+                embedded_document_targets=embedded_document_targets,
+                module_script_targets=module_script_targets,
+            )
+        )
     return targets
 
 
@@ -4291,6 +4661,8 @@ def svg_document_resource_targets(
     text: str,
     *,
     stylesheet_targets: list[str] | None = None,
+    embedded_document_targets: list[str] | None = None,
+    module_script_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Collect browser-loaded targets from a standalone SVG document."""
 
@@ -4299,7 +4671,10 @@ def svg_document_resource_targets(
     except ElementTree.ParseError:
         return []
     targets = svg_xml_element_resource_targets(
-        root, stylesheet_targets=stylesheet_targets
+        root,
+        stylesheet_targets=stylesheet_targets,
+        embedded_document_targets=embedded_document_targets,
+        module_script_targets=module_script_targets,
     )
     processing_instruction_targets = (
         xml_stylesheet_processing_instruction_targets(text)
@@ -4343,31 +4718,58 @@ def xhtml_document_resource_targets(
     except ElementTree.ParseError:
         return []
 
-    parents = {child: parent for parent in root.iter() for child in parent}
     targets: list[tuple[str, bool, bool]] = []
-    style_sources: list[str] = []
+    style_sources: list[tuple[str, str]] = []
     document_stylesheet_targets: list[str] = []
     document_resource_targets: list[str] = []
     document_module_script_targets: list[str] = []
-    srcdocs: list[str] = []
-    effective_base = ""
+    srcdocs: list[tuple[str, str]] = []
+    document_base = ""
 
     for element in root.iter():
         namespace, tag = xml_expanded_name(element.tag)
         attributes = element.attrib
-        if namespace == SVG_XML_NAMESPACE:
-            continue
-        if namespace != XHTML_XML_NAMESPACE:
-            continue
-        if tag == "base" and not effective_base and "href" in attributes:
+        if (
+            namespace == XHTML_XML_NAMESPACE
+            and tag == "base"
+            and not document_base
+            and "href" in attributes
+        ):
             try:
                 urlsplit(attributes["href"])
             except ValueError:
                 pass
             else:
-                effective_base = attributes["href"]
+                document_base = attributes["href"]
+                break
+
+    def add_target(
+        target: str, base: str, *, requires_file: bool
+    ) -> str:
+        resolved_target = xml_resolve_target(target, base)
+        targets.append((resolved_target, False, requires_file))
+        return resolved_target
+
+    def visit(
+        element: ElementTree.Element,
+        inherited_base: str,
+        parent_name: tuple[str, str] = ("", ""),
+    ) -> None:
+        namespace, tag = xml_expanded_name(element.tag)
+        attributes = element.attrib
+        effective_base = inherited_base
+        if XML_BASE_ATTRIBUTE in attributes:
+            effective_base = xml_resolve_target(
+                attributes[XML_BASE_ATTRIBUTE], inherited_base
+            )
+        if namespace == SVG_XML_NAMESPACE:
+            return
+        if namespace != XHTML_XML_NAMESPACE:
+            for child in element:
+                visit(child, effective_base, (namespace, tag))
+            return
         if tag == "a" and "href" in attributes:
-            targets.append((attributes["href"], False, False))
+            add_target(attributes["href"], effective_base, requires_file=False)
         if tag == "link":
             relations = frozenset(
                 re.findall(
@@ -4378,21 +4780,23 @@ def xhtml_document_resource_targets(
                 is_resource = bool(
                     relations.intersection(MARKDOWN_HTML_LINK_RESOURCE_RELATIONS)
                 )
-                targets.append((attributes["href"], False, is_resource))
+                resolved_target = add_target(
+                    attributes["href"],
+                    effective_base,
+                    requires_file=is_resource,
+                )
                 if "stylesheet" in relations:
-                    document_stylesheet_targets.append(attributes["href"])
+                    document_stylesheet_targets.append(resolved_target)
             if (
                 "preload" in relations
                 and attributes.get("as", "").casefold()
                 in MARKDOWN_HTML_IMAGE_PRELOAD_AS_VALUES
                 and "imagesrcset" in attributes
             ):
-                targets.extend(
-                    (candidate, False, True)
-                    for candidate in html_srcset_candidates(
-                        attributes["imagesrcset"]
-                    )
-                )
+                for candidate in html_srcset_candidates(
+                    attributes["imagesrcset"]
+                ):
+                    add_target(candidate, effective_base, requires_file=True)
         if (
             tag in MARKDOWN_HTML_SRC_TAGS
             and "src" in attributes
@@ -4407,64 +4811,72 @@ def xhtml_document_resource_targets(
                 and not html_script_attributes_use_src(attributes)
             )
         ):
-            targets.append((attributes["src"], False, True))
+            resolved_target = add_target(
+                attributes["src"], effective_base, requires_file=True
+            )
             if tag in MARKDOWN_HTML_EMBEDDED_DOCUMENT_SRC_TAGS:
-                document_resource_targets.append(attributes["src"])
+                document_resource_targets.append(resolved_target)
             if tag == "script" and html_script_is_module(attributes):
-                document_module_script_targets.append(attributes["src"])
+                document_module_script_targets.append(resolved_target)
+        if (
+            tag == "script"
+            and "src" not in attributes
+            and html_script_is_module(attributes)
+        ):
+            for target in javascript_static_module_specifiers(
+                "".join(element.itertext())
+            ):
+                resolved_target = add_target(
+                    target, effective_base, requires_file=True
+                )
+                document_module_script_targets.append(resolved_target)
         if (
             tag == "input"
             and attributes.get("type", "").casefold()
             in MARKDOWN_HTML_IMAGE_INPUT_TYPES
             and "src" in attributes
         ):
-            targets.append((attributes["src"], False, True))
-        parent = parents.get(element)
-        parent_name = (
-            xml_expanded_name(parent.tag)
-            if parent is not None
-            else ("", "")
-        )
+            add_target(attributes["src"], effective_base, requires_file=True)
         if (
             tag == "source"
             and parent_name[0] == XHTML_XML_NAMESPACE
             and parent_name[1] in {"audio", "video"}
             and "src" in attributes
         ):
-            targets.append((attributes["src"], False, True))
+            add_target(attributes["src"], effective_base, requires_file=True)
         if (
             tag == "source"
             and parent_name == (XHTML_XML_NAMESPACE, "picture")
             and "srcset" in attributes
         ):
-            targets.extend(
-                (candidate, False, True)
-                for candidate in html_srcset_candidates(attributes["srcset"])
-            )
+            for candidate in html_srcset_candidates(attributes["srcset"]):
+                add_target(candidate, effective_base, requires_file=True)
         if tag == "img" and "srcset" in attributes:
-            targets.extend(
-                (candidate, False, True)
-                for candidate in html_srcset_candidates(attributes["srcset"])
-            )
+            for candidate in html_srcset_candidates(attributes["srcset"]):
+                add_target(candidate, effective_base, requires_file=True)
         if tag == "object" and "data" in attributes:
-            targets.append((attributes["data"], False, True))
-            document_resource_targets.append(attributes["data"])
+            resolved_target = add_target(
+                attributes["data"], effective_base, requires_file=True
+            )
+            document_resource_targets.append(resolved_target)
         if tag == "video" and "poster" in attributes:
-            targets.append((attributes["poster"], False, True))
+            add_target(attributes["poster"], effective_base, requires_file=True)
         if (
             tag in MARKDOWN_HTML_BACKGROUND_TAGS
             and attributes.get("background", "")
         ):
-            targets.append((attributes["background"], False, True))
+            add_target(
+                attributes["background"], effective_base, requires_file=True
+            )
         if tag == "form" and "action" in attributes:
-            targets.append((attributes["action"], False, False))
+            add_target(attributes["action"], effective_base, requires_file=False)
         formaction = html_formaction_value(tag, HTML_NAMESPACE, attributes)
         if formaction is not None and "form" in attributes:
-            targets.append((formaction, False, False))
+            add_target(formaction, effective_base, requires_file=False)
         if "style" in attributes:
-            style_sources.append(attributes["style"])
+            style_sources.append((attributes["style"], effective_base))
         if tag == "style" and html_style_type_uses_css(attributes.get("type", "")):
-            style_sources.append("".join(element.itertext()))
+            style_sources.append(("".join(element.itertext()), effective_base))
         if (
             tag == "meta"
             and attributes.get("http-equiv", "").strip().casefold() == "refresh"
@@ -4472,73 +4884,59 @@ def xhtml_document_resource_targets(
         ):
             refresh_target = html_meta_refresh_target(attributes["content"])
             if refresh_target is not None:
-                targets.append((refresh_target, False, False))
+                add_target(
+                    refresh_target, effective_base, requires_file=False
+                )
         if tag == "iframe" and "srcdoc" in attributes:
-            srcdocs.append(attributes["srcdoc"])
+            srcdocs.append((attributes["srcdoc"], effective_base))
+        for child in element:
+            visit(child, effective_base, (namespace, tag))
 
-    svg_stylesheet_targets: list[str] = []
+    visit(root, document_base)
+
     targets.extend(
         svg_xml_element_resource_targets(
-            root, stylesheet_targets=svg_stylesheet_targets
+            root,
+            stylesheet_targets=document_stylesheet_targets,
+            embedded_document_targets=document_resource_targets,
+            module_script_targets=document_module_script_targets,
+            inherited_base=document_base,
         )
     )
-    document_stylesheet_targets.extend(svg_stylesheet_targets)
-    used_custom_properties = css_used_custom_properties(style_sources)
-    for style_source in style_sources:
+    used_custom_properties = css_used_custom_properties(
+        [style_source for style_source, _ in style_sources]
+    )
+    for style_source, style_base in style_sources:
+        imported_targets: list[str] = []
+        for target, requires_file in css_resource_references(
+            style_source,
+            used_custom_properties=used_custom_properties,
+            imported_targets=imported_targets,
+        ):
+            add_target(
+                target, style_base, requires_file=requires_file
+            )
+        document_stylesheet_targets.extend(
+            xml_resolve_target(target, style_base)
+            for target in imported_targets
+        )
+    for srcdoc, srcdoc_base in srcdocs:
         targets.extend(
-            (target, False, requires_file)
-            for target, requires_file in css_resource_references(
-                style_source,
-                used_custom_properties=used_custom_properties,
-                imported_targets=document_stylesheet_targets,
-            )
-        )
-
-    resolved_targets = resolve_html_targets(targets, effective_base)
-    if stylesheet_targets is not None:
-        stylesheet_targets.extend(
-            target
-            for target, _, _ in resolve_html_targets(
-                [
-                    (target, False, True)
-                    for target in document_stylesheet_targets
-                ],
-                effective_base,
-            )
-        )
-    if embedded_document_targets is not None:
-        embedded_document_targets.extend(
-            target
-            for target, _, _ in resolve_html_targets(
-                [
-                    (target, False, True)
-                    for target in document_resource_targets
-                ],
-                effective_base,
-            )
-        )
-    if module_script_targets is not None:
-        module_script_targets.extend(
-            target
-            for target, _, _ in resolve_html_targets(
-                [
-                    (target, False, True)
-                    for target in document_module_script_targets
-                ],
-                effective_base,
-            )
-        )
-    for srcdoc in srcdocs:
-        resolved_targets.extend(
             html_fragment_resource_targets(
                 srcdoc,
-                inherited_base=effective_base,
-                stylesheet_targets=stylesheet_targets,
-                embedded_document_targets=embedded_document_targets,
-                module_script_targets=module_script_targets,
+                inherited_base=srcdoc_base,
+                stylesheet_targets=document_stylesheet_targets,
+                embedded_document_targets=document_resource_targets,
+                module_script_targets=document_module_script_targets,
             )
         )
-    return resolved_targets
+    if stylesheet_targets is not None:
+        stylesheet_targets.extend(document_stylesheet_targets)
+    if embedded_document_targets is not None:
+        embedded_document_targets.extend(document_resource_targets)
+    if module_script_targets is not None:
+        module_script_targets.extend(document_module_script_targets)
+    return targets
 
 
 def url_element_fragment(fragment: str) -> str:
@@ -4794,17 +5192,28 @@ def mask_html_template_contents(text: str) -> str:
             continue
 
         attributes: dict[str, str] = {}
-        encoding_values = html_attribute_values(
-            value, frozenset({"encoding"})
-        )
+        encoding_values = html_attribute_values(value, frozenset({"encoding"}))
         if encoding_values:
             attributes["encoding"] = html_attribute_unescape(
                 encoding_values[0]
             )
+        shadow_modes = html_attribute_values(
+            value, frozenset({"shadowrootmode"})
+        )
+        if shadow_modes:
+            attributes["shadowrootmode"] = html_attribute_unescape(
+                shadow_modes[0]
+            )
         namespace = html_start_tag_namespace(
             element_stack, tag, attributes
         )
-        if tag == "template" and namespace == HTML_NAMESPACE:
+        if (
+            tag == "template"
+            and namespace == HTML_NAMESPACE
+            and not html_template_establishes_declarative_shadow_root(
+                element_stack, namespace, attributes
+            )
+        ):
             template_depth = 1
             content_start = tag_match.end()
             continue
@@ -4898,6 +5307,7 @@ def html_resource_targets(
     text: str,
     *,
     additional_style_sources: list[str] | None = None,
+    additional_module_script_sources: list[str] | None = None,
     stylesheet_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
@@ -4921,6 +5331,10 @@ def html_resource_targets(
             module_script_targets=document_module_script_targets,
         )
     )
+    for module_source in additional_module_script_sources or []:
+        for target in javascript_static_module_specifiers(module_source):
+            targets.append((target, False, True))
+            document_module_script_targets.append(target)
     targets.extend(
         (candidate, False, True)
         for value in html_attribute_values(
@@ -5332,10 +5746,16 @@ def markdown_link_targets(
     """Extract destinations and whether they require Markdown parsing or a file."""
 
     style_content_spans: list[tuple[int, int]] = []
+    module_script_content_spans: list[tuple[int, int]] = []
     rendered_text = markdown_searchable_text(
-        text, style_content_spans=style_content_spans
+        text,
+        style_content_spans=style_content_spans,
+        module_script_content_spans=module_script_content_spans,
     )
     style_contents = [text[start:end] for start, end in style_content_spans]
+    module_script_contents = [
+        text[start:end] for start, end in module_script_content_spans
+    ]
     markdown_characters = list(rendered_text)
     html_characters = list(rendered_text)
     inline_label_ends = set(markdown_label_pairs(rendered_text).values())
@@ -5462,6 +5882,7 @@ def markdown_link_targets(
         html_resource_targets(
             rendered_html_text,
             additional_style_sources=style_contents,
+            additional_module_script_sources=module_script_contents,
             stylesheet_targets=stylesheet_targets,
             embedded_document_targets=embedded_document_targets,
             module_script_targets=module_script_targets,
@@ -6148,6 +6569,7 @@ def find_broken_links(root: Path) -> list[str]:
                 raw_target in stylesheet_target_set,
                 raw_target in embedded_document_target_set,
                 raw_target in module_script_target_set,
+                path,
             )
             for raw_target, is_markdown, requires_file in link_targets
         ]
@@ -6159,6 +6581,7 @@ def find_broken_links(root: Path) -> list[str]:
             scan_stylesheet,
             scan_embedded_document,
             scan_module_script,
+            fragment_context_path,
         ) in pending_targets:
             target = raw_target.strip("\t\n\f\r ")
             if not target:
@@ -6205,12 +6628,17 @@ def find_broken_links(root: Path) -> list[str]:
                     f"{display_path(source_path)}: broken relative link {raw_target!r}"
                 )
                 continue
+            resolution_source_path = (
+                fragment_context_path
+                if html_same_document_fragment(target) is not None
+                else source_path
+            )
             try:
                 lexical_path = Path(
                     os.path.normpath(
-                        source_path.parent / path_target
+                        resolution_source_path.parent / path_target
                         if path_target
-                        else source_path
+                        else resolution_source_path
                     )
                 )
                 resolved = lexical_path.resolve()
@@ -6272,6 +6700,7 @@ def find_broken_links(root: Path) -> list[str]:
                             stylesheet_target in imported_target_set,
                             False,
                             False,
+                            fragment_context_path,
                         )
                         for stylesheet_target, stylesheet_requires_file
                         in stylesheet_references
@@ -6323,12 +6752,13 @@ def find_broken_links(root: Path) -> list[str]:
                             html_target in html_stylesheet_target_set,
                             html_target in html_document_target_set,
                             html_target in html_module_script_target_set,
+                            lexical_path,
                         )
                         for html_target, html_is_markdown, html_requires_file
                         in html_targets
                     )
             if (
-                not requires_file
+                (not requires_file or scan_embedded_document)
                 and resolved.is_file()
                 and resolved.suffix.lower() in SVG_SUFFIXES
                 and (resolved, lexical_path) not in seen_svg_documents
@@ -6337,11 +6767,19 @@ def find_broken_links(root: Path) -> list[str]:
                 svg_text = read_text_resource(resolved)
                 if svg_text is not None:
                     svg_stylesheet_targets: list[str] = []
+                    svg_document_targets: list[str] = []
+                    svg_module_script_targets: list[str] = []
                     svg_targets = svg_document_resource_targets(
                         svg_text,
                         stylesheet_targets=svg_stylesheet_targets,
+                        embedded_document_targets=svg_document_targets,
+                        module_script_targets=svg_module_script_targets,
                     )
                     svg_stylesheet_target_set = set(svg_stylesheet_targets)
+                    svg_document_target_set = set(svg_document_targets)
+                    svg_module_script_target_set = set(
+                        svg_module_script_targets
+                    )
                     pending_targets.extend(
                         (
                             lexical_path,
@@ -6349,8 +6787,9 @@ def find_broken_links(root: Path) -> list[str]:
                             svg_is_markdown,
                             svg_requires_file,
                             svg_target in svg_stylesheet_target_set,
-                            False,
-                            False,
+                            svg_target in svg_document_target_set,
+                            svg_target in svg_module_script_target_set,
+                            lexical_path,
                         )
                         for svg_target, svg_is_markdown, svg_requires_file
                         in svg_targets
@@ -6372,6 +6811,7 @@ def find_broken_links(root: Path) -> list[str]:
                             False,
                             False,
                             True,
+                            lexical_path,
                         )
                         for module_target in javascript_static_module_specifiers(
                             module_text

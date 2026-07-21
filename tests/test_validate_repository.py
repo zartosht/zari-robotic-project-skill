@@ -235,6 +235,167 @@ class LinkTests(unittest.TestCase):
 
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_scans_inline_module_script_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<script type="module">import "./missing-markdown.js";</script>\n'
+                "[html](page.html) [xhtml](page.xhtml)\n"
+                '<iframe srcdoc="<script type=\047module\047>'
+                'import &quot;./missing-srcdoc.js&quot;;</script>"></iframe>\n',
+                encoding="utf-8",
+            )
+            (root / "page.html").write_text(
+                '<script type="module">import "./missing-html.js";</script>\n',
+                encoding="utf-8",
+            )
+            (root / "page.xhtml").write_text(
+                '<html xmlns="http://www.w3.org/1999/xhtml">'
+                '<script type="module">import "./missing-xhtml.js";</script>'
+                "</html>\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(4, len(errors))
+            for target in (
+                "missing-markdown.js",
+                "missing-html.js",
+                "missing-xhtml.js",
+                "missing-srcdoc.js",
+            ):
+                self.assertTrue(any(target in error for error in errors))
+
+    def test_traverses_svg_documents_loaded_in_embedded_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<iframe src="frame.svg"></iframe>\n'
+                '<object data="object.svg"></object>\n',
+                encoding="utf-8",
+            )
+            (root / "frame.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<image href="missing-frame.png"/></svg>\n',
+                encoding="utf-8",
+            )
+            (root / "object.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<image href="missing-object.png"/></svg>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-frame.png" in error for error in errors))
+            self.assertTrue(any("missing-object.png" in error for error in errors))
+
+    def test_resolves_xhtml_resources_through_inherited_xml_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.xhtml)\n", encoding="utf-8"
+            )
+            (root / "assets" / "icons").mkdir(parents=True)
+            (root / "assets" / "icons" / "ok.png").write_bytes(b"png")
+            (root / "page.xhtml").write_text(
+                '<html xmlns="http://www.w3.org/1999/xhtml" '
+                'xml:base="assets/"><body><div xml:base="icons/">'
+                '<img src="ok.png"/></div></body></html>\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_processes_resources_inside_declarative_shadow_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.html)\n"
+                '<iframe srcdoc="<div><template shadowrootmode=\047closed\047>'
+                '<img src=\047missing-srcdoc-shadow.png\047></template></div>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            (root / "page.html").write_text(
+                '<div><template shadowrootmode="open">'
+                '<img src="missing-shadow.png">'
+                "</template></div>"
+                '<template><img src="ignored-inert.png"></template>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-shadow.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-shadow.png" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-inert.png" in error for error in errors))
+
+    def test_scans_xhtml_resources_inside_standalone_svg_foreign_object(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[diagram](diagram.svg)\n", encoding="utf-8"
+            )
+            (root / "diagram.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<foreignObject><img xmlns="http://www.w3.org/1999/xhtml" '
+                'src="missing-foreign-object.png"/></foreignObject></svg>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing-foreign-object.png", errors[0])
+
+    def test_ignores_resources_discarded_by_frameset_insertion_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[valid](valid.html) [broken](broken.html)\n", encoding="utf-8"
+            )
+            (root / "valid.html").write_text(
+                '<html><frameset><img src="ignored.png">'
+                '<frame src="existing.html"></frameset></html>\n',
+                encoding="utf-8",
+            )
+            (root / "broken.html").write_text(
+                '<html><frameset><frame src="missing-frame.html">'
+                "</frameset></html>\n",
+                encoding="utf-8",
+            )
+            (root / "existing.html").write_text("<p>ok</p>\n", encoding="utf-8")
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing-frame.html", errors[0])
+            self.assertNotIn("ignored.png", errors[0])
+
+    def test_validates_stylesheet_local_fragments_in_the_styled_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.html)\n", encoding="utf-8"
+            )
+            (root / "page.html").write_text(
+                '<link rel="stylesheet" href="theme.css">'
+                '<svg><filter id="present"></filter></svg>\n',
+                encoding="utf-8",
+            )
+            (root / "theme.css").write_text(
+                ".ok { filter: url(#present); }\n"
+                ".broken { filter: url(#missing); }\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertTrue(errors[0].startswith("theme.css:"))
+            self.assertIn("broken HTML fragment #missing", errors[0])
+            self.assertFalse(any("#present" in error for error in errors))
+
     def test_restricts_link_resources_to_the_html_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
