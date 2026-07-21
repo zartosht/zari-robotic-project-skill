@@ -1880,6 +1880,62 @@ class LinkTests(unittest.TestCase):
             )
             self.assertTrue(any("missing.svg#icon" in error for error in errors))
 
+    def test_validates_contextual_source_src_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<picture><source src="ignored-picture.png" '
+                'srcset="existing.png 1x"></picture>\n'
+                '<video><source src="missing-video.mp4"></video>\n'
+                '<audio><source src="missing-audio.mp3"></audio>\n'
+                '<iframe srcdoc="<picture><source src=\047ignored-srcdoc-picture.png\047 '
+                'srcset=\047existing.png 1x\047></picture>'
+                '<video><source src=\047missing-srcdoc-video.mp4\047></video>'
+                '<audio><source src=\047missing-srcdoc-audio.mp3\047></audio>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(4, len(errors))
+            self.assertTrue(any("missing-video.mp4" in error for error in errors))
+            self.assertTrue(any("missing-audio.mp3" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-video.mp4" in error for error in errors)
+            )
+            self.assertTrue(
+                any("missing-srcdoc-audio.mp3" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-picture.png" in error for error in errors))
+            self.assertFalse(
+                any("ignored-srcdoc-picture.png" in error for error in errors)
+            )
+
+    def test_recognizes_legacy_html_image_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<image src="missing-alias.png">\n'
+                '<image src="overridden-alias.png" srcset="existing.png 1x">\n'
+                '<svg><image src="ignored-svg.png"></image></svg>\n'
+                '<iframe srcdoc="<image src=\047missing-srcdoc-alias.png\047>'
+                '<svg><image src=\047ignored-srcdoc-svg.png\047></image></svg>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-alias.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-alias.png" in error for error in errors)
+            )
+            self.assertFalse(any("overridden-alias.png" in error for error in errors))
+            self.assertFalse(any("ignored-svg.png" in error for error in errors))
+            self.assertFalse(
+                any("ignored-srcdoc-svg.png" in error for error in errors)
+            )
+
     def test_validates_src_only_for_resource_loading_elements(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2218,6 +2274,21 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_ignores_resource_tokens_in_supports_conditions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>@supports (background: url(ignored.png)) '
+                'and (background-image: image-set("ignored-set.png" 1x)) {'
+                '.hero { background: url(missing.png); }}</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
+            self.assertFalse(any("ignored.png" in error for error in errors))
+            self.assertFalse(any("ignored-set.png" in error for error in errors))
+
     def test_rejects_fragment_only_file_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2367,6 +2438,23 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("page.html#hidden" in error for error in errors))
             self.assertTrue(any("page.html#missing" in error for error in errors))
+
+    def test_validates_fragments_in_local_svg_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "icons.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<symbol id="present"></symbol></svg>\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                '<svg><use href="icons.svg#present"></use>'
+                '<use href="icons.svg#missing"></use></svg>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("icons.svg#missing", errors[0])
 
     def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
