@@ -7,6 +7,7 @@ import argparse
 import math
 import re
 import sys
+import unicodedata
 from bisect import bisect_left
 from html import unescape as html_unescape
 from pathlib import Path
@@ -1099,7 +1100,10 @@ def markdown_bare_destination_is_balanced(destination: str) -> bool:
         if ord(character) < 0x20 or ord(character) == 0x7F:
             return False
         if character == "\\":
-            index += 2
+            escape = MARKDOWN_BACKSLASH_ESCAPE.match(destination, index)
+            if escape is None:
+                return False
+            index = escape.end()
             continue
         if character == "(":
             depth += 1
@@ -1920,7 +1924,9 @@ def github_heading_slug(
     characters = [
         character
         for character in heading
-        if character.isalnum() or character in {"-", "_"}
+        if character.isalnum()
+        or character in {"-", "_"}
+        or unicodedata.category(character).startswith("M")
     ]
     return "".join(characters)
 
@@ -2056,8 +2062,8 @@ def find_broken_links(root: Path) -> list[str]:
             if not target:
                 continue
             if is_markdown:
-                if target.startswith("<") and ">" in target:
-                    target = target[1 : target.index(">")]
+                if target.startswith("<") and target.endswith(">"):
+                    target = target[1:-1]
                 else:
                     target = target.split(maxsplit=1)[0]
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)

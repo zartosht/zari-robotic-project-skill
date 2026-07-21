@@ -152,6 +152,23 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#motordriver", errors[0])
 
+    def test_preserves_unicode_combining_marks_in_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# नमस्ते\n"
+                "[devanagari](#नमस्ते)\n"
+                "[truncated-devanagari](#नमसत)\n"
+                "# cafe\u0301\n"
+                "[decomposed](#cafe%CC%81)\n"
+                "[truncated-decomposed](#cafe)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("#नमसत" in error for error in errors))
+            self.assertTrue(any("#cafe" in error for error in errors))
+
     def test_strips_complete_inline_html_from_heading_fragments(self) -> None:
         headings = (
             "hello <!-- a > b --> world",
@@ -365,6 +382,17 @@ class LinkTests(unittest.TestCase):
             (assets / "power path.png").write_bytes(b"diagram")
             (root / "README.md").write_text(
                 "[diagram](<assets/power path.png>)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_accepts_escaped_closer_in_angle_bracketed_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = root / "docs"
+            docs.mkdir()
+            (docs / "a>b.md").write_text("guide\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide](<docs/a\\>b.md>)\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
 
@@ -593,6 +621,14 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 "[old]: missing(foo.md\n\n[guide][old]\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_reference_with_non_punctuation_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[r]: missing\\ file.md\n[x][r]\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
 
