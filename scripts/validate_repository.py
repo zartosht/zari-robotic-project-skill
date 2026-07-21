@@ -121,6 +121,18 @@ MARKDOWN_HTML_TAG = re.compile(
 MARKDOWN_HTML_TAG_OR_CLOSING = re.compile(
     rf"(?:{MARKDOWN_HTML_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\r\n]*>)"
 )
+MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS = frozenset(
+    {
+        "iframe",
+        "noembed",
+        "noframes",
+        "script",
+        "style",
+        "textarea",
+        "title",
+        "xmp",
+    }
+)
 MARKDOWN_RAW_HTML_TYPE_1 = re.compile(
     r"^[ \t]{0,3}<(?P<tag>script|pre|style|textarea)(?=[\s>]|\Z)", re.IGNORECASE
 )
@@ -295,8 +307,13 @@ def find_escaping_skill_symlinks(skill_root: Path) -> list[str]:
 
     errors: list[str] = []
     for path in sorted(entry for entry in entries if entry.is_symlink()):
+        relative = path.relative_to(skill_root.parent)
+        try:
+            target = path.readlink()
+        except OSError:
+            errors.append(f"{relative}: symlink target cannot be read")
+            continue
         if not path.exists():
-            relative = path.relative_to(skill_root.parent)
             errors.append(f"{relative}: symlink target does not exist")
             continue
         try:
@@ -304,10 +321,11 @@ def find_escaping_skill_symlinks(skill_root: Path) -> list[str]:
         except (OSError, RuntimeError):
             resolves_within_skill = False
         if not resolves_within_skill:
-            relative = path.relative_to(skill_root.parent)
             errors.append(
                 f"{relative}: symlink resolves outside distributable skill directory"
             )
+        elif target.is_absolute():
+            errors.append(f"{relative}: symlink target is absolute and not portable")
     return errors
 
 
@@ -590,8 +608,49 @@ def mask_markdown_raw_html_blocks(
                 characters[position] = " "
 
     def mask_except_html_tags(start: int, end: int) -> None:
+        special_spans: list[tuple[int, int]] = []
         cursor = start
+        while cursor < end:
+            special_start = text.find("<", cursor, end)
+            if special_start < 0:
+                break
+            if text.startswith("<!--", special_start):
+                opener_length, closer = 4, "-->"
+            elif text.startswith("<?", special_start):
+                opener_length, closer = 2, "?>"
+            elif text.startswith("<![CDATA[", special_start):
+                opener_length = 9
+                closer = "]]>"
+            elif (
+                special_start + 2 < end
+                and text.startswith("<!", special_start)
+                and "A" <= text[special_start + 2] <= "Z"
+            ):
+                opener_length, closer = 3, ">"
+            else:
+                cursor = special_start + 1
+                continue
+            special_end = text.find(closer, special_start + opener_length, end)
+            if special_end < 0:
+                cursor = special_start + opener_length
+                continue
+            special_end += len(closer)
+            special_spans.append((special_start, special_end))
+            cursor = special_end
+
+        cursor = start
+        span_index = 0
         for tag in MARKDOWN_HTML_TAG_OR_CLOSING.finditer(text, start, end):
+            while (
+                span_index < len(special_spans)
+                and special_spans[span_index][1] <= tag.start()
+            ):
+                span_index += 1
+            if (
+                span_index < len(special_spans)
+                and special_spans[span_index][0] <= tag.start()
+            ):
+                continue
             mask(cursor, tag.start())
             cursor = tag.end()
         mask(cursor, end)
@@ -694,8 +753,25 @@ def mask_markdown_raw_html_blocks(
                     text, tag_start, raw_container_end
                 )
                 body_start = opening_tag.end() if opening_tag else content_start
-                blank_block_start = body_start
-                blank_block_end = raw_container_end
+                opening_name = (
+                    re.match(r"<([A-Za-z][A-Za-z0-9-]*)", opening_tag.group(0))
+                    if opening_tag
+                    else None
+                )
+                tag_name = opening_name.group(1).casefold() if opening_name else None
+                if tag_name in MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS:
+                    closing = re.compile(
+                        rf"</{re.escape(tag_name)}[ \t]*>", re.IGNORECASE
+                    )
+                    closing_match = closing.search(text, body_start, raw_container_end)
+                    raw_end = (
+                        closing_match.end() if closing_match else raw_container_end
+                    )
+                    skip_until = line_end_after(raw_end, raw_container_end)
+                    mask(body_start, skip_until)
+                else:
+                    blank_block_start = body_start
+                    blank_block_end = raw_container_end
                 open_paragraph_containers = None
             elif not content.strip():
                 open_paragraph_containers = None
@@ -932,10 +1008,29 @@ def markdown_paragraph_end(text: str, start: int) -> int:
     return len(text) if boundary is None else boundary.start()
 
 
-def markdown_html_tag_is_rendered(text: str, tag: re.Match[str]) -> bool:
+def markdown_paragraph_boundaries(text: str) -> tuple[int, ...]:
+    """Index blank-line boundaries once for repeated inline HTML scans."""
+
+    return tuple(match.start() for match in MARKDOWN_PARAGRAPH_BOUNDARY.finditer(text))
+
+
+def markdown_html_tag_is_rendered(
+    text: str,
+    tag: re.Match[str],
+    paragraph_boundaries: tuple[int, ...] | None = None,
+) -> bool:
     """Return whether an HTML tag is inline or a type-1 raw-block opener."""
 
-    if tag.end() <= markdown_paragraph_end(text, tag.start()):
+    if paragraph_boundaries is None:
+        paragraph_end = markdown_paragraph_end(text, tag.start())
+    else:
+        boundary_index = bisect_left(paragraph_boundaries, tag.start())
+        paragraph_end = (
+            len(text)
+            if boundary_index >= len(paragraph_boundaries)
+            else paragraph_boundaries[boundary_index]
+        )
+    if tag.end() <= paragraph_end:
         return True
 
     line_start = max(
@@ -1425,8 +1520,9 @@ def html_attribute_values(
     """Collect top-level HTML attribute values without scanning quoted values."""
 
     values: list[str] = []
+    paragraph_boundaries = markdown_paragraph_boundaries(text)
     for tag_match in MARKDOWN_HTML_TAG.finditer(text):
-        if not markdown_html_tag_is_rendered(text, tag_match):
+        if not markdown_html_tag_is_rendered(text, tag_match, paragraph_boundaries):
             continue
         tag = tag_match.group(0)
         index = 1
@@ -1889,8 +1985,11 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     markdown_characters = list(rendered_text)
     html_characters = list(rendered_text)
     inline_label_ends = set(markdown_label_pairs(rendered_text).values())
+    paragraph_boundaries = markdown_paragraph_boundaries(rendered_text)
     for tag in MARKDOWN_HTML_TAG.finditer(rendered_text):
-        if not markdown_html_tag_is_rendered(rendered_text, tag):
+        if not markdown_html_tag_is_rendered(
+            rendered_text, tag, paragraph_boundaries
+        ):
             continue
         opening = tag.start() - 1
         if (
@@ -2296,8 +2395,13 @@ def markdown_heading_fragments(text: str) -> set[str]:
     searchable_text = markdown_searchable_text(text)
     structure_text_with_tags = markdown_searchable_text(text, mask_inline_code=False)
     structure_characters = list(structure_text_with_tags)
+    structure_paragraph_boundaries = markdown_paragraph_boundaries(
+        structure_text_with_tags
+    )
     for tag in MARKDOWN_HTML_TAG.finditer(structure_text_with_tags):
-        if not markdown_html_tag_is_rendered(structure_text_with_tags, tag):
+        if not markdown_html_tag_is_rendered(
+            structure_text_with_tags, tag, structure_paragraph_boundaries
+        ):
             continue
         for position in range(*tag.span()):
             if structure_characters[position] not in "\r\n":
@@ -2312,8 +2416,11 @@ def markdown_heading_fragments(text: str) -> set[str]:
         for definition in reference_definitions
     )
     footnote_characters = list(searchable_text)
+    footnote_paragraph_boundaries = markdown_paragraph_boundaries(searchable_text)
     for tag in MARKDOWN_HTML_TAG.finditer(searchable_text):
-        if not markdown_html_tag_is_rendered(searchable_text, tag):
+        if not markdown_html_tag_is_rendered(
+            searchable_text, tag, footnote_paragraph_boundaries
+        ):
             continue
         for position in range(*tag.span()):
             if footnote_characters[position] not in "\r\n":
@@ -2460,6 +2567,16 @@ def find_broken_links(root: Path) -> list[str]:
                     target = target.split(maxsplit=1)[0]
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)
             target = markdown_unescape(target) if is_markdown else target
+            if not is_markdown:
+                suffix_positions = [
+                    position
+                    for separator in ("?", "#")
+                    if (position := target.find(separator)) >= 0
+                ]
+                path_end = min(suffix_positions, default=len(target))
+                target = (
+                    target[:path_end].replace("\\", "/") + target[path_end:]
+                )
             if not target or target.startswith("/") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)

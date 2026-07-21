@@ -1644,6 +1644,37 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_normalizes_backslashes_in_raw_html_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = root / "docs"
+            assets = root / "assets"
+            docs.mkdir()
+            assets.mkdir()
+            (docs / "guide.md").write_text("guide\n", encoding="utf-8")
+            (assets / "image.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<a href="docs\\guide.md">guide</a>\n'
+                '<img src="assets\\image.png">\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_caches_paragraph_boundaries_while_scanning_html_tags(self) -> None:
+        text = " ".join('<a href="README.md">guide</a>' for _ in range(500))
+        with mock.patch.object(
+            validator,
+            "markdown_paragraph_end",
+            wraps=validator.markdown_paragraph_end,
+        ) as paragraph_end:
+            values = validator.html_attribute_values(
+                text,
+                validator.MARKDOWN_HTML_HREF_ATTRIBUTES,
+                tag_names=validator.MARKDOWN_HTML_HREF_TAGS,
+            )
+        self.assertEqual(500, len(values))
+        self.assertLess(paragraph_end.call_count, 10)
+
     def test_validates_local_html_object_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1681,6 +1712,26 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
+
+    def test_ignores_resource_tags_inside_raw_html_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div>\n<!-- <img src="missing.png"> -->\n</div>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_ignores_markup_inside_html_raw_text_element_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for tag_name in ("iframe", "noembed", "noframes", "title", "xmp"):
+                with self.subTest(tag_name=tag_name):
+                    (root / "README.md").write_text(
+                        f'<{tag_name}>\n<img src="missing.png">\n</{tag_name}>\n',
+                        encoding="utf-8",
+                    )
+                    self.assertEqual([], validator.find_broken_links(root))
 
     def test_ignores_html_resources_inside_image_description(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2321,6 +2372,22 @@ class RepositoryTests(unittest.TestCase):
                 "build-robot-project/optional.txt: symlink resolves outside "
                 "distributable skill directory",
                 errors,
+            )
+
+    def test_rejects_absolute_symlink_target_inside_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill_root = root / "build-robot-project"
+            skill_root.mkdir()
+            target = skill_root / "target.txt"
+            target.write_text("target\n", encoding="utf-8")
+            (skill_root / "absolute.txt").symlink_to(target.resolve())
+            self.assertEqual(
+                [
+                    "build-robot-project/absolute.txt: symlink target is absolute "
+                    "and not portable"
+                ],
+                validator.find_escaping_skill_symlinks(skill_root),
             )
 
     def test_rejects_dangling_optional_skill_resource_symlink(self) -> None:
