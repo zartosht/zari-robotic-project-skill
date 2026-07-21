@@ -1978,6 +1978,34 @@ class LinkTests(unittest.TestCase):
                 any("ignored-srcdoc-svg.png" in error for error in errors)
             )
 
+    def test_recognizes_html_image_alias_at_svg_integration_points(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><foreignObject><image src="missing-foreign-object.png">'
+                '</foreignObject><image src="ignored-svg.png"></image></svg>\n'
+                '<iframe srcdoc="<svg><foreignObject><image '
+                'src=\047missing-srcdoc-foreign-object.png\047>'
+                '</foreignObject><image src=\047ignored-srcdoc-svg.png\047>'
+                '</image></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                any("missing-foreign-object.png" in error for error in errors)
+            )
+            self.assertTrue(
+                any(
+                    "missing-srcdoc-foreign-object.png" in error
+                    for error in errors
+                )
+            )
+            self.assertFalse(any("ignored-svg.png" in error for error in errors))
+            self.assertFalse(
+                any("ignored-srcdoc-svg.png" in error for error in errors)
+            )
+
     def test_validates_src_only_for_resource_loading_elements(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2009,6 +2037,29 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("missing-module.js" in error for error in errors))
             self.assertTrue(any("missing-srcdoc.js" in error for error in errors))
+
+    def test_uses_legacy_script_language_to_decide_src_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<script language="json" src="ignored-data.json"></script>\n'
+                '<script language="javascript" src="missing-script.js"></script>\n'
+                '<iframe srcdoc="<script language=\047json\047 '
+                'src=\047ignored-srcdoc-data.json\047></script>'
+                '<script language=\047javascript\047 '
+                'src=\047missing-srcdoc-script.js\047></script>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-script.js" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-script.js" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-data.json" in error for error in errors))
+            self.assertFalse(
+                any("ignored-srcdoc-data.json" in error for error in errors)
+            )
 
     def test_preserves_resource_tags_inside_pre_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2052,6 +2103,23 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("live.png", errors[0])
+
+    def test_preserves_foreign_namespace_template_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text(
+                '<svg><template><g id="svg-page"></g></template></svg>'
+                '<math><template><mrow id="math-page"></mrow></template></math>\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                '<svg><template><g id="svg-local"></g></template></svg>\n'
+                '<math><template><mrow id="math-local"></mrow></template></math>\n\n'
+                '[svg-local](#svg-local) [math-local](#math-local) '
+                '[svg-page](page.html#svg-page) [math-page](page.html#math-page)\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_excludes_inert_template_ids_from_fragment_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2230,6 +2298,24 @@ class LinkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_validates_fragment_only_srcdoc_urls_in_the_nested_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div id="host-only"></div>\n'
+                '<iframe srcdoc="<svg><filter id=\047blur\047></filter></svg>'
+                '<div style=\047filter:url(#blur)\047></div>'
+                '<a href=\047#missing\047>missing</a>'
+                '<a href=\047#host-only\047>host only</a>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("#missing" in error for error in errors))
+            self.assertTrue(any("#host-only" in error for error in errors))
+            self.assertFalse(any("#blur" in error for error in errors))
 
     def test_validates_inline_style_attribute_resource_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2421,6 +2507,42 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_consumes_complete_hexadecimal_escapes_in_css_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>.outer { background: url(missing\\2e png); }</style>\n'
+                '<iframe srcdoc="<style>.nested { background: '
+                'url(missing-srcdoc\\2e png); }</style>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc.png" in error for error in errors)
+            )
+
+    def test_ignores_non_css_style_element_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style type="text/plain">a{background:url(ignored.png)}</style>\n'
+                '<style type="text/css">a{background:url(missing.png)}</style>\n'
+                '<iframe srcdoc="<style type=\047text/plain\047>'
+                'a{background:url(ignored-srcdoc.png)}</style>'
+                '<style>a{background:url(missing-srcdoc.png)}</style>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertTrue(any("missing-srcdoc.png" in error for error in errors))
+            self.assertFalse(any("ignored.png" in error for error in errors))
+            self.assertFalse(
+                any("ignored-srcdoc.png" in error for error in errors)
+            )
+
     def test_applies_first_document_base_to_raw_html_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2482,6 +2604,23 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("docs/missing.md", errors[0])
 
+    def test_stops_quoted_meta_refresh_targets_at_the_closing_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.html").write_text("existing\n", encoding="utf-8")
+            (root / "existing-srcdoc.html").write_text(
+                "existing\n", encoding="utf-8"
+            )
+            (root / "README.md").write_text(
+                '<meta http-equiv="refresh" '
+                'content="0;url=\047existing.html\047;ignored">\n'
+                '<iframe srcdoc="<meta http-equiv=\047refresh\047 '
+                'content=\0470;url=&quot;existing-srcdoc.html&quot;;ignored\047>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_form_submission_destinations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2521,6 +2660,22 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("page.html#hidden" in error for error in errors))
             self.assertTrue(any("page.html#missing" in error for error in errors))
+
+    def test_recognizes_text_fragment_directives_before_id_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text(
+                '<div id="present">Hello world</div>\n', encoding="utf-8"
+            )
+            (root / "README.md").write_text(
+                "[text](page.html#:~:text=Hello%20world) "
+                "[anchored](page.html#present:~:text=Hello) "
+                "[missing](page.html#missing:~:text=Hello)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("page.html#missing:~:text=Hello", errors[0])
 
     def test_excludes_ids_on_elements_ignored_inside_selects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

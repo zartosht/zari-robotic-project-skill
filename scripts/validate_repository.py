@@ -250,6 +250,11 @@ HTML_SELECT_ALLOWED_START_TAGS = frozenset(
 )
 HTML_SELECT_BREAKOUT_START_TAGS = frozenset({"input", "keygen", "textarea"})
 MARKDOWN_HTML_SUBMIT_INPUT_TYPES = frozenset({"image", "submit"})
+HTML_NAMESPACE = "html"
+SVG_NAMESPACE = "svg"
+MATHML_NAMESPACE = "mathml"
+SVG_HTML_INTEGRATION_POINTS = frozenset({"desc", "foreignobject", "title"})
+MATHML_TEXT_INTEGRATION_POINTS = frozenset({"mi", "mn", "mo", "ms", "mtext"})
 HTML_JAVASCRIPT_MIME_TYPE_ESSENCES = frozenset(
     {
         "application/ecmascript",
@@ -937,12 +942,22 @@ def mask_markdown_raw_html_blocks(
             )
             raw_end = closing_match.end() if closing_match else raw_container_end
             if style_content_spans is not None and tag_name == "style" and opening_tag:
-                style_content_spans.append(
-                    (
-                        opening_tag.end(),
-                        closing_match.start() if closing_match else raw_container_end,
-                    )
+                style_types = html_attribute_values(
+                    opening_tag.group(0),
+                    frozenset({"type"}),
+                    tag_names=frozenset({"style"}),
                 )
+                if not style_types or html_style_type_uses_css(
+                    html_attribute_unescape(style_types[0])
+                ):
+                    style_content_spans.append(
+                        (
+                            opening_tag.end(),
+                            closing_match.start()
+                            if closing_match
+                            else raw_container_end,
+                        )
+                    )
             skip_until = line_end_after(raw_end, raw_container_end)
             if opening_tag is None:
                 mask(content_start, skip_until)
@@ -2112,6 +2127,26 @@ def html_script_type_uses_src(value: str) -> bool:
     return essence in HTML_JAVASCRIPT_MIME_TYPE_ESSENCES
 
 
+def html_script_attributes_use_src(attributes: dict[str, str]) -> bool:
+    """Return whether decoded script attributes select an executable type."""
+
+    if "type" in attributes:
+        return html_script_type_uses_src(attributes["type"])
+    language = attributes.get("language", "").strip("\t\n\f\r ")
+    if language:
+        return html_script_type_uses_src(f"text/{language}")
+    return True
+
+
+def html_style_type_uses_css(value: str) -> bool:
+    """Return whether a decoded style type selects CSS."""
+
+    normalized = value.strip("\t\n\f\r ").casefold()
+    if not normalized:
+        return True
+    return normalized.split(";", 1)[0].rstrip("\t\n\f\r ") == "text/css"
+
+
 def html_raw_src_is_ignored(
     tag_name: str, attributes: dict[str, str]
 ) -> bool:
@@ -2125,9 +2160,13 @@ def html_raw_src_is_ignored(
         )
     ):
         return True
-    return tag_name == "script" and not html_script_type_uses_src(
-        html_attribute_unescape(attributes.get("type", ""))
-    )
+    if tag_name != "script":
+        return False
+    decoded_attributes = {
+        name: html_attribute_unescape(value)
+        for name, value in attributes.items()
+    }
+    return not html_script_attributes_use_src(decoded_attributes)
 
 
 def css_escape_value(text: str, start: int) -> tuple[str, int] | None:
@@ -2603,7 +2642,10 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                     if text[value_end] in {'"', "'", "("}:
                         break
                     if text[value_end] == "\\" and value_end + 1 < len(text):
-                        value_end += 2
+                        escape = css_escape_value(text, value_end)
+                        if escape is None:
+                            break
+                        _, value_end = escape
                         continue
                     if text[value_end] in HTML_ASCII_WHITESPACE:
                         whitespace_end = value_end + 1
@@ -2673,8 +2715,14 @@ def html_meta_refresh_target(content: str) -> str | None:
         if target.startswith("="):
             target = target[1:].lstrip("\t\n\f\r ")
     target = target.strip("\t\n\f\r ")
-    if len(target) >= 2 and target[0] == target[-1] and target[0] in {'"', "'"}:
-        target = target[1:-1]
+    if target.startswith(('"', "'")):
+        quote_character = target[0]
+        closing_quote = target.find(quote_character, 1)
+        target = (
+            target[1:closing_quote]
+            if closing_quote >= 0
+            else target[1:]
+        )
     return target or None
 
 
@@ -2682,6 +2730,93 @@ def html_slash_closes_context(tag: str, *, inside_foreign: bool) -> bool:
     """Return whether HTML parsing honors a start tag's self-closing flag."""
 
     return inside_foreign or tag in {"math", "svg"} or tag in HTML_VOID_TAGS
+
+
+def html_start_tag_namespace(
+    element_stack: list[tuple[str, str, dict[str, str]]],
+    tag: str,
+    attributes: dict[str, str],
+) -> str:
+    """Return the namespace assigned by the HTML tree builder to a start tag."""
+
+    if not element_stack:
+        parent_namespace = HTML_NAMESPACE
+        parent_tag = ""
+        parent_attributes: dict[str, str] = {}
+    else:
+        parent_tag, parent_namespace, parent_attributes = element_stack[-1]
+
+    enters_html = (
+        parent_namespace == SVG_NAMESPACE
+        and parent_tag in SVG_HTML_INTEGRATION_POINTS
+    ) or (
+        parent_namespace == MATHML_NAMESPACE
+        and (
+            (
+                parent_tag in MATHML_TEXT_INTEGRATION_POINTS
+                and tag not in {"malignmark", "mglyph"}
+            )
+            or (
+                parent_tag == "annotation-xml"
+                and parent_attributes.get("encoding", "").strip().casefold()
+                in {"application/xhtml+xml", "text/html"}
+            )
+        )
+    )
+    if parent_namespace == HTML_NAMESPACE or enters_html:
+        if tag == "svg":
+            return SVG_NAMESPACE
+        if tag == "math":
+            return MATHML_NAMESPACE
+        return HTML_NAMESPACE
+    if parent_namespace == MATHML_NAMESPACE and tag == "svg":
+        return SVG_NAMESPACE
+    return parent_namespace
+
+
+def html_canonical_tag_name(tag: str, namespace: str) -> str:
+    """Apply HTML tree-builder tag aliases used by resource semantics."""
+
+    if namespace == HTML_NAMESPACE and tag == "image":
+        return "img"
+    return tag
+
+
+def html_push_element_context(
+    element_stack: list[tuple[str, str, dict[str, str]]],
+    tag: str,
+    namespace: str,
+    attributes: dict[str, str],
+) -> None:
+    """Push a non-void element onto a lightweight namespace stack."""
+
+    canonical_tag = html_canonical_tag_name(tag, namespace)
+    if namespace == HTML_NAMESPACE and canonical_tag in HTML_VOID_TAGS:
+        return
+    element_stack.append((tag, namespace, attributes))
+
+
+def html_pop_element_context(
+    element_stack: list[tuple[str, str, dict[str, str]]], tag: str
+) -> None:
+    """Pop through the most recent matching element context."""
+
+    for index in range(len(element_stack) - 1, -1, -1):
+        if element_stack[index][0] == tag:
+            del element_stack[index:]
+            return
+
+
+def html_has_ancestor(
+    element_stack: list[tuple[str, str, dict[str, str]]],
+    tags: frozenset[str],
+) -> bool:
+    """Return whether an HTML-namespace ancestor has one of the given tags."""
+
+    return any(
+        namespace == HTML_NAMESPACE and tag in tags
+        for tag, namespace, _ in element_stack
+    )
 
 
 class HTMLContextResourceParser(HTMLParser):
@@ -2694,36 +2829,48 @@ class HTMLContextResourceParser(HTMLParser):
         self.targets: list[tuple[str, bool, bool]] = []
         self.base_hrefs: list[str] = []
         self.template_depth = 0
-        self.svg_depth = 0
-        self.math_depth = 0
-        self.picture_depth = 0
-        self.media_depth = 0
+        self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         tag = tag.casefold()
-        if tag == "template":
-            self.template_depth += 1
-            return
         if self.template_depth:
+            if tag == "template":
+                self.template_depth += 1
             return
 
         values: dict[str, str] = {}
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
 
-        inside_foreign = bool(self.svg_depth or self.math_depth)
-        if tag == "base" and "href" in values and not inside_foreign:
+        namespace = html_start_tag_namespace(self.element_stack, tag, values)
+        canonical_tag = html_canonical_tag_name(tag, namespace)
+        if tag == "template" and namespace == HTML_NAMESPACE:
+            self.template_depth = 1
+            return
+        picture_ancestor = html_has_ancestor(
+            self.element_stack, frozenset({"picture"})
+        )
+        media_ancestor = html_has_ancestor(
+            self.element_stack, frozenset({"audio", "video"})
+        )
+        if tag == "base" and "href" in values and namespace == HTML_NAMESPACE:
             self.base_hrefs.append(values["href"])
         if (
-            tag == "source"
+            canonical_tag == "source"
+            and namespace == HTML_NAMESPACE
             and "src" in values
-            and self.media_depth
-            and not self.picture_depth
+            and media_ancestor
+            and not picture_ancestor
         ):
             self.targets.append((values["src"], False, True))
-        if tag == "source" and "srcset" in values and self.picture_depth:
+        if (
+            canonical_tag == "source"
+            and namespace == HTML_NAMESPACE
+            and "srcset" in values
+            and picture_ancestor
+        ):
             self.targets.extend(
                 (candidate, False, True)
                 for candidate in html_srcset_candidates(values["srcset"])
@@ -2731,30 +2878,28 @@ class HTMLContextResourceParser(HTMLParser):
         if (
             tag == "image"
             and "src" in values
-            and not inside_foreign
+            and namespace == HTML_NAMESPACE
             and not (
                 "srcset" in values
                 and html_srcset_overrides_src(values["srcset"])
             )
         ):
             self.targets.append((values["src"], False, True))
-
-        if tag == "svg":
-            self.svg_depth += 1
-        elif tag == "math":
-            self.math_depth += 1
-        elif tag == "picture":
-            self.picture_depth += 1
-        elif tag in {"audio", "video"}:
-            self.media_depth += 1
+        html_push_element_context(self.element_stack, tag, namespace, values)
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         tag = tag.casefold()
-        inside_foreign = bool(self.svg_depth or self.math_depth)
+        values = {
+            name.casefold(): value or "" for name, value in attributes
+        }
+        namespace = html_start_tag_namespace(self.element_stack, tag, values)
         self.handle_starttag(tag, attributes)
-        if html_slash_closes_context(tag, inside_foreign=inside_foreign):
+        if html_slash_closes_context(
+            html_canonical_tag_name(tag, namespace),
+            inside_foreign=namespace != HTML_NAMESPACE,
+        ):
             self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
@@ -2764,14 +2909,7 @@ class HTMLContextResourceParser(HTMLParser):
             return
         if self.template_depth:
             return
-        if tag == "svg" and self.svg_depth:
-            self.svg_depth -= 1
-        elif tag == "math" and self.math_depth:
-            self.math_depth -= 1
-        elif tag == "picture" and self.picture_depth:
-            self.picture_depth -= 1
-        elif tag in {"audio", "video"} and self.media_depth:
-            self.media_depth -= 1
+        html_pop_element_context(self.element_stack, tag)
 
 
 def html_context_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
@@ -2804,10 +2942,7 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.base_href: str | None = None
         self.style_content: list[str] | None = None
         self.template_depth = 0
-        self.svg_depth = 0
-        self.math_depth = 0
-        self.picture_depth = 0
-        self.media_depth = 0
+        self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
@@ -2817,25 +2952,26 @@ class HTMLFragmentResourceParser(HTMLParser):
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
 
-        if tag == "template":
-            self.template_depth += 1
-            return
         if self.template_depth:
+            if tag == "template":
+                self.template_depth += 1
             return
-        inside_foreign = bool(self.svg_depth or self.math_depth)
-        if tag == "svg":
-            self.svg_depth += 1
-        elif tag == "math":
-            self.math_depth += 1
-        elif tag == "picture":
-            self.picture_depth += 1
-        elif tag in {"audio", "video"}:
-            self.media_depth += 1
+        namespace = html_start_tag_namespace(self.element_stack, tag, values)
+        canonical_tag = html_canonical_tag_name(tag, namespace)
+        if tag == "template" and namespace == HTML_NAMESPACE:
+            self.template_depth = 1
+            return
+        picture_ancestor = html_has_ancestor(
+            self.element_stack, frozenset({"picture"})
+        )
+        media_ancestor = html_has_ancestor(
+            self.element_stack, frozenset({"audio", "video"})
+        )
         if (
             tag == "base"
             and self.base_href is None
             and "href" in values
-            and not inside_foreign
+            and namespace == HTML_NAMESPACE
         ):
             try:
                 urlsplit(values["href"])
@@ -2898,35 +3034,27 @@ class HTMLFragmentResourceParser(HTMLParser):
         ):
             self.targets.append((values["formaction"], False, False))
         if (
-            tag in MARKDOWN_HTML_SRC_TAGS
+            canonical_tag in MARKDOWN_HTML_SRC_TAGS
+            and namespace == HTML_NAMESPACE
             and "src" in values
-            and not (tag == "iframe" and "srcdoc" in values)
+            and not (canonical_tag == "iframe" and "srcdoc" in values)
             and not (
-                tag == "img"
+                canonical_tag == "img"
                 and "srcset" in values
                 and html_srcset_overrides_src(values["srcset"])
             )
             and not (
-                tag == "script"
-                and not html_script_type_uses_src(values.get("type", ""))
+                canonical_tag == "script"
+                and not html_script_attributes_use_src(values)
             )
         ):
             self.targets.append((values["src"], False, True))
         if (
-            tag == "source"
+            canonical_tag == "source"
+            and namespace == HTML_NAMESPACE
             and "src" in values
-            and self.media_depth
-            and not self.picture_depth
-        ):
-            self.targets.append((values["src"], False, True))
-        if (
-            tag == "image"
-            and "src" in values
-            and not inside_foreign
-            and not (
-                "srcset" in values
-                and html_srcset_overrides_src(values["srcset"])
-            )
+            and media_ancestor
+            and not picture_ancestor
         ):
             self.targets.append((values["src"], False, True))
         if (
@@ -2939,17 +3067,30 @@ class HTMLFragmentResourceParser(HTMLParser):
             self.targets.append((values["data"], False, True))
         if tag in MARKDOWN_HTML_POSTER_TAGS and "poster" in values:
             self.targets.append((values["poster"], False, True))
-        if tag in MARKDOWN_HTML_SRCSET_TAGS and "srcset" in values:
+        if (
+            canonical_tag in MARKDOWN_HTML_SRCSET_TAGS
+            and namespace == HTML_NAMESPACE
+            and "srcset" in values
+        ):
             self.targets.extend(
                 (candidate, False, True)
                 for candidate in html_srcset_candidates(values["srcset"])
             )
-        if tag == "source" and "srcset" in values and self.picture_depth:
+        if (
+            canonical_tag == "source"
+            and namespace == HTML_NAMESPACE
+            and "srcset" in values
+            and picture_ancestor
+        ):
             self.targets.extend(
                 (candidate, False, True)
                 for candidate in html_srcset_candidates(values["srcset"])
             )
-        if tag in MARKDOWN_HTML_SRCDOC_TAGS and "srcdoc" in values:
+        if (
+            canonical_tag in MARKDOWN_HTML_SRCDOC_TAGS
+            and namespace == HTML_NAMESPACE
+            and "srcdoc" in values
+        ):
             self.srcdocs.append(values["srcdoc"])
         if "style" in values:
             self.targets.extend(
@@ -2959,23 +3100,31 @@ class HTMLFragmentResourceParser(HTMLParser):
                 )
             )
         if (
-            tag in MARKDOWN_HTML_META_TAGS
+            canonical_tag in MARKDOWN_HTML_META_TAGS
+            and namespace == HTML_NAMESPACE
             and values.get("http-equiv", "").strip().casefold() == "refresh"
             and "content" in values
         ):
             refresh_target = html_meta_refresh_target(values["content"])
             if refresh_target is not None:
                 self.targets.append((refresh_target, False, False))
-        if tag == "style":
+        if tag == "style" and html_style_type_uses_css(values.get("type", "")):
             self.style_content = []
+        html_push_element_context(self.element_stack, tag, namespace, values)
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         tag = tag.casefold()
-        inside_foreign = bool(self.svg_depth or self.math_depth)
+        values = {
+            name.casefold(): value or "" for name, value in attributes
+        }
+        namespace = html_start_tag_namespace(self.element_stack, tag, values)
         self.handle_starttag(tag, attributes)
-        if html_slash_closes_context(tag, inside_foreign=inside_foreign):
+        if html_slash_closes_context(
+            html_canonical_tag_name(tag, namespace),
+            inside_foreign=namespace != HTML_NAMESPACE,
+        ):
             self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
@@ -2989,14 +3138,6 @@ class HTMLFragmentResourceParser(HTMLParser):
             return
         if self.template_depth:
             return
-        if tag == "svg" and self.svg_depth:
-            self.svg_depth -= 1
-        elif tag == "math" and self.math_depth:
-            self.math_depth -= 1
-        elif tag == "picture" and self.picture_depth:
-            self.picture_depth -= 1
-        elif tag in {"audio", "video"} and self.media_depth:
-            self.media_depth -= 1
         if tag == "style" and self.style_content is not None:
             self.targets.extend(
                 (target, False, requires_file)
@@ -3005,6 +3146,7 @@ class HTMLFragmentResourceParser(HTMLParser):
                 )
             )
             self.style_content = None
+        html_pop_element_context(self.element_stack, tag)
 
     def finish(self) -> None:
         self.close()
@@ -3026,6 +3168,7 @@ class HTMLDocumentFragmentParser(HTMLParser):
         self.fragments: set[str] = set()
         self.template_depth = 0
         self.in_select = False
+        self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
@@ -3046,26 +3189,44 @@ class HTMLDocumentFragmentParser(HTMLParser):
         values: dict[str, str] = {}
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
+        namespace = html_start_tag_namespace(self.element_stack, tag, values)
         if "id" in values:
             self.fragments.add(values["id"])
-        if tag == "a" and "name" in values:
+        if tag == "a" and namespace == HTML_NAMESPACE and "name" in values:
             self.fragments.add(values["name"])
-        if tag == "template":
+        if tag == "template" and namespace == HTML_NAMESPACE:
             self.template_depth += 1
-        elif tag == "select":
+            return
+        if tag == "select" and namespace == HTML_NAMESPACE:
             self.in_select = True
+        html_push_element_context(self.element_stack, tag, namespace, values)
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
+        tag = tag.casefold()
+        values = {
+            name.casefold(): value or "" for name, value in attributes
+        }
+        namespace = html_start_tag_namespace(self.element_stack, tag, values)
         self.handle_starttag(tag, attributes)
+        if html_slash_closes_context(
+            html_canonical_tag_name(tag, namespace),
+            inside_foreign=namespace != HTML_NAMESPACE,
+        ):
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.casefold()
         if tag == "template" and self.template_depth:
             self.template_depth -= 1
-        elif tag == "select":
-            self.in_select = False
+            return
+        if self.template_depth:
+            return
+        html_pop_element_context(self.element_stack, tag)
+        self.in_select = html_has_ancestor(
+            self.element_stack, frozenset({"select"})
+        )
 
 
 def html_document_fragments(text: str) -> set[str]:
@@ -3089,6 +3250,30 @@ def svg_document_fragments(text: str) -> set[str]:
         for element in root.iter()
         if (identifier := element.attrib.get("id")) is not None
     }
+
+
+def url_element_fragment(fragment: str) -> str:
+    """Return the element-ID portion before any text-fragment directive."""
+
+    return fragment.split(":~:", 1)[0]
+
+
+def html_same_document_fragment(target: str) -> str | None:
+    """Return a decoded fragment for a fragment-only URL."""
+
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.path
+        or parsed.query
+        or not parsed.fragment
+    ):
+        return None
+    return unquote(parsed.fragment)
 
 
 def html_fragment_resource_targets(
@@ -3121,6 +3306,8 @@ def html_fragment_resource_targets(
                 effective_base = parent_base
 
         for target, is_markdown, requires_file in parser.targets:
+            if html_same_document_fragment(target) is not None:
+                continue
             try:
                 resolved_target = urljoin(
                     html_url_for_resolution(effective_base),
@@ -3135,28 +3322,95 @@ def html_fragment_resource_targets(
     return targets
 
 
+def html_srcdoc_fragment_errors(text: str) -> list[str]:
+    """Return missing same-document fragments from nested srcdoc documents."""
+
+    searchable_text = mask_html_template_contents(text)
+    pending_documents = [
+        html_attribute_unescape(srcdoc)
+        for srcdoc in html_attribute_values(
+            searchable_text,
+            MARKDOWN_HTML_SRCDOC_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_SRCDOC_TAGS,
+        )
+    ]
+    seen_documents: set[str] = set()
+    missing_fragments: list[str] = []
+    while pending_documents:
+        document = pending_documents.pop()
+        if document in seen_documents:
+            continue
+        seen_documents.add(document)
+
+        parser = HTMLFragmentResourceParser()
+        parser.feed(document)
+        parser.finish()
+        fragments = html_document_fragments(document)
+        for target, _, _ in parser.targets:
+            fragment = html_same_document_fragment(target)
+            if fragment is None:
+                continue
+            element_fragment = url_element_fragment(fragment)
+            if element_fragment and element_fragment not in fragments:
+                missing_fragments.append(target)
+        pending_documents.extend(reversed(parser.srcdocs))
+    return missing_fragments
+
+
 def mask_html_template_contents(text: str) -> str:
     """Mask inert template bodies while preserving their surrounding tags."""
 
     characters = list(text)
-    content_starts: list[int] = []
-    for tag in MARKDOWN_HTML_TAG_OR_CLOSING.finditer(text):
-        value = tag.group(0)
+    element_stack: list[tuple[str, str, dict[str, str]]] = []
+    template_depth = 0
+    content_start: int | None = None
+    for tag_match in MARKDOWN_HTML_TAG_OR_CLOSING.finditer(text):
+        value = tag_match.group(0)
         name_match = re.match(r"</?([A-Za-z][A-Za-z0-9-]*)", value)
-        if name_match is None or name_match.group(1).casefold() != "template":
+        if name_match is None:
             continue
-        if value.startswith("</"):
-            if not content_starts:
+        tag = name_match.group(1).casefold()
+        is_closing = value.startswith("</")
+        if template_depth:
+            if tag != "template":
                 continue
-            content_start = content_starts.pop()
-            if not content_starts:
-                for position in range(content_start, tag.start()):
-                    if characters[position] not in "\r\n":
-                        characters[position] = " "
-        else:
-            content_starts.append(tag.end())
-    if content_starts:
-        for position in range(content_starts[0], len(characters)):
+            if is_closing:
+                template_depth -= 1
+                if template_depth == 0 and content_start is not None:
+                    for position in range(content_start, tag_match.start()):
+                        if characters[position] not in "\r\n":
+                            characters[position] = " "
+                    content_start = None
+            else:
+                template_depth += 1
+            continue
+        if is_closing:
+            html_pop_element_context(element_stack, tag)
+            continue
+
+        attributes: dict[str, str] = {}
+        encoding_values = html_attribute_values(
+            value, frozenset({"encoding"})
+        )
+        if encoding_values:
+            attributes["encoding"] = html_attribute_unescape(
+                encoding_values[0]
+            )
+        namespace = html_start_tag_namespace(
+            element_stack, tag, attributes
+        )
+        if tag == "template" and namespace == HTML_NAMESPACE:
+            template_depth = 1
+            content_start = tag_match.end()
+            continue
+        html_push_element_context(element_stack, tag, namespace, attributes)
+        if value.rstrip().endswith("/>") and html_slash_closes_context(
+            html_canonical_tag_name(tag, namespace),
+            inside_foreign=namespace != HTML_NAMESPACE,
+        ):
+            html_pop_element_context(element_stack, tag)
+    if template_depth and content_start is not None:
+        for position in range(content_start, len(characters)):
             if characters[position] not in "\r\n":
                 characters[position] = " "
     return "".join(characters)
@@ -3172,6 +3426,15 @@ def html_style_contents(text: str) -> list[str]:
         if not re.match(r"<style(?=[\s>])", tag.group(0), re.IGNORECASE):
             continue
         if not markdown_html_tag_is_rendered(text, tag, paragraph_boundaries):
+            continue
+        type_values = html_attribute_values(
+            tag.group(0),
+            frozenset({"type"}),
+            tag_names=frozenset({"style"}),
+        )
+        if type_values and not html_style_type_uses_css(
+            html_attribute_unescape(type_values[0])
+        ):
             continue
         closing_match = closing.search(text, tag.end())
         if closing_match is None:
@@ -4263,6 +4526,11 @@ def find_broken_links(root: Path) -> list[str]:
         text = read_text_resource(path)
         if text is None:
             continue
+        for fragment_target in html_srcdoc_fragment_errors(text):
+            errors.append(
+                f"{path.relative_to(root)}: broken srcdoc fragment "
+                f"{fragment_target!r}"
+            )
         for raw_target, is_markdown, requires_file in markdown_link_targets(text):
             target = raw_target.strip("\t\n\f\r ")
             if not target:
@@ -4297,7 +4565,7 @@ def find_broken_links(root: Path) -> list[str]:
                 continue
             parsed_target = urlsplit(target)
             path_target = unquote_url_path(parsed_target.path)
-            fragment = unquote(parsed_target.fragment)
+            fragment = url_element_fragment(unquote(parsed_target.fragment))
             if requires_file and not path_target:
                 errors.append(
                     f"{path.relative_to(root)}: resource target has no file path "
