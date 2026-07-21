@@ -7,6 +7,7 @@ import argparse
 import math
 import re
 import sys
+from bisect import bisect_left
 from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -235,6 +236,31 @@ def path_resolves_within(path: Path, root: Path) -> bool:
         return path.resolve().is_relative_to(root.resolve())
     except (OSError, RuntimeError):
         return False
+
+
+def find_escaping_skill_symlinks(skill_root: Path) -> list[str]:
+    """Reject distributable symlinks that resolve outside the skill directory."""
+
+    expected_boundary = skill_root.parent.resolve() / skill_root.name
+    if skill_root.is_symlink():
+        entries = [skill_root]
+    elif skill_root.is_dir():
+        entries = list(skill_root.rglob("*"))
+    else:
+        return []
+
+    errors: list[str] = []
+    for path in sorted(entry for entry in entries if entry.is_symlink()):
+        try:
+            resolves_within_skill = path.resolve().is_relative_to(expected_boundary)
+        except (OSError, RuntimeError):
+            resolves_within_skill = False
+        if not resolves_within_skill:
+            relative = path.relative_to(skill_root.parent)
+            errors.append(
+                f"{relative}: symlink resolves outside distributable skill directory"
+            )
+    return errors
 
 
 def decode_text_data(data: bytes) -> str | None:
@@ -987,6 +1013,36 @@ def markdown_reference_definitions(
     return definitions
 
 
+def markdown_reference_definition_ranges(
+    text: str, definitions: list[re.Match[str]]
+) -> list[tuple[int, int]]:
+    """Map normalized reference-definition matches to original line ranges."""
+
+    if not definitions:
+        return []
+
+    lines_with_endings = text.splitlines(keepends=True)
+    container_text = "\n".join(
+        content for _, content in markdown_container_lines(text.splitlines())
+    )
+    container_line_endings = [
+        index for index, character in enumerate(container_text) if character == "\n"
+    ]
+    line_offsets = [0]
+    for line in lines_with_endings:
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    ranges: list[tuple[int, int]] = []
+    for definition in definitions:
+        start_line = bisect_left(container_line_endings, definition.start())
+        end_line = bisect_left(
+            container_line_endings,
+            max(definition.start(), definition.end() - 1),
+        )
+        ranges.append((line_offsets[start_line], line_offsets[end_line + 1]))
+    return ranges
+
+
 def markdown_bare_destination_is_balanced(destination: str) -> bool:
     """Return whether a bare destination has balanced unescaped parentheses."""
 
@@ -1011,20 +1067,49 @@ def markdown_reference_usages(
     text: str,
     reference_labels: set[str],
     label_pairs: dict[int, int] | None = None,
+    definition_ranges: list[tuple[int, int]] | None = None,
 ) -> dict[str, bool]:
     """Collect active reference labels and whether any use renders an image."""
 
+    if not reference_labels:
+        return {}
     if label_pairs is None:
         label_pairs = markdown_label_pairs(text)
+    if definition_ranges is None:
+        definitions = markdown_reference_definitions(text)
+        definition_ranges = markdown_reference_definition_ranges(text, definitions)
     usages: dict[str, bool] = {}
     image_label_ranges = markdown_active_image_label_ranges(
         text, reference_labels, label_pairs
     )
+    definition_index = 0
+    definition_end = -1
+    image_index = 0
+    image_end = -1
+    paragraph_end = -1
     for label_start, character in enumerate(text):
         if character != "[" or markdown_character_is_escaped(text, label_start):
             continue
-        if any(start < label_start < end for start, end in image_label_ranges):
+        while (
+            definition_index < len(definition_ranges)
+            and definition_ranges[definition_index][0] <= label_start
+        ):
+            definition_end = max(
+                definition_end, definition_ranges[definition_index][1]
+            )
+            definition_index += 1
+        if label_start < definition_end:
             continue
+        while (
+            image_index < len(image_label_ranges)
+            and image_label_ranges[image_index][0] < label_start
+        ):
+            image_end = max(image_end, image_label_ranges[image_index][1])
+            image_index += 1
+        if label_start < image_end:
+            continue
+        if label_start >= paragraph_end:
+            paragraph_end = markdown_paragraph_end(text, label_start)
         label_end = label_pairs.get(label_start)
         if label_end is None:
             continue
@@ -1040,7 +1125,7 @@ def markdown_reference_usages(
         if (
             cursor < len(text)
             and text[cursor] == "("
-            and markdown_destination_end(text, cursor) is not None
+            and markdown_destination_end(text, cursor, paragraph_end) is not None
         ):
             continue
         if cursor < len(text) and text[cursor] == "[":
@@ -1056,7 +1141,12 @@ def markdown_reference_usages(
         if normalized not in reference_labels:
             continue
         if not is_image and markdown_label_contains_active_link(
-            text, label_start, label_end, reference_labels, label_pairs
+            text,
+            label_start,
+            label_end,
+            reference_labels,
+            label_pairs,
+            paragraph_end,
         ):
             continue
         usages[normalized] = usages.get(normalized, False) or is_image
@@ -1069,6 +1159,7 @@ def markdown_label_contains_active_link(
     label_end: int,
     reference_labels: set[str],
     label_pairs: dict[int, int] | None = None,
+    paragraph_end: int | None = None,
 ) -> bool:
     """Return whether a link label contains a nested link that deactivates it."""
 
@@ -1102,7 +1193,7 @@ def markdown_label_contains_active_link(
 
         cursor = nested_end + 1
         if cursor < label_end and text[cursor] == "(":
-            destination = markdown_destination_end(text, cursor)
+            destination = markdown_destination_end(text, cursor, paragraph_end)
             if destination is not None and destination[1] < label_end:
                 return True
         if cursor < label_end and text[cursor] == "[":
@@ -1389,12 +1480,15 @@ def markdown_line_interrupts_paragraph(content: str) -> bool:
     )
 
 
-def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
+def markdown_destination_end(
+    text: str, opening: int, paragraph_end: int | None = None
+) -> tuple[str, int] | None:
     """Extract a valid CommonMark inline destination and its closing parenthesis."""
 
     start = opening + 1
     index = start
-    paragraph_end = markdown_paragraph_end(text, opening)
+    if paragraph_end is None:
+        paragraph_end = markdown_paragraph_end(text, opening)
     if index >= paragraph_end:
         return None
 
@@ -1476,6 +1570,7 @@ def markdown_active_image_label_ranges(
     if label_pairs is None:
         label_pairs = markdown_label_pairs(text)
     ranges: list[tuple[int, int]] = []
+    paragraph_end = -1
     for label_start, character in enumerate(text):
         if character != "[" or label_start == 0 or text[label_start - 1] != "!":
             continue
@@ -1485,12 +1580,14 @@ def markdown_active_image_label_ranges(
         if label_end is None:
             continue
 
+        if label_start >= paragraph_end:
+            paragraph_end = markdown_paragraph_end(text, label_start)
         primary_label = text[label_start + 1 : label_end]
         cursor = label_end + 1
         active = (
             cursor < len(text)
             and text[cursor] == "("
-            and markdown_destination_end(text, cursor) is not None
+            and markdown_destination_end(text, cursor, paragraph_end) is not None
         )
         if not active:
             if cursor < len(text) and text[cursor] == "[":
@@ -1528,26 +1625,52 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         label = markdown_normalize_reference_label(match.group("label"))
         first_reference_definitions.setdefault(label, match)
     reference_labels = set(first_reference_definitions)
+    definition_ranges = markdown_reference_definition_ranges(
+        text, reference_definitions
+    )
     label_pairs = markdown_label_pairs(text)
     image_label_ranges = markdown_active_image_label_ranges(
         text, reference_labels, label_pairs
     )
     reference_usages = markdown_reference_usages(
-        text, reference_labels, label_pairs
+        text, reference_labels, label_pairs, definition_ranges
     )
     targets: list[tuple[str, bool, bool]] = []
-    inline_link_suffix_ranges: list[tuple[int, int]] = []
+    definition_index = 0
+    definition_end = -1
+    image_index = 0
+    image_end = -1
+    inline_link_suffix_end = -1
+    paragraph_end = -1
     for label_start, character in enumerate(text):
         if character != "[":
             continue
-        if any(start <= label_start < end for start, end in inline_link_suffix_ranges):
+        if label_start < inline_link_suffix_end:
             continue
-        if any(start < label_start < end for start, end in image_label_ranges):
+        while (
+            definition_index < len(definition_ranges)
+            and definition_ranges[definition_index][0] <= label_start
+        ):
+            definition_end = max(
+                definition_end, definition_ranges[definition_index][1]
+            )
+            definition_index += 1
+        if label_start < definition_end:
             continue
+        while (
+            image_index < len(image_label_ranges)
+            and image_label_ranges[image_index][0] < label_start
+        ):
+            image_end = max(image_end, image_label_ranges[image_index][1])
+            image_index += 1
+        if label_start < image_end:
+            continue
+        if label_start >= paragraph_end:
+            paragraph_end = markdown_paragraph_end(text, label_start)
         label_end = label_pairs.get(label_start)
         if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":
             continue
-        destination = markdown_destination_end(text, label_end + 1)
+        destination = markdown_destination_end(text, label_end + 1, paragraph_end)
         if destination is not None:
             is_image = (
                 label_start > 0
@@ -1555,13 +1678,18 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
                 and not markdown_character_is_escaped(text, label_start - 1)
             )
             if not is_image and markdown_label_contains_active_link(
-                text, label_start, label_end, reference_labels, label_pairs
+                text,
+                label_start,
+                label_end,
+                reference_labels,
+                label_pairs,
+                paragraph_end,
             ):
                 continue
             targets.append(
                 (markdown_restore_escaped_openers(destination[0]), True, is_image)
             )
-            inline_link_suffix_ranges.append((label_end + 1, destination[1] + 1))
+            inline_link_suffix_end = max(inline_link_suffix_end, destination[1] + 1)
 
     targets.extend(
         (
@@ -1978,7 +2106,10 @@ def find_secret_like_content(root: Path) -> list[str]:
         and not is_ignored_repository_path(path, root)
         and not is_ignored_secret_file(path)
     ):
-        text = decode_text_data(path.read_bytes())
+        data = path.read_bytes()
+        if data_looks_binary(data):
+            continue
+        text = decode_text_data(data)
         if text is None:
             if path.suffix.lower() in PORTABLE_TEXT_SUFFIXES:
                 errors.append(f"{path.relative_to(root)}: undecodable textual resource")
@@ -2068,6 +2199,7 @@ def validate_repository(root: Path) -> list[str]:
         if estimated_tokens >= 5000:
             errors.append(f"SKILL.md estimated token count must stay below 5000; found {estimated_tokens}")
 
+    errors.extend(find_escaping_skill_symlinks(skill_root))
     errors.extend(find_empty_resources(root))
     errors.extend(find_broken_links(root))
     if skill_root.is_dir():

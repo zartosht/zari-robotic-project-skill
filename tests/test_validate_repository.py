@@ -612,6 +612,15 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_inline_link_markup_in_reference_definition_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '[guide][foo]\n\n[foo]: README.md "[example](missing.md)"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_uses_first_duplicate_reference_definition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -671,6 +680,35 @@ class LinkTests(unittest.TestCase):
                 validator.markdown_link_targets(text),
             )
         self.assertLess(inline_block_end.call_count, 10)
+
+    def test_scans_many_image_ranges_in_a_single_pass(self) -> None:
+        text = "![a](image.png) [b](README.md)\n" * 200
+        label_pairs = validator.markdown_label_pairs(text)
+        ranges = validator.markdown_active_image_label_ranges(
+            text, set(), label_pairs
+        )
+
+        class CountingRanges(list[tuple[int, int]]):
+            iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        counted_ranges = CountingRanges(ranges)
+        with mock.patch.object(
+            validator,
+            "markdown_active_image_label_ranges",
+            return_value=counted_ranges,
+        ), mock.patch.object(
+            validator,
+            "markdown_paragraph_end",
+            wraps=validator.markdown_paragraph_end,
+        ) as paragraph_end:
+            targets = validator.markdown_link_targets(text)
+        self.assertEqual(400, len(targets))
+        self.assertLess(counted_ranges.iterations, 10)
+        self.assertLess(paragraph_end.call_count, 10)
 
     def test_rejects_markdown_image_targeting_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1560,6 +1598,12 @@ class SecretTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("script.ps1", errors[0])
 
+    def test_skips_utf8_decodable_binary_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.bin").write_bytes(b"\0AKIA1234567890ABCDEF\0")
+            self.assertEqual([], validator.find_secret_like_content(root))
+
     def test_ignores_local_credentials_but_scans_env_example(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1661,6 +1705,22 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn(
                 "required skill file resolves outside distributable skill directory: "
                 "build-robot-project/references/discovery-interview.md",
+                errors,
+            )
+
+    def test_rejects_optional_skill_resource_symlink_outside_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "repository"
+            skill_root = root / "build-robot-project"
+            skill_root.mkdir(parents=True)
+            outside = workspace / "outside.txt"
+            outside.write_text("outside\n", encoding="utf-8")
+            (skill_root / "optional.txt").symlink_to(outside)
+            errors = validator.validate_repository(root)
+            self.assertIn(
+                "build-robot-project/optional.txt: symlink resolves outside "
+                "distributable skill directory",
                 errors,
             )
 
