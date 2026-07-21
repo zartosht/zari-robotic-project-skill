@@ -8,8 +8,9 @@ import math
 import re
 import sys
 import unicodedata
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from html import unescape as html_unescape
+from html.entities import html5 as HTML5_ENTITIES
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -162,6 +163,15 @@ MARKDOWN_PARAGRAPH_BOUNDARY = re.compile(
     r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)"
 )
 MARKDOWN_REFERENCE_LABEL_MAX_LENGTH = 999
+HTML_NUMERIC_CHARACTER_REFERENCE = re.compile(
+    r"&#(?:[xX][0-9A-Fa-f]+|[0-9]+);?"
+)
+HTML_FLOATING_POINT_NUMBER = re.compile(
+    r"-?(?:(?:[0-9]+(?:\.[0-9]+)?)|(?:\.[0-9]+))"
+    r"(?:[eE][+-]?[0-9]+)?"
+)
+HTML_ASCII_WHITESPACE = frozenset("\t\n\f\r ")
+HTML_CHARACTER_REFERENCE_MAX_LENGTH = max(len(name) for name in HTML5_ENTITIES)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 MARKDOWN_SUFFIXES = frozenset(
@@ -1333,6 +1343,56 @@ def markdown_render_code_spans(text: str) -> str:
     return "".join(result)
 
 
+def html_attribute_unescape(text: str) -> str:
+    """Decode HTML references using the tokenizer's attribute-value rules."""
+
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "&":
+            result.append(text[index])
+            index += 1
+            continue
+
+        numeric = HTML_NUMERIC_CHARACTER_REFERENCE.match(text, index)
+        if numeric is not None:
+            result.append(html_unescape(numeric.group(0)))
+            index = numeric.end()
+            continue
+
+        name_start = index + 1
+        max_end = min(
+            len(text), name_start + HTML_CHARACTER_REFERENCE_MAX_LENGTH
+        )
+        entity_name: str | None = None
+        for end in range(max_end, name_start, -1):
+            candidate = text[name_start:end]
+            if candidate in HTML5_ENTITIES:
+                entity_name = candidate
+                break
+        if entity_name is None:
+            result.append("&")
+            index += 1
+            continue
+
+        entity_end = name_start + len(entity_name)
+        if (
+            not entity_name.endswith(";")
+            and entity_end < len(text)
+            and (
+                (text[entity_end].isascii() and text[entity_end].isalnum())
+                or text[entity_end] == "="
+            )
+        ):
+            result.append("&")
+            index += 1
+            continue
+
+        result.append(HTML5_ENTITIES[entity_name])
+        index = entity_end
+    return "".join(result)
+
+
 def html_attribute_values(
     text: str,
     names: frozenset[str],
@@ -1402,30 +1462,73 @@ def html_attribute_values(
     return values
 
 
+def html_srcset_descriptors_are_valid(descriptors: list[str]) -> bool:
+    """Return whether one srcset candidate's descriptors survive parsing."""
+
+    width: int | None = None
+    density: float | None = None
+    future_compat_height: int | None = None
+    for descriptor in descriptors:
+        if descriptor.endswith("w") and re.fullmatch(
+            r"[0-9]+", descriptor[:-1]
+        ):
+            if width is not None or density is not None:
+                return False
+            width = int(descriptor[:-1])
+            if width == 0:
+                return False
+            continue
+        if descriptor.endswith("x") and HTML_FLOATING_POINT_NUMBER.fullmatch(
+            descriptor[:-1]
+        ):
+            if (
+                width is not None
+                or density is not None
+                or future_compat_height is not None
+            ):
+                return False
+            density = float(descriptor[:-1])
+            if density < 0 or not math.isfinite(density):
+                return False
+            continue
+        if descriptor.endswith("h") and re.fullmatch(
+            r"[0-9]+", descriptor[:-1]
+        ):
+            if future_compat_height is not None or density is not None:
+                return False
+            future_compat_height = int(descriptor[:-1])
+            if future_compat_height == 0:
+                return False
+            continue
+        return False
+    return future_compat_height is None or width is not None
+
+
 def html_srcset_candidates(value: str) -> list[str]:
-    """Extract URL candidates from an HTML srcset attribute value."""
+    """Extract URL candidates accepted by the HTML srcset parser."""
 
     candidates: list[str] = []
     index = 0
     while index < len(value):
         while index < len(value) and (
-            value[index].isspace() or value[index] == ","
+            value[index] in HTML_ASCII_WHITESPACE or value[index] == ","
         ):
             index += 1
         if index >= len(value):
             break
 
         url_start = index
-        while index < len(value) and not value[index].isspace():
+        while index < len(value) and value[index] not in HTML_ASCII_WHITESPACE:
             index += 1
         url = value[url_start:index]
         trailing_commas = len(url) - len(url.rstrip(","))
         url = url.rstrip(",")
-        if url:
+        if url and trailing_commas:
             candidates.append(url)
         if trailing_commas:
             continue
 
+        descriptors_start = index
         parentheses = 0
         while index < len(value):
             character = value[index]
@@ -1434,16 +1537,59 @@ def html_srcset_candidates(value: str) -> list[str]:
             elif character == ")" and parentheses:
                 parentheses -= 1
             elif character == "," and parentheses == 0:
-                index += 1
                 break
             index += 1
+        descriptors = re.findall(
+            r"[^\t\n\f\r ]+", value[descriptors_start:index]
+        )
+        if url and html_srcset_descriptors_are_valid(descriptors):
+            candidates.append(url)
+        if index < len(value) and value[index] == ",":
+            index += 1
     return candidates
+
+
+def markdown_inline_block_context(
+    text: str,
+) -> tuple[
+    list[str],
+    list[int],
+    list[tuple[tuple[str, ...], str]],
+    list[int],
+]:
+    """Precompute line containers and blank-line paragraph ends once."""
+
+    lines_with_endings = text.splitlines(keepends=True)
+    lines = [line.rstrip("\r\n") for line in lines_with_endings]
+    line_offsets: list[int] = []
+    offset = 0
+    for line in lines_with_endings:
+        line_offsets.append(offset)
+        offset += len(line)
+    container_lines = markdown_container_lines(lines)
+    paragraph_ends = [len(text)] * len(lines)
+    paragraph_start_line = 0
+    for line_index, line in enumerate(lines):
+        if line.strip(" \t"):
+            continue
+        if paragraph_start_line < line_index:
+            previous_line = lines_with_endings[line_index - 1]
+            paragraph_end = line_offsets[line_index - 1] + len(
+                previous_line.rstrip("\r\n")
+            )
+            paragraph_ends[paragraph_start_line:line_index] = [paragraph_end] * (
+                line_index - paragraph_start_line
+            )
+        paragraph_ends[line_index] = line_offsets[line_index]
+        paragraph_start_line = line_index + 1
+    return lines, line_offsets, container_lines, paragraph_ends
 
 
 def markdown_label_pairs(text: str) -> dict[int, int]:
     """Parse matching label brackets once per inline Markdown block."""
 
     pairs: dict[int, int] = {}
+    inline_context = markdown_inline_block_context(text)
     search_from = 0
     while search_from < len(text):
         label_start = text.find("[", search_from)
@@ -1452,7 +1598,7 @@ def markdown_label_pairs(text: str) -> dict[int, int]:
         if label_start < 0:
             break
 
-        block_end = markdown_inline_block_end(text, label_start)
+        block_end = markdown_inline_block_end(text, label_start, inline_context)
         stack: list[int] = []
         index = label_start
         while index < block_end:
@@ -1489,24 +1635,32 @@ def markdown_label_end(text: str, start: int) -> int | None:
     return None
 
 
-def markdown_inline_block_end(text: str, start: int) -> int:
+def markdown_inline_block_end(
+    text: str,
+    start: int,
+    context: tuple[
+        list[str],
+        list[int],
+        list[tuple[tuple[str, ...], str]],
+        list[int],
+    ]
+    | None = None,
+) -> int:
     """Return the next paragraph-interrupting block boundary after an inline start."""
 
-    paragraph_end = markdown_paragraph_end(text, start)
-    lines_with_endings = text[:paragraph_end].splitlines(keepends=True)
-    lines = [line.rstrip("\r\n") for line in lines_with_endings]
-    container_lines = markdown_container_lines(lines)
-    line_offsets: list[int] = []
-    offset = 0
-    for line in lines_with_endings:
-        line_offsets.append(offset)
-        offset += len(line)
-    start_line = max(
-        index for index, line_offset in enumerate(line_offsets) if line_offset <= start
-    )
+    if context is None:
+        context = markdown_inline_block_context(text)
+    lines, line_offsets, container_lines, paragraph_ends = context
+    if not lines:
+        return len(text)
+    start_line = max(0, bisect_right(line_offsets, start) - 1)
+    paragraph_end = paragraph_ends[start_line]
     start_containers = container_lines[start_line][0]
 
-    for line_index in range(start_line + 1, len(lines)):
+    paragraph_end_line = bisect_left(
+        line_offsets, paragraph_end, start_line + 1
+    )
+    for line_index in range(start_line + 1, paragraph_end_line):
         containers, content = container_lines[line_index]
         parent_containers, parent_content = markdown_blockquote_content(lines[line_index])
         direct_list_item = MARKDOWN_LIST_PREFIX.match(parent_content)
@@ -2036,6 +2190,17 @@ def markdown_heading_fragments(text: str) -> set[str]:
     structure_containers = markdown_container_lines(structure_lines)
     raw_containers = markdown_container_lines(lines)
     structure_text = "\n".join(content for _, content in structure_containers)
+    footnote_characters = list(searchable_text)
+    for tag in MARKDOWN_HTML_TAG.finditer(searchable_text):
+        if not markdown_html_tag_is_rendered(searchable_text, tag):
+            continue
+        for position in range(*tag.span()):
+            if footnote_characters[position] not in "\r\n":
+                footnote_characters[position] = " "
+    footnote_lines = "".join(footnote_characters).splitlines()
+    footnote_text = "\n".join(
+        content for _, content in markdown_container_lines(footnote_lines)
+    )
     reference_definition_lines: set[int] = set()
     reference_definitions = markdown_reference_definitions(structure_text)
     reference_labels.update(
@@ -2043,13 +2208,13 @@ def markdown_heading_fragments(text: str) -> set[str]:
         for definition in reference_definitions
     )
     footnote_labels: set[str] = set()
-    for footnote in MARKDOWN_FOOTNOTE_DEFINITION.finditer(structure_text):
+    for footnote in MARKDOWN_FOOTNOTE_DEFINITION.finditer(footnote_text):
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
         normalized_label = markdown_unescape(label).casefold()
         footnote_labels.add(normalized_label)
         fragments.add(f"user-content-fn-{normalized_label}")
     footnote_reference_counts: dict[str, int] = {}
-    for footnote in MARKDOWN_FOOTNOTE_REFERENCE.finditer(structure_text):
+    for footnote in MARKDOWN_FOOTNOTE_REFERENCE.finditer(footnote_text):
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
         normalized_label = markdown_unescape(label).casefold()
         if normalized_label not in footnote_labels:
@@ -2065,13 +2230,13 @@ def markdown_heading_fragments(text: str) -> set[str]:
         )
         reference_definition_lines.update(range(start_line, end_line + 1))
     for anchor in html_attribute_values(searchable_text, MARKDOWN_HTML_ID_ATTRIBUTES):
-        fragments.add(html_unescape(anchor))
+        fragments.add(html_attribute_unescape(anchor))
     for anchor in html_attribute_values(
         searchable_text,
         MARKDOWN_HTML_NAME_ATTRIBUTES,
         tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
     ):
-        fragments.add(html_unescape(anchor))
+        fragments.add(html_attribute_unescape(anchor))
     frontmatter_end = markdown_frontmatter_end(text.splitlines(keepends=True))
     content_start = len(text[:frontmatter_end].splitlines()) if frontmatter_end else 0
 
@@ -2157,7 +2322,9 @@ def find_broken_links(root: Path) -> list[str]:
                     target = target.split(maxsplit=1)[0]
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)
             target = (
-                markdown_unescape(target) if is_markdown else html_unescape(target)
+                markdown_unescape(target)
+                if is_markdown
+                else html_attribute_unescape(target)
             )
             if not target or target.startswith("/") or URI_SCHEME.match(target):
                 continue

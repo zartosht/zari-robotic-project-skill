@@ -641,6 +641,19 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_footnote_reference_text_inside_inline_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "`[^1]`\n\n"
+                "[^1]: Footnote text\n\n"
+                "[stale](#user-content-fnref-1)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#user-content-fnref-1", errors[0])
+
     def test_ignores_footnote_definition_inside_code_fence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -886,6 +899,19 @@ class LinkTests(unittest.TestCase):
                 validator.markdown_link_targets(text),
             )
         self.assertLess(inline_block_end.call_count, 10)
+
+    def test_indexes_many_link_paragraphs_in_one_container_pass(self) -> None:
+        text = "".join(
+            f"[guide-{index}](README.md)\n\n" for index in range(2_000)
+        )
+        with mock.patch.object(
+            validator,
+            "markdown_container_lines",
+            wraps=validator.markdown_container_lines,
+        ) as container_lines:
+            pairs = validator.markdown_label_pairs(text)
+        self.assertEqual(2_000, len(pairs))
+        self.assertEqual(1, container_lines.call_count)
 
     def test_scans_many_image_ranges_in_a_single_pass(self) -> None:
         text = "![a](image.png) [b](README.md)\n" * 200
@@ -1356,6 +1382,30 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("missing-large.png" in error for error in errors))
             self.assertTrue(any("missing-wide.png" in error for error in errors))
+
+    def test_discards_srcset_candidates_with_invalid_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "valid.png").write_bytes(b"valid")
+            (root / "future.png").write_bytes(b"future")
+            (root / "README.md").write_text(
+                '<img srcset="missing-a.png nope, missing-b.png 1x 2x, '
+                'missing-c.png 10w 20w, missing-d.png 0w, '
+                'missing-e.png -1x, missing-f.png 10h, '
+                'missing-g.png +1x, missing-h.png 1.x, '
+                'valid.png 2x, future.png 100w 50h">\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_preserves_ambiguous_ampersand_in_html_attribute_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a&notit;.md").write_text("target\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                '<a href="a&notit;.md">target</a>\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_validates_local_html_object_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
