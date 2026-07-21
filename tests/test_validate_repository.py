@@ -3983,6 +3983,140 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("escapes repository checkout", errors[0])
 
+    def test_scans_nested_style_bodies_in_markdown_raw_html_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div><style>.hero{background:url(missing-nested.png)}</style>'
+                '<template><style>.ignored{background:url(ignored-inert.png)}'
+                "</style></template>"
+                '<template shadowrootmode="open"><style>'
+                ".shadow{background:url(missing-shadow-style.png)}"
+                "</style></template>"
+                "</div>\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-nested.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-shadow-style.png" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-inert.png" in error for error in errors))
+
+    def test_scans_xhtml_stylesheet_processing_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.xhtml)\n", encoding="utf-8"
+            )
+            (root / "page.xhtml").write_text(
+                '<?xml-stylesheet type="text/css" href="missing-pi.css"?>\n'
+                '<html xmlns="http://www.w3.org/1999/xhtml"><body/></html>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing-pi.css", errors[0])
+
+    def test_computes_effective_xhtml_form_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.xhtml)\n", encoding="utf-8"
+            )
+            (root / "page.xhtml").write_text(
+                '<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                '<base href=""/></head><body>'
+                '<form><button formaction="missing-owned.html">Go</button></form>'
+                '<button form="absent" formaction="ignored-ownerless.html">'
+                'No owner</button><button form="target" '
+                'formaction="missing-explicit.html">Explicit</button>'
+                '<form id="target"/></body></html>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-owned.html" in error for error in errors))
+            self.assertTrue(
+                any("missing-explicit.html" in error for error in errors)
+            )
+            self.assertFalse(
+                any("ignored-ownerless.html" in error for error in errors)
+            )
+
+    def test_ignores_origin_only_link_hint_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<link rel="preconnect" href="missing/preconnect">\n'
+                '<link rel="dns-prefetch" href="missing/dns-prefetch">\n'
+                "[html](page.html) [xhtml](page.xhtml)\n"
+                '<iframe srcdoc="<link rel=\047preconnect\047 '
+                'href=\047missing/srcdoc\047>"></iframe>\n',
+                encoding="utf-8",
+            )
+            (root / "page.html").write_text(
+                '<link rel="preconnect" href="missing/html">\n',
+                encoding="utf-8",
+            )
+            (root / "page.xhtml").write_text(
+                '<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                '<link rel="dns-prefetch" href="missing/xhtml"/>'
+                "</head></html>\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_tracks_custom_property_use_across_external_stylesheets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[page](page.html) [second](second.html)\n", encoding="utf-8"
+            )
+            (root / "page.html").write_text(
+                '<link rel="stylesheet" href="theme.css">'
+                '<link rel="stylesheet" href="consumer.css">'
+                '<link rel="stylesheet" href="shared.css">'
+                '<div style="background:var(--inline-hero)"></div>\n',
+                encoding="utf-8",
+            )
+            (root / "second.html").write_text(
+                '<link rel="stylesheet" href="shared.css">'
+                '<div style="background:var(--second-page)"></div>\n',
+                encoding="utf-8",
+            )
+            (root / "theme.css").write_text(
+                ":root{--inline-hero:url(missing-inline-hero.png);"
+                "--external-hero:url(missing-external-hero.png);"
+                "--unused:url(ignored-unused.png)}\n",
+                encoding="utf-8",
+            )
+            (root / "consumer.css").write_text(
+                ".hero{background:var(--external-hero)}\n", encoding="utf-8"
+            )
+            (root / "shared.css").write_text(
+                ":root{--second-page:url(missing-second-page.png)}\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            self.assertTrue(
+                any("missing-inline-hero.png" in error for error in errors)
+            )
+            self.assertTrue(
+                any("missing-external-hero.png" in error for error in errors)
+            )
+            self.assertTrue(
+                any("missing-second-page.png" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-unused.png" in error for error in errors))
+
 
 class PortabilityTests(unittest.TestCase):
     def test_detects_client_specific_tool_name(self) -> None:
@@ -4020,6 +4154,20 @@ class PortabilityTests(unittest.TestCase):
             (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
             (root / "model.bin").write_bytes(b"\x00codex\x00")
             self.assertEqual([], validator.find_portability_violations(root))
+
+    def test_scans_declared_text_resources_that_contain_nuls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            references = root / "references"
+            references.mkdir()
+            (root / "SKILL.md").write_text("Portable instructions.\n", encoding="utf-8")
+            (references / "guide.md").write_bytes(
+                b"Portable prefix.\x00 Call request_user_input.\n"
+            )
+
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("references/guide.md", errors[0])
 
     def test_scans_bundled_scripts_for_portability_violations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
