@@ -752,6 +752,19 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_scans_indented_blocks_in_referenced_footnotes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "Reference[^note].\n\n"
+                "[^note]: First paragraph\n\n"
+                "    ![bad](missing.png)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
+
     def test_rejects_footnote_fragment_for_unused_definition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1254,6 +1267,14 @@ class LinkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_masks_many_code_spans_quickly(self) -> None:
+        text = " ".join("`literal`" for _ in range(8_000))
+        started = time.perf_counter()
+        masked = validator.markdown_searchable_text(text)
+        elapsed = time.perf_counter() - started
+        self.assertNotIn("literal", masked)
+        self.assertLess(elapsed, 0.75)
 
     def test_ignores_code_span_closed_by_backslash_prefixed_tick(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2029,6 +2050,20 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_decodes_escaped_css_resource_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div style="background:u\\72l(missing.png)"></div>\n'
+                "\n"
+                '<style>@\\69mport "missing.css";</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertTrue(any("missing.css" in error for error in errors))
+
     def test_rejects_fragment_only_file_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2302,6 +2337,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("missing.png" in error for error in errors))
             self.assertTrue(any("missing.js" in error for error in errors))
+
+    def test_recognizes_form_feed_separators_in_raw_html_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div>\n<img\f src="missing.png">\n</div>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
 
     def test_preserves_non_ascii_whitespace_in_html_resource_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

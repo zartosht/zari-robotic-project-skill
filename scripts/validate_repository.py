@@ -127,12 +127,12 @@ HTML_RAW_BLOCK_ATTRIBUTE_NAME = r'''[^\t\n\f\r "'=<>`/]+'''
 HTML_RAW_BLOCK_ATTRIBUTE_VALUE = r'''(?:[^\t\n\f\r "'=<>`]+|"[^"]*"|'[^']*')'''
 HTML_RAW_BLOCK_TAG = re.compile(
     rf"<[A-Za-z][A-Za-z0-9-]*"
-    rf"(?:[ \t\r\n]+{HTML_RAW_BLOCK_ATTRIBUTE_NAME}"
-    rf"(?:[ \t\r\n]*=[ \t\r\n]*{HTML_RAW_BLOCK_ATTRIBUTE_VALUE})?)*"
-    rf"[ \t\r\n]*/?>"
+    rf"(?:[ \t\f\r\n]+{HTML_RAW_BLOCK_ATTRIBUTE_NAME}"
+    rf"(?:[ \t\f\r\n]*=[ \t\f\r\n]*{HTML_RAW_BLOCK_ATTRIBUTE_VALUE})?)*"
+    rf"[ \t\f\r\n]*/?>"
 )
 HTML_RAW_BLOCK_TAG_OR_CLOSING = re.compile(
-    rf"(?:{HTML_RAW_BLOCK_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\r\n]*>)"
+    rf"(?:{HTML_RAW_BLOCK_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\f\r\n]*>)"
 )
 MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS = frozenset(
     {
@@ -247,8 +247,6 @@ HTML_FLOATING_POINT_NUMBER = re.compile(
 HTML_ASCII_WHITESPACE = frozenset("\t\n\f\r ")
 HTML_CHARACTER_REFERENCE_MAX_LENGTH = max(len(name) for name in HTML5_ENTITIES)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
-CSS_IMPORT_RULE = re.compile(r"@import(?![-_A-Za-z0-9])", re.IGNORECASE)
-CSS_URL_FUNCTION = re.compile(r"url\(", re.IGNORECASE)
 CSS_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 PERCENT_ENCODED_PATH_SEPARATOR = re.compile(r"(%(?:2[fF]|5[cC]))")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
@@ -657,6 +655,13 @@ def mask_markdown_raw_html_blocks(
                 characters[position] = " "
 
     def normalize_raw_html_attribute_names(start: int, end: int) -> None:
+        def skip_whitespace(index: int) -> int:
+            while index < end and text[index] in HTML_ASCII_WHITESPACE:
+                if text[index] == "\f":
+                    characters[index] = " "
+                index += 1
+            return index
+
         index = start + 1
         if index < end and text[index] == "/":
             return
@@ -665,8 +670,7 @@ def mask_markdown_raw_html_blocks(
         ):
             index += 1
         while index < end:
-            while index < end and text[index] in HTML_ASCII_WHITESPACE:
-                index += 1
+            index = skip_whitespace(index)
             if index >= end or text[index] in {"/", ">"}:
                 return
             name_start = index
@@ -691,13 +695,11 @@ def mask_markdown_raw_html_blocks(
                 )
                 if not valid:
                     characters[position] = "x"
-            while index < end and text[index] in HTML_ASCII_WHITESPACE:
-                index += 1
+            index = skip_whitespace(index)
             if index >= end or text[index] != "=":
                 continue
             index += 1
-            while index < end and text[index] in HTML_ASCII_WHITESPACE:
-                index += 1
+            index = skip_whitespace(index)
             if index < end and text[index] in {'"', "'"}:
                 quote = text[index]
                 index += 1
@@ -1003,6 +1005,29 @@ def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
     return 0
 
 
+def markdown_footnote_continuation_lines(
+    container_lines: list[tuple[tuple[str, ...], str]],
+) -> set[int]:
+    """Return indented block lines that remain inside footnote definitions."""
+
+    continuation_lines: set[int] = set()
+    active_containers: tuple[str, ...] | None = None
+    for line_index, (containers, content) in enumerate(container_lines):
+        if active_containers is not None:
+            if containers != active_containers:
+                active_containers = None
+            elif not content.strip():
+                continue
+            elif MARKDOWN_INDENTED_CODE.match(content) is not None:
+                continuation_lines.add(line_index)
+                continue
+            else:
+                active_containers = None
+        if MARKDOWN_FOOTNOTE_DEFINITION.match(content) is not None:
+            active_containers = containers
+    return continuation_lines
+
+
 def markdown_searchable_text(
     text: str,
     *,
@@ -1027,6 +1052,9 @@ def markdown_searchable_text(
 
     lines = [line.rstrip("\r\n") for line in lines_with_endings]
     container_lines = markdown_container_lines(lines)
+    footnote_continuation_lines = markdown_footnote_continuation_lines(
+        container_lines
+    )
     _, reference_definition_lines = markdown_reference_definitions_with_lines(
         lines, container_lines
     )
@@ -1037,6 +1065,7 @@ def markdown_searchable_text(
         indented_candidate = MARKDOWN_INDENTED_CODE.match(container_content) is not None
         indented_code = (
             indented_candidate
+            and line_index not in footnote_continuation_lines
             and (
                 open_paragraph_containers != containers
                 or markdown_line_starts_list_item(line_body)
@@ -1145,7 +1174,7 @@ def markdown_searchable_text(
             if literal_characters[position] not in "\r\n":
                 literal_characters[position] = " "
         index = closing + len(delimiter)
-        masked = "".join(literal_characters)
+    masked = "".join(literal_characters)
 
     if mask_inline_code:
         characters = literal_characters.copy()
@@ -1997,6 +2026,36 @@ def css_string_value(text: str, start: int) -> tuple[str, int] | None:
     return None
 
 
+def css_name_character(character: str) -> bool:
+    """Return whether one decoded character can continue a CSS name."""
+
+    return bool(character) and (
+        (character.isascii() and (character.isalnum() or character in {"_", "-"}))
+        or not character.isascii()
+    )
+
+
+def css_identifier_value(text: str, start: int) -> tuple[str, int] | None:
+    """Decode a CSS identifier from one tokenizer position."""
+
+    value: list[str] = []
+    index = start
+    while index < len(text):
+        character = text[index]
+        if character == "\\":
+            escaped = css_escape_value(text, index)
+            if escaped is None or not escaped[0]:
+                return None
+            decoded, index = escaped
+            value.append(decoded)
+            continue
+        if not css_name_character(character):
+            break
+        value.append(character)
+        index += 1
+    return ("".join(value), index) if value else None
+
+
 def css_resource_targets(text: str) -> list[str]:
     """Extract resource URLs from CSS url() functions and @import strings."""
 
@@ -2012,9 +2071,16 @@ def css_resource_targets(text: str) -> list[str]:
             index = len(text) if string is None else string[1]
             continue
 
-        import_match = CSS_IMPORT_RULE.match(text, index)
-        if import_match is not None:
-            value_start = import_match.end()
+        import_identifier = (
+            css_identifier_value(text, index + 1)
+            if text[index] == "@"
+            else None
+        )
+        if (
+            import_identifier is not None
+            and import_identifier[0].casefold() == "import"
+        ):
+            value_start = import_identifier[1]
             while value_start < len(text) and text[value_start] in HTML_ASCII_WHITESPACE:
                 value_start += 1
             if value_start < len(text) and text[value_start] in {'"', "'"}:
@@ -2024,12 +2090,20 @@ def css_resource_targets(text: str) -> list[str]:
                     index = string[1]
                     continue
 
-        url_match = CSS_URL_FUNCTION.match(text, index)
         previous = text[index - 1] if index else ""
-        if url_match is not None and not (
-            previous.isascii() and (previous.isalnum() or previous in {"_", "-"})
+        url_identifier = (
+            css_identifier_value(text, index)
+            if text[index].casefold() == "u" or text[index] == "\\"
+            else None
+        )
+        if (
+            url_identifier is not None
+            and url_identifier[0].casefold() == "url"
+            and url_identifier[1] < len(text)
+            and text[url_identifier[1]] == "("
+            and not css_name_character(previous)
         ):
-            value_start = url_match.end()
+            value_start = url_identifier[1] + 1
             while value_start < len(text) and text[value_start] in HTML_ASCII_WHITESPACE:
                 value_start += 1
             if value_start < len(text) and text[value_start] in {'"', "'"}:
