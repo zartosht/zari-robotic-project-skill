@@ -1868,6 +1868,26 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.pdf", errors[0])
 
+    def test_restricts_object_data_to_the_html_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<object data="missing-html.bin"></object>\n'
+                '<svg><object data="ignored-svg.bin"></object></svg>\n'
+                '<math><object data="ignored-math.bin"></object></math>\n'
+                '<iframe srcdoc="<object data=\047missing-srcdoc-html.bin\047>'
+                '</object><svg><object data=\047ignored-srcdoc-svg.bin\047>'
+                '</object></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-html.bin" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-html.bin" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-" in error for error in errors))
+
     def test_treats_resource_link_relations_as_file_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1945,6 +1965,33 @@ class LinkTests(unittest.TestCase):
             self.assertFalse(
                 any("ignored-srcdoc-picture.png" in error for error in errors)
             )
+
+    def test_checks_the_source_elements_direct_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<picture><audio><source src="missing-nested-audio.mp3">'
+                '</audio></picture>\n'
+                '<audio><div><source src="ignored-indirect-audio.mp3">'
+                '</div></audio>\n'
+                '<iframe srcdoc="<picture><video><source '
+                'src=\047missing-srcdoc-nested-video.mp4\047></video></picture>'
+                '<video><div><source src=\047ignored-srcdoc-indirect-video.mp4\047>'
+                '</div></video>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                any("missing-nested-audio.mp3" in error for error in errors)
+            )
+            self.assertTrue(
+                any(
+                    "missing-srcdoc-nested-video.mp4" in error
+                    for error in errors
+                )
+            )
+            self.assertFalse(any("ignored-" in error for error in errors))
 
     def test_preserves_nonvoid_slash_tag_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2415,6 +2462,51 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("missing-block.png" in error for error in errors))
             self.assertTrue(any("missing-inline.png" in error for error in errors))
             self.assertFalse(any("ignored-" in error for error in errors))
+
+    def test_tracks_css_custom_property_usage_across_style_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>:root{--asset:url(missing-cross-source.png)}</style>'
+                '<div style="background:var(--asset)"></div>\n'
+                '<iframe srcdoc="<style>:root{--asset:url('
+                'missing-srcdoc-cross-source.png)}</style>'
+                '<div style=\047background:var(--asset)\047></div>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                any("missing-cross-source.png" in error for error in errors)
+            )
+            self.assertTrue(
+                any(
+                    "missing-srcdoc-cross-source.png" in error
+                    for error in errors
+                )
+            )
+
+    def test_accepts_all_html_whitespace_in_closing_style_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                'prefix <style>body{background:url(missing-line-feed.png)}'
+                '</style\n>\n'
+                '<iframe srcdoc="<style>body{background:url('
+                'missing-srcdoc-line-feed.png)}</style&#10;>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                any("missing-line-feed.png" in error for error in errors)
+            )
+            self.assertTrue(
+                any(
+                    "missing-srcdoc-line-feed.png" in error
+                    for error in errors
+                )
+            )
 
     def test_decodes_escaped_css_resource_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3229,6 +3321,28 @@ class PortabilityTests(unittest.TestCase):
                     errors = validator.find_portability_violations(root)
                     self.assertEqual(1, len(errors))
                     self.assertIn("machine-specific Linux path", errors[0])
+
+    def test_excludes_remote_url_paths_from_home_directory_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill_file = root / "SKILL.md"
+            skill_file.write_text(
+                "Read https://example.com/root/guide.\n"
+                "Read https://example.com/home/widgets/docs.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_portability_violations(root))
+
+            skill_file.write_text(
+                "Read https://example.com/root/guide.\n"
+                "Read https://example.com/home/widgets/docs.\n"
+                "Open /root/robot-project.\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_portability_violations(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("SKILL.md:3", errors[0])
+            self.assertIn("machine-specific Linux path", errors[0])
 
     def test_detects_macos_user_home_without_trailing_slash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

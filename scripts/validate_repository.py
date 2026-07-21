@@ -209,7 +209,6 @@ MARKDOWN_HTML_SRC_TAGS = frozenset(
 )
 MARKDOWN_HTML_INPUT_TAGS = frozenset({"input"})
 MARKDOWN_HTML_IMAGE_INPUT_TYPES = frozenset({"image"})
-MARKDOWN_HTML_DATA_ATTRIBUTES = frozenset({"data"})
 MARKDOWN_HTML_DATA_TAGS = frozenset({"object"})
 MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
@@ -343,6 +342,7 @@ HTML_FLOATING_POINT_NUMBER = re.compile(
 HTML_ASCII_WHITESPACE = frozenset("\t\n\f\r ")
 HTML_CHARACTER_REFERENCE_MAX_LENGTH = max(len(name) for name in HTML5_ENTITIES)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+URI_SPAN = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
 URL_INTERNAL_ASCII_WHITESPACE_TRANSLATION = str.maketrans("", "", "\t\n\r")
 CSS_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 PERCENT_ENCODED_PATH_SEPARATOR = re.compile(r"(%(?:2[fF]|5[cC]))")
@@ -994,7 +994,7 @@ def mask_markdown_raw_html_blocks(
             if opening_tag is not None:
                 normalize_raw_html_attribute_names(*opening_tag.span())
             closing = re.compile(
-                rf"</{re.escape(tag_name)}[ \t]*>", re.IGNORECASE
+                rf"</{re.escape(tag_name)}[ \t\f\r\n]*>", re.IGNORECASE
             )
             closing_match = closing.search(
                 text,
@@ -1022,6 +1022,9 @@ def mask_markdown_raw_html_blocks(
             skip_until = line_end_after(raw_end, raw_container_end)
             if opening_tag is None:
                 mask(content_start, skip_until)
+            elif tag_name == "style" and closing_match is not None:
+                mask(opening_tag.end(), closing_match.start())
+                mask_except_html_tags(closing_match.start(), skip_until)
             elif tag_name == "pre":
                 mask_except_html_tags(opening_tag.end(), skip_until)
             else:
@@ -2689,25 +2692,27 @@ def css_variable_references(text: str) -> list[tuple[str, int]]:
     return references
 
 
-def css_unused_custom_property_value_ranges(text: str) -> list[tuple[int, int]]:
-    """Return value ranges for custom properties never referenced by live CSS."""
+def css_used_custom_properties(
+    texts: list[str],
+    initially_used: set[str] | frozenset[str] = frozenset(),
+) -> set[str]:
+    """Return custom properties consumed across a collection of style sources."""
 
-    declarations = css_custom_property_declarations(text)
-    if not declarations:
-        return []
-    starts = [start for _, start, _ in declarations]
     dependencies: dict[str, set[str]] = {}
-    used: set[str] = set()
-    for name, position in css_variable_references(text):
-        declaration_index = bisect_right(starts, position) - 1
-        if (
-            declaration_index >= 0
-            and position < declarations[declaration_index][2]
-        ):
-            owner = declarations[declaration_index][0]
-            dependencies.setdefault(owner, set()).add(name)
-        else:
-            used.add(name)
+    used = set(initially_used)
+    for text in texts:
+        declarations = css_custom_property_declarations(text)
+        starts = [start for _, start, _ in declarations]
+        for name, position in css_variable_references(text):
+            declaration_index = bisect_right(starts, position) - 1
+            if (
+                declaration_index >= 0
+                and position < declarations[declaration_index][2]
+            ):
+                owner = declarations[declaration_index][0]
+                dependencies.setdefault(owner, set()).add(name)
+            else:
+                used.add(name)
     pending = list(used)
     while pending:
         name = pending.pop()
@@ -2715,6 +2720,19 @@ def css_unused_custom_property_value_ranges(text: str) -> list[tuple[int, int]]:
             if dependency not in used:
                 used.add(dependency)
                 pending.append(dependency)
+    return used
+
+
+def css_unused_custom_property_value_ranges(
+    text: str,
+    used_custom_properties: set[str] | frozenset[str] = frozenset(),
+) -> list[tuple[int, int]]:
+    """Return value ranges for custom properties never referenced by live CSS."""
+
+    declarations = css_custom_property_declarations(text)
+    if not declarations:
+        return []
+    used = css_used_custom_properties([text], used_custom_properties)
     return [
         (start, end)
         for name, start, end in declarations
@@ -2722,7 +2740,11 @@ def css_unused_custom_property_value_ranges(text: str) -> list[tuple[int, int]]:
     ]
 
 
-def css_resource_references(text: str) -> list[tuple[str, bool]]:
+def css_resource_references(
+    text: str,
+    *,
+    used_custom_properties: set[str] | frozenset[str] = frozenset(),
+) -> list[tuple[str, bool]]:
     """Extract CSS resource URLs and whether each requires a file path."""
 
     targets: list[tuple[str, bool]] = []
@@ -2730,7 +2752,9 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
     ignored_url_starts: set[int] = set()
     ignored_supports_condition_end = -1
     valid_import_starts = css_top_level_import_starts(text)
-    unused_custom_property_ranges = css_unused_custom_property_value_ranges(text)
+    unused_custom_property_ranges = css_unused_custom_property_value_ranges(
+        text, used_custom_properties
+    )
     unused_custom_property_starts = [
         start for start, _ in unused_custom_property_ranges
     ]
@@ -3102,6 +3126,19 @@ def html_has_ancestor(
     )
 
 
+def html_has_direct_parent(
+    element_stack: list[tuple[str, str, dict[str, str]]],
+    tags: frozenset[str],
+) -> bool:
+    """Return whether the direct parent is an HTML element with a given tag."""
+
+    return bool(
+        element_stack
+        and element_stack[-1][1] == HTML_NAMESPACE
+        and element_stack[-1][0] in tags
+    )
+
+
 class HTMLContextResourceParser(HTMLParser):
     """Collect resources whose HTML meaning depends on ancestor context."""
 
@@ -3132,10 +3169,10 @@ class HTMLContextResourceParser(HTMLParser):
         if tag == "template" and namespace == HTML_NAMESPACE:
             self.template_depth = 1
             return
-        picture_ancestor = html_has_ancestor(
+        picture_parent = html_has_direct_parent(
             self.element_stack, frozenset({"picture"})
         )
-        media_ancestor = html_has_ancestor(
+        media_parent = html_has_direct_parent(
             self.element_stack, frozenset({"audio", "video"})
         )
         if tag == "base" and "href" in values and namespace == HTML_NAMESPACE:
@@ -3144,20 +3181,25 @@ class HTMLContextResourceParser(HTMLParser):
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
             and "src" in values
-            and media_ancestor
-            and not picture_ancestor
+            and media_parent
         ):
             self.targets.append((values["src"], False, True))
         if (
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
             and "srcset" in values
-            and picture_ancestor
+            and picture_parent
         ):
             self.targets.extend(
                 (candidate, False, True)
                 for candidate in html_srcset_candidates(values["srcset"])
             )
+        if (
+            canonical_tag in MARKDOWN_HTML_DATA_TAGS
+            and namespace == HTML_NAMESPACE
+            and "data" in values
+        ):
+            self.targets.append((values["data"], False, True))
         if (
             tag == "image"
             and "src" in values
@@ -3230,6 +3272,7 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.srcdocs: list[str] = []
         self.base_href: str | None = None
         self.style_content: list[str] | None = None
+        self.style_sources: list[str] = []
         self.template_depth = 0
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
@@ -3250,10 +3293,10 @@ class HTMLFragmentResourceParser(HTMLParser):
         if tag == "template" and namespace == HTML_NAMESPACE:
             self.template_depth = 1
             return
-        picture_ancestor = html_has_ancestor(
+        picture_parent = html_has_direct_parent(
             self.element_stack, frozenset({"picture"})
         )
-        media_ancestor = html_has_ancestor(
+        media_parent = html_has_direct_parent(
             self.element_stack, frozenset({"audio", "video"})
         )
         if (
@@ -3342,8 +3385,7 @@ class HTMLFragmentResourceParser(HTMLParser):
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
             and "src" in values
-            and media_ancestor
-            and not picture_ancestor
+            and media_parent
         ):
             self.targets.append((values["src"], False, True))
         if (
@@ -3352,7 +3394,11 @@ class HTMLFragmentResourceParser(HTMLParser):
             and "src" in values
         ):
             self.targets.append((values["src"], False, True))
-        if tag in MARKDOWN_HTML_DATA_TAGS and "data" in values:
+        if (
+            canonical_tag in MARKDOWN_HTML_DATA_TAGS
+            and namespace == HTML_NAMESPACE
+            and "data" in values
+        ):
             self.targets.append((values["data"], False, True))
         if tag in MARKDOWN_HTML_POSTER_TAGS and "poster" in values:
             self.targets.append((values["poster"], False, True))
@@ -3369,7 +3415,7 @@ class HTMLFragmentResourceParser(HTMLParser):
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
             and "srcset" in values
-            and picture_ancestor
+            and picture_parent
         ):
             self.targets.extend(
                 (candidate, False, True)
@@ -3382,12 +3428,7 @@ class HTMLFragmentResourceParser(HTMLParser):
         ):
             self.srcdocs.append(values["srcdoc"])
         if "style" in values:
-            self.targets.extend(
-                (target, False, requires_file)
-                for target, requires_file in css_resource_references(
-                    values["style"]
-                )
-            )
+            self.style_sources.append(values["style"])
         if (
             canonical_tag in MARKDOWN_HTML_META_TAGS
             and namespace == HTML_NAMESPACE
@@ -3428,25 +3469,26 @@ class HTMLFragmentResourceParser(HTMLParser):
         if self.template_depth:
             return
         if tag == "style" and self.style_content is not None:
-            self.targets.extend(
-                (target, False, requires_file)
-                for target, requires_file in css_resource_references(
-                    "".join(self.style_content)
-                )
-            )
+            self.style_sources.append("".join(self.style_content))
             self.style_content = None
         html_pop_element_context(self.element_stack, tag)
 
     def finish(self) -> None:
         self.close()
         if self.style_content is not None:
+            self.style_sources.append("".join(self.style_content))
+            self.style_content = None
+        used_custom_properties = css_used_custom_properties(
+            self.style_sources
+        )
+        for style_source in self.style_sources:
             self.targets.extend(
                 (target, False, requires_file)
                 for target, requires_file in css_resource_references(
-                    "".join(self.style_content)
+                    style_source,
+                    used_custom_properties=used_custom_properties,
                 )
             )
-            self.style_content = None
 
 
 class HTMLDocumentFragmentParser(HTMLParser):
@@ -3775,7 +3817,7 @@ def html_style_contents(text: str) -> list[str]:
 
     contents: list[str] = []
     paragraph_boundaries = markdown_paragraph_boundaries(text)
-    closing = re.compile(r"</style[ \t]*>", re.IGNORECASE)
+    closing = re.compile(r"</style[ \t\f\r\n]*>", re.IGNORECASE)
     for tag in MARKDOWN_HTML_TAG.finditer(text):
         if not re.match(r"<style(?=[\s>])", tag.group(0), re.IGNORECASE):
             continue
@@ -3843,7 +3885,11 @@ def resolve_html_targets(
     return resolved
 
 
-def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
+def html_resource_targets(
+    text: str,
+    *,
+    additional_style_sources: list[str] | None = None,
+) -> list[tuple[str, bool, bool]]:
     """Collect navigations and resource requests from rendered HTML."""
 
     attribute_text = mask_html_template_contents(
@@ -3938,14 +3984,6 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
             attribute_text,
-            MARKDOWN_HTML_DATA_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_DATA_TAGS,
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, True)
-        for target in html_attribute_values(
-            attribute_text,
             MARKDOWN_HTML_POSTER_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_POSTER_TAGS,
         )
@@ -3972,19 +4010,22 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
         )
         for candidate in html_srcset_candidates(html_attribute_unescape(value))
     )
-    for style_content in html_style_contents(text):
-        targets.extend(
-            (target, False, requires_file)
-            for target, requires_file in css_resource_references(style_content)
+    style_sources = list(additional_style_sources or [])
+    style_sources.extend(html_style_contents(text))
+    style_sources.extend(
+        html_attribute_unescape(style_attribute)
+        for style_attribute in html_attribute_values(
+            attribute_text,
+            MARKDOWN_HTML_STYLE_ATTRIBUTES,
         )
-    for style_attribute in html_attribute_values(
-        attribute_text,
-        MARKDOWN_HTML_STYLE_ATTRIBUTES,
-    ):
+    )
+    used_custom_properties = css_used_custom_properties(style_sources)
+    for style_source in style_sources:
         targets.extend(
             (target, False, requires_file)
             for target, requires_file in css_resource_references(
-                html_attribute_unescape(style_attribute)
+                style_source,
+                used_custom_properties=used_custom_properties,
             )
         )
     for content in html_attribute_values(
@@ -4455,13 +4496,11 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         if label in reference_usages
     )
     targets.extend(
-        html_resource_targets(rendered_html_text)
-    )
-    for style_content in style_contents:
-        targets.extend(
-            (target, False, requires_file)
-            for target, requires_file in css_resource_references(style_content)
+        html_resource_targets(
+            rendered_html_text,
+            additional_style_sources=style_contents,
         )
+    )
     return targets
 
 
@@ -4989,6 +5028,20 @@ def find_broken_links(root: Path) -> list[str]:
     return errors
 
 
+def remote_uri_spans(text: str) -> list[tuple[int, int]]:
+    """Return spans for authority-based non-file URIs in portable text."""
+
+    spans: list[tuple[int, int]] = []
+    for match in URI_SPAN.finditer(text):
+        try:
+            parsed = urlsplit(match.group(0))
+        except ValueError:
+            continue
+        if parsed.netloc and parsed.scheme.casefold() != "file":
+            spans.append(match.span())
+    return spans
+
+
 def find_portability_violations(skill_root: Path) -> list[str]:
     errors: list[str] = []
     for path in sorted(
@@ -5008,11 +5061,18 @@ def find_portability_violations(skill_root: Path) -> list[str]:
                     f"{path.relative_to(skill_root)}: undecodable textual resource"
                 )
             continue
+        uri_spans = remote_uri_spans(text)
         for label, pattern in PORTABILITY_PATTERNS.items():
-            match = pattern.search(text)
-            if match:
+            for match in pattern.finditer(text):
+                if label.startswith("machine-specific ") and any(
+                    start <= match.start() < end for start, end in uri_spans
+                ):
+                    continue
                 line = text.count("\n", 0, match.start()) + 1
-                errors.append(f"{path.relative_to(skill_root)}:{line}: {label} in portable core")
+                errors.append(
+                    f"{path.relative_to(skill_root)}:{line}: {label} in portable core"
+                )
+                break
     return errors
 
 
