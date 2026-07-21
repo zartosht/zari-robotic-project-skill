@@ -6,11 +6,11 @@ Until the first tagged release, only the current default branch is supported. Af
 
 ## Report Privately
 
-Use GitHub private vulnerability reporting when the repository is published:
+GitHub private vulnerability reporting is enabled for this public repository. Use:
 
 `https://github.com/zartosht/zari-robotic-project-skill/security/advisories/new`
 
-The owner must enable private vulnerability reporting and verify this URL before making the repository public. Publication is blocked until that check succeeds.
+If a private successor or mirror is prepared for publication, first establish a monitored private contact channel for pre-publication reports. Make the repository public in a controlled step without announcing it, immediately enable private vulnerability reporting and verify the advisory URL, and announce the repository only after that check succeeds. GitHub exposes the setting only after a repository is public, so it is not a pre-publication gate.
 
 If private reporting is unavailable after publication, do not publish sensitive details. Open a minimal issue asking the maintainer to establish a monitored private contact channel, without including exploit steps, personal data, credentials, or dangerous physical instructions.
 

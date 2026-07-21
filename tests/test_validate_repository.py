@@ -67,6 +67,45 @@ class LinkTests(unittest.TestCase):
             self.assertIn("page.html", errors[0])
             self.assertIn("missing.png", errors[0])
 
+    def test_scans_local_web_manifest_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<link rel="manifest" href="site.webmanifest">\n'
+                '<link rel="manifest" href="app.json">\n',
+                encoding="utf-8",
+            )
+            (root / "site.webmanifest").write_text(
+                '{"icons":[{"src":"assets/missing-icon.png"}]}\n',
+                encoding="utf-8",
+            )
+            (root / "app.json").write_text(
+                '{"screenshots":[{"src":"missing-screen.png"}]}\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-icon.png" in error for error in errors))
+            self.assertTrue(any("missing-screen.png" in error for error in errors))
+
+    def test_validates_download_target_without_traversing_its_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<a href="archive.html#ignored-fragment" download>Archive</a>\n'
+                '<a href="missing.html" download>Missing</a>\n',
+                encoding="utf-8",
+            )
+            (root / "archive.html").write_text(
+                '<img src="nested-missing.png">\n', encoding="utf-8"
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.html", errors[0])
+            self.assertFalse(any("nested-missing.png" in error for error in errors))
+
     def test_recursively_scans_linked_html_with_cycle_protection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3494,6 +3533,36 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("docs/missing-button.md" in error for error in errors))
             self.assertTrue(any("docs/missing-input.md" in error for error in errors))
 
+    def test_ignores_dialog_form_submission_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<dialog><form method="DIALOG" action="ignored-action.html">'
+                '<button formaction="ignored-owned.html">Close</button>'
+                "</form></dialog>\n"
+                '<form method="dialog" action="missing-action-override.html">'
+                '<button formmethod="post">Submit</button></form>\n'
+                '<form method="dialog" action="ignored-overridden-action.html">'
+                '<button formmethod="post" formaction="missing-post.html">'
+                "</button></form>\n"
+                '<form action="existing.html"><button formmethod="dialog" '
+                'formaction="ignored-override.html">Close</button></form>\n'
+                '<iframe srcdoc="<form method=\047dialog\047 '
+                'action=\047ignored-srcdoc.html\047><button '
+                'formaction=\047ignored-srcdoc-owned.html\047>Close</button>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            (root / "existing.html").write_text("ok\n", encoding="utf-8")
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertIn("missing-post.html", errors[0])
+            self.assertTrue(
+                any("missing-action-override.html" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-" in error for error in errors))
+
     def test_validates_formaction_only_for_controls_with_form_owners(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4034,15 +4103,30 @@ class LinkTests(unittest.TestCase):
                 '<button form="absent" formaction="ignored-ownerless.html">'
                 'No owner</button><button form="target" '
                 'formaction="missing-explicit.html">Explicit</button>'
-                '<form id="target"/></body></html>\n',
+                '<form id="target"/>'
+                '<form method="dialog" action="ignored-dialog-action.html">'
+                '<button formaction="ignored-dialog-formaction.html">Close</button>'
+                '</form><form method="dialog" '
+                'action="missing-dialog-override-action.html">'
+                '<button formmethod="post">Submit</button></form>'
+                '<form action="existing.html"><button formmethod="dialog" '
+                'formaction="ignored-dialog-override.html">Close</button></form>'
+                '</body></html>\n',
                 encoding="utf-8",
             )
+            (root / "existing.html").write_text("ok\n", encoding="utf-8")
 
             errors = validator.find_broken_links(root)
-            self.assertEqual(2, len(errors))
+            self.assertEqual(3, len(errors))
             self.assertTrue(any("missing-owned.html" in error for error in errors))
             self.assertTrue(
                 any("missing-explicit.html" in error for error in errors)
+            )
+            self.assertTrue(
+                any(
+                    "missing-dialog-override-action.html" in error
+                    for error in errors
+                )
             )
             self.assertFalse(
                 any("ignored-ownerless.html" in error for error in errors)
@@ -4419,6 +4503,12 @@ class SkillWorkflowTests(unittest.TestCase):
 
 
 class SafetyDocumentationTests(unittest.TestCase):
+    def test_private_reporting_gate_matches_github_publication_order(self) -> None:
+        security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertIn("public in a controlled step without announcing it", security)
+        self.assertIn("immediately enable private vulnerability reporting", security)
+        self.assertIn("not a pre-publication gate", security)
+
     def test_readme_requires_physical_stop_for_all_hazardous_motion(self) -> None:
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("motion capable of injury or material property damage requires", readme)

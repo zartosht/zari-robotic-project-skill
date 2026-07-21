@@ -110,11 +110,11 @@ The portable core is `build-robot-project/SKILL.md`, `references/`, and `assets/
 
 ## Quick Start
 
-The proposed public URL is `https://github.com/zartosht/zari-robotic-project-skill`. It will not work until the owner explicitly authorizes publication.
+The public repository is `https://github.com/zartosht/zari-robotic-project-skill`.
 
 From this checkout, point a supported agent at `build-robot-project/SKILL.md`, or link/copy the whole `build-robot-project` directory into the client-specific location below. Review the skill before enabling it; skills may read files, research the web, and create project files when invoked.
 
-After publication:
+Clone it with:
 
 ```bash
 git clone https://github.com/zartosht/zari-robotic-project-skill.git
@@ -407,7 +407,7 @@ Licensed under the [Apache License 2.0](LICENSE), including an explicit patent g
 
 ## Project Status and Limitations
 
-Status: owner-review candidate; not yet published or released.
+Status: public repository under owner review; not yet released.
 
 - The format and client documentation were checked on 2026-07-20.
 - Native support labels are documentation-backed; cross-client hands-on execution can still vary by version, policy, and environment.
@@ -415,6 +415,6 @@ Status: owner-review candidate; not yet published or released.
 - Prices, stock, shipping, and product revisions can change after research.
 - The skill cannot inspect physical wiring, measure current, or certify a machine from text alone.
 - Beginner guidance reduces ambiguity but does not replace qualified supervision.
-- No public GitHub repository, release, package, or installer should be assumed to exist until publication is explicitly authorized.
-- GitHub private vulnerability reporting must be enabled and its advisory URL verified before the repository is made public.
+- The GitHub repository is public, but no tagged release, package, or installer should be assumed to exist until one is explicitly published.
+- GitHub private vulnerability reporting is enabled. For any future private-to-public publication, follow the controlled enablement and verification sequence in `SECURITY.md` before announcement.
 - The standard validator source is commit-pinned in CI; its Python transitive dependencies are still resolved from the package index at workflow time.

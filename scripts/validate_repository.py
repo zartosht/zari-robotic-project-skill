@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import re
@@ -328,6 +329,7 @@ HTML_SELECT_ALLOWED_START_TAGS = frozenset(
 )
 HTML_SELECT_BREAKOUT_START_TAGS = frozenset({"input", "keygen", "textarea"})
 MARKDOWN_HTML_SUBMIT_INPUT_TYPES = frozenset({"image", "submit"})
+WEB_MANIFEST_RESOURCE_ARRAY_MEMBERS = frozenset({"icons", "screenshots"})
 HTML_NAMESPACE = "html"
 SVG_NAMESPACE = "svg"
 MATHML_NAMESPACE = "mathml"
@@ -3545,21 +3547,51 @@ def html_formaction_value(
 ) -> str | None:
     """Return a submit control's formaction value, if it can override one."""
 
-    if namespace != HTML_NAMESPACE or "formaction" not in attributes:
+    if (
+        "formaction" not in attributes
+        or not html_is_submit_control(tag, namespace, attributes)
+    ):
         return None
+    return attributes["formaction"]
+
+
+def html_is_submit_control(
+    tag: str, namespace: str, attributes: dict[str, str]
+) -> bool:
+    """Return whether an HTML element can submit an associated form."""
+
+    if namespace != HTML_NAMESPACE:
+        return False
     if (
         tag in MARKDOWN_HTML_BUTTON_TAGS
         and attributes.get("type", "").casefold()
         not in MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES
     ):
-        return attributes["formaction"]
+        return True
     if (
         tag in MARKDOWN_HTML_INPUT_TAGS
         and attributes.get("type", "").casefold()
         in MARKDOWN_HTML_SUBMIT_INPUT_TYPES
     ):
-        return attributes["formaction"]
-    return None
+        return True
+    return False
+
+
+def html_form_method(attributes: dict[str, str]) -> str:
+    """Return the normalized form submission method keyword."""
+
+    return attributes.get("method", "").strip().casefold()
+
+
+def html_navigation_href_target(
+    target: str, attributes: dict[str, str]
+) -> tuple[str, bool]:
+    """Return a navigation URL and whether it is an existence-only download."""
+
+    if "download" not in attributes:
+        return target, False
+    target = target.split("#", 1)[0]
+    return target, bool(target)
 
 
 def html_link_href_should_validate(relations: frozenset[str]) -> bool:
@@ -3571,20 +3603,62 @@ def html_link_href_should_validate(relations: frozenset[str]) -> bool:
 
 
 def html_owned_formaction_targets(
-    candidates: list[tuple[str, str | None, bool]],
+    candidates: list[tuple[str, str | None, bool, str, str | None]],
     first_id_elements: dict[str, tuple[str, str]],
+    first_id_form_methods: dict[str, str],
 ) -> list[tuple[str, bool, bool]]:
-    """Return formaction targets whose controls have an effective form owner."""
+    """Return navigable formactions for controls with effective form owners."""
 
-    return [
-        (target, False, False)
-        for target, explicit_form_id, inside_form in candidates
-        if (
-            inside_form
-            if explicit_form_id is None
-            else first_id_elements.get(explicit_form_id)
-            == ("form", HTML_NAMESPACE)
+    targets: list[tuple[str, bool, bool]] = []
+    for (
+        target,
+        explicit_form_id,
+        inside_form,
+        ancestor_form_method,
+        submitter_form_method,
+    ) in candidates:
+        if explicit_form_id is None:
+            if not inside_form:
+                continue
+            owner_method = ancestor_form_method
+        else:
+            if first_id_elements.get(explicit_form_id) != (
+                "form",
+                HTML_NAMESPACE,
+            ):
+                continue
+            owner_method = first_id_form_methods.get(explicit_form_id, "")
+        effective_method = (
+            submitter_form_method
+            if submitter_form_method is not None
+            else owner_method
         )
+        if effective_method != "dialog":
+            targets.append((target, False, False))
+    return targets
+
+
+def html_overridden_dialog_form_action_targets(
+    forms: list[tuple[str | None, str]],
+    candidates: list[tuple[str | None, int | None]],
+    first_id_form_indexes: dict[str, int],
+) -> list[tuple[str, bool, bool]]:
+    """Return dialog-form actions reached by non-dialog submitter overrides."""
+
+    form_indexes = {
+        (
+            ancestor_form_index
+            if explicit_form_id is None
+            else first_id_form_indexes.get(explicit_form_id)
+        )
+        for explicit_form_id, ancestor_form_index in candidates
+    }
+    return [
+        (action, False, False)
+        for form_index, (action, method) in enumerate(forms)
+        if form_index in form_indexes
+        and action is not None
+        and method == "dialog"
     ]
 
 
@@ -3598,12 +3672,23 @@ class HTMLContextResourceParser(HTMLParser):
         self.targets: list[tuple[str, bool, bool]] = []
         self.embedded_document_targets: list[str] = []
         self.stylesheet_targets: list[str] = []
+        self.manifest_targets: list[str] = []
         self.module_script_targets: list[str] = []
         self.module_script_content: list[str] | None = None
         self.base_hrefs: list[str] = []
-        self.formaction_candidates: list[tuple[str, str | None, bool]] = []
+        self.formaction_candidates: list[
+            tuple[str, str | None, bool, str, str | None]
+        ] = []
         self.first_id_elements: dict[str, tuple[str, str]] = {}
+        self.first_id_form_methods: dict[str, str] = {}
+        self.first_id_form_indexes: dict[str, int] = {}
+        self.forms: list[tuple[str | None, str]] = []
+        self.form_action_override_candidates: list[
+            tuple[str | None, int | None]
+        ] = []
         self.form_active = False
+        self.active_form_method = ""
+        self.active_form_index: int | None = None
         self.template_depth = 0
         self.in_select = False
         self.frameset_depth = 0
@@ -3655,11 +3740,32 @@ class HTMLContextResourceParser(HTMLParser):
             if self.form_active:
                 return
             self.form_active = True
-            if "action" in values:
+            self.active_form_method = html_form_method(values)
+            self.active_form_index = len(self.forms)
+            self.forms.append((values.get("action"), self.active_form_method))
+            if "action" in values and self.active_form_method != "dialog":
                 self.targets.append((values["action"], False, False))
-        if "id" in values:
-            self.first_id_elements.setdefault(
-                values["id"], (canonical_tag, namespace)
+        if "id" in values and values["id"] not in self.first_id_elements:
+            self.first_id_elements[values["id"]] = (canonical_tag, namespace)
+            if canonical_tag == "form" and namespace == HTML_NAMESPACE:
+                self.first_id_form_methods[values["id"]] = html_form_method(
+                    values
+                )
+                if self.active_form_index is not None:
+                    self.first_id_form_indexes[values["id"]] = (
+                        self.active_form_index
+                    )
+        if (
+            html_is_submit_control(canonical_tag, namespace, values)
+            and "formmethod" in values
+            and values.get("formmethod", "").strip().casefold() != "dialog"
+            and "formaction" not in values
+        ):
+            self.form_action_override_candidates.append(
+                (
+                    values.get("form") if "form" in values else None,
+                    self.active_form_index,
+                )
             )
         formaction = html_formaction_value(canonical_tag, namespace, values)
         if formaction is not None:
@@ -3668,6 +3774,12 @@ class HTMLContextResourceParser(HTMLParser):
                     formaction,
                     values.get("form") if "form" in values else None,
                     self.form_active,
+                    self.active_form_method,
+                    (
+                        values.get("formmethod", "").strip().casefold()
+                        if "formmethod" in values
+                        else None
+                    ),
                 )
             )
         picture_parent = html_has_direct_parent(
@@ -3683,14 +3795,20 @@ class HTMLContextResourceParser(HTMLParser):
             and namespace == HTML_NAMESPACE
             and "href" in values
         ):
-            self.targets.append((values["href"], False, False))
+            target, is_download = html_navigation_href_target(
+                values["href"], values
+            )
+            self.targets.append((target, False, is_download))
         if (
             canonical_tag == "area"
             and namespace == HTML_NAMESPACE
             and "href" in values
             and html_has_ancestor(self.element_stack, MARKDOWN_HTML_MAP_TAGS)
         ):
-            self.targets.append((values["href"], False, False))
+            target, is_download = html_navigation_href_target(
+                values["href"], values
+            )
+            self.targets.append((target, False, is_download))
         if (
             canonical_tag in MARKDOWN_HTML_LINK_TAGS
             and namespace == HTML_NAMESPACE
@@ -3708,6 +3826,8 @@ class HTMLContextResourceParser(HTMLParser):
                     self.targets.append((values["href"], False, is_resource))
                 if "stylesheet" in relations:
                     self.stylesheet_targets.append(values["href"])
+                if "manifest" in relations:
+                    self.manifest_targets.append(values["href"])
             if (
                 "preload" in relations
                 and values.get("as", "").casefold()
@@ -3834,6 +3954,8 @@ class HTMLContextResourceParser(HTMLParser):
             if not self.form_active:
                 return
             self.form_active = False
+            self.active_form_method = ""
+            self.active_form_index = None
         if tag == "script" and self.module_script_content is not None:
             self.finish_module_script_content()
         if tag == "frameset" and self.frameset_depth:
@@ -3867,6 +3989,7 @@ def html_context_resource_targets(
     *,
     embedded_document_targets: list[str] | None = None,
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
 ) -> list[tuple[str, bool, bool]]:
     """Return resource targets that require HTML ancestor context."""
@@ -3879,10 +4002,22 @@ def html_context_resource_targets(
         embedded_document_targets.extend(parser.embedded_document_targets)
     if stylesheet_targets is not None:
         stylesheet_targets.extend(parser.stylesheet_targets)
+    if manifest_targets is not None:
+        manifest_targets.extend(parser.manifest_targets)
     if module_script_targets is not None:
         module_script_targets.extend(parser.module_script_targets)
-    return parser.targets + html_owned_formaction_targets(
-        parser.formaction_candidates, parser.first_id_elements
+    return (
+        parser.targets
+        + html_owned_formaction_targets(
+            parser.formaction_candidates,
+            parser.first_id_elements,
+            parser.first_id_form_methods,
+        )
+        + html_overridden_dialog_form_action_targets(
+            parser.forms,
+            parser.form_action_override_candidates,
+            parser.first_id_form_indexes,
+        )
     )
 
 
@@ -3910,11 +4045,22 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.style_sources: list[str] = []
         self.used_custom_properties: set[str] = set()
         self.stylesheet_targets: list[str] = []
+        self.manifest_targets: list[str] = []
         self.module_script_targets: list[str] = []
         self.module_script_content: list[str] | None = None
-        self.formaction_candidates: list[tuple[str, str | None, bool]] = []
+        self.formaction_candidates: list[
+            tuple[str, str | None, bool, str, str | None]
+        ] = []
         self.first_id_elements: dict[str, tuple[str, str]] = {}
+        self.first_id_form_methods: dict[str, str] = {}
+        self.first_id_form_indexes: dict[str, int] = {}
+        self.forms: list[tuple[str | None, str]] = []
+        self.form_action_override_candidates: list[
+            tuple[str | None, int | None]
+        ] = []
         self.form_active = False
+        self.active_form_method = ""
+        self.active_form_index: int | None = None
         self.template_depth = 0
         self.in_select = False
         self.frameset_depth = 0
@@ -3970,11 +4116,32 @@ class HTMLFragmentResourceParser(HTMLParser):
             if self.form_active:
                 return
             self.form_active = True
-            if "action" in values:
+            self.active_form_method = html_form_method(values)
+            self.active_form_index = len(self.forms)
+            self.forms.append((values.get("action"), self.active_form_method))
+            if "action" in values and self.active_form_method != "dialog":
                 self.targets.append((values["action"], False, False))
-        if "id" in values:
-            self.first_id_elements.setdefault(
-                values["id"], (canonical_tag, namespace)
+        if "id" in values and values["id"] not in self.first_id_elements:
+            self.first_id_elements[values["id"]] = (canonical_tag, namespace)
+            if canonical_tag == "form" and namespace == HTML_NAMESPACE:
+                self.first_id_form_methods[values["id"]] = html_form_method(
+                    values
+                )
+                if self.active_form_index is not None:
+                    self.first_id_form_indexes[values["id"]] = (
+                        self.active_form_index
+                    )
+        if (
+            html_is_submit_control(canonical_tag, namespace, values)
+            and "formmethod" in values
+            and values.get("formmethod", "").strip().casefold() != "dialog"
+            and "formaction" not in values
+        ):
+            self.form_action_override_candidates.append(
+                (
+                    values.get("form") if "form" in values else None,
+                    self.active_form_index,
+                )
             )
         formaction = html_formaction_value(canonical_tag, namespace, values)
         if formaction is not None:
@@ -3983,6 +4150,12 @@ class HTMLFragmentResourceParser(HTMLParser):
                     formaction,
                     values.get("form") if "form" in values else None,
                     self.form_active,
+                    self.active_form_method,
+                    (
+                        values.get("formmethod", "").strip().casefold()
+                        if "formmethod" in values
+                        else None
+                    ),
                 )
             )
         picture_parent = html_has_direct_parent(
@@ -4008,14 +4181,20 @@ class HTMLFragmentResourceParser(HTMLParser):
             and namespace == HTML_NAMESPACE
             and "href" in values
         ):
-            self.targets.append((values["href"], False, False))
+            target, is_download = html_navigation_href_target(
+                values["href"], values
+            )
+            self.targets.append((target, False, is_download))
         if (
             canonical_tag == "area"
             and namespace == HTML_NAMESPACE
             and "href" in values
             and html_has_ancestor(self.element_stack, MARKDOWN_HTML_MAP_TAGS)
         ):
-            self.targets.append((values["href"], False, False))
+            target, is_download = html_navigation_href_target(
+                values["href"], values
+            )
+            self.targets.append((target, False, is_download))
         if (
             canonical_tag in MARKDOWN_HTML_LINK_TAGS
             and namespace == HTML_NAMESPACE
@@ -4035,6 +4214,8 @@ class HTMLFragmentResourceParser(HTMLParser):
                     )
                 if "stylesheet" in relations:
                     self.stylesheet_targets.append(values["href"])
+                if "manifest" in relations:
+                    self.manifest_targets.append(values["href"])
             if (
                 "preload" in relations
                 and values.get("as", "").casefold()
@@ -4202,6 +4383,8 @@ class HTMLFragmentResourceParser(HTMLParser):
             if not self.form_active:
                 return
             self.form_active = False
+            self.active_form_method = ""
+            self.active_form_index = None
         if tag == "style" and self.style_content is not None:
             self.style_sources.append("".join(self.style_content))
             self.style_content = None
@@ -4233,7 +4416,16 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.finish_module_script_content()
         self.targets.extend(
             html_owned_formaction_targets(
-                self.formaction_candidates, self.first_id_elements
+                self.formaction_candidates,
+                self.first_id_elements,
+                self.first_id_form_methods,
+            )
+        )
+        self.targets.extend(
+            html_overridden_dialog_form_action_targets(
+                self.forms,
+                self.form_action_override_candidates,
+                self.first_id_form_indexes,
             )
         )
         if self.style_content is not None:
@@ -4452,6 +4644,7 @@ def svg_xml_element_resource_targets(
     root: ElementTree.Element,
     *,
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
     used_custom_property_names: set[str] | None = None,
@@ -4462,6 +4655,7 @@ def svg_xml_element_resource_targets(
     targets: list[tuple[str, bool, bool]] = []
     style_sources: list[tuple[str, str]] = []
     document_stylesheet_targets: list[str] = []
+    document_manifest_targets: list[str] = []
     document_resource_targets: list[str] = []
     document_module_script_targets: list[str] = []
     srcdocs: list[tuple[str, str]] = []
@@ -4521,7 +4715,14 @@ def svg_xml_element_resource_targets(
                 style_sources.append(("".join(element.itertext()), effective_base))
         elif namespace == XHTML_XML_NAMESPACE and inside_foreign_object:
             if tag == "a" and "href" in attributes:
-                add_target(attributes["href"], effective_base, requires_file=False)
+                target, is_download = html_navigation_href_target(
+                    attributes["href"], attributes
+                )
+                add_target(
+                    target,
+                    effective_base,
+                    requires_file=is_download,
+                )
             if tag == "link":
                 relations = frozenset(
                     re.findall(
@@ -4545,6 +4746,8 @@ def svg_xml_element_resource_targets(
                         )
                     if "stylesheet" in relations:
                         document_stylesheet_targets.append(resolved_target)
+                    if "manifest" in relations:
+                        document_manifest_targets.append(resolved_target)
                 if (
                     "preload" in relations
                     and attributes.get("as", "").casefold()
@@ -4626,10 +4829,19 @@ def svg_xml_element_resource_targets(
                 add_target(
                     attributes["background"], effective_base, requires_file=True
                 )
-            if tag == "form" and "action" in attributes:
+            if (
+                tag == "form"
+                and "action" in attributes
+                and html_form_method(attributes) != "dialog"
+            ):
                 add_target(attributes["action"], effective_base, requires_file=False)
             formaction = html_formaction_value(tag, HTML_NAMESPACE, attributes)
-            if formaction is not None and "form" in attributes:
+            if (
+                formaction is not None
+                and "form" in attributes
+                and attributes.get("formmethod", "").strip().casefold()
+                != "dialog"
+            ):
                 add_target(formaction, effective_base, requires_file=False)
             if "style" in attributes:
                 style_sources.append((attributes["style"], effective_base))
@@ -4685,6 +4897,8 @@ def svg_xml_element_resource_targets(
         )
     if stylesheet_targets is not None:
         stylesheet_targets.extend(document_stylesheet_targets)
+    if manifest_targets is not None:
+        manifest_targets.extend(document_manifest_targets)
     if embedded_document_targets is not None:
         embedded_document_targets.extend(document_resource_targets)
     if module_script_targets is not None:
@@ -4695,6 +4909,7 @@ def svg_xml_element_resource_targets(
                 srcdoc,
                 inherited_base=srcdoc_base,
                 stylesheet_targets=stylesheet_targets,
+                manifest_targets=manifest_targets,
                 embedded_document_targets=embedded_document_targets,
                 module_script_targets=module_script_targets,
                 used_custom_property_names=used_custom_property_names,
@@ -4707,6 +4922,7 @@ def svg_document_resource_targets(
     text: str,
     *,
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
     used_custom_property_names: set[str] | None = None,
@@ -4720,6 +4936,7 @@ def svg_document_resource_targets(
     targets = svg_xml_element_resource_targets(
         root,
         stylesheet_targets=stylesheet_targets,
+        manifest_targets=manifest_targets,
         embedded_document_targets=embedded_document_targets,
         module_script_targets=module_script_targets,
         used_custom_property_names=used_custom_property_names,
@@ -4756,6 +4973,7 @@ def xhtml_document_resource_targets(
     text: str,
     *,
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
     used_custom_property_names: set[str] | None = None,
@@ -4770,20 +4988,28 @@ def xhtml_document_resource_targets(
     targets: list[tuple[str, bool, bool]] = []
     style_sources: list[tuple[str, str]] = []
     document_stylesheet_targets: list[str] = []
+    document_manifest_targets: list[str] = []
     document_resource_targets: list[str] = []
     document_module_script_targets: list[str] = []
     srcdocs: list[tuple[str, str]] = []
     first_id_elements: dict[str, tuple[str, str]] = {}
+    first_id_form_methods: dict[str, str] = {}
+    first_id_form_keys: dict[str, int] = {}
+    dialog_form_actions: dict[int, str] = {}
+    dialog_form_action_override_keys: set[int] = set()
     document_base = ""
     document_base_found = False
 
     for element in root.iter():
         namespace, tag = xml_expanded_name(element.tag)
         attributes = element.attrib
-        if "id" in attributes:
-            first_id_elements.setdefault(
-                attributes["id"], (tag, namespace)
-            )
+        if "id" in attributes and attributes["id"] not in first_id_elements:
+            first_id_elements[attributes["id"]] = (tag, namespace)
+            if namespace == XHTML_XML_NAMESPACE and tag == "form":
+                first_id_form_methods[attributes["id"]] = html_form_method(
+                    attributes
+                )
+                first_id_form_keys[attributes["id"]] = id(element)
         if (
             namespace == XHTML_XML_NAMESPACE
             and tag == "base"
@@ -4809,7 +5035,8 @@ def xhtml_document_resource_targets(
         element: ElementTree.Element,
         inherited_base: str,
         parent_name: tuple[str, str] = ("", ""),
-        inside_form: bool = False,
+        inside_form_method: str | None = None,
+        inside_form_key: int | None = None,
     ) -> None:
         namespace, tag = xml_expanded_name(element.tag)
         attributes = element.attrib
@@ -4822,10 +5049,23 @@ def xhtml_document_resource_targets(
             return
         if namespace != XHTML_XML_NAMESPACE:
             for child in element:
-                visit(child, effective_base, (namespace, tag), inside_form)
+                visit(
+                    child,
+                    effective_base,
+                    (namespace, tag),
+                    inside_form_method,
+                    inside_form_key,
+                )
             return
         if tag == "a" and "href" in attributes:
-            add_target(attributes["href"], effective_base, requires_file=False)
+            target, is_download = html_navigation_href_target(
+                attributes["href"], attributes
+            )
+            add_target(
+                target,
+                effective_base,
+                requires_file=is_download,
+            )
         if tag == "link":
             relations = frozenset(
                 re.findall(
@@ -4847,6 +5087,8 @@ def xhtml_document_resource_targets(
                     )
                 if "stylesheet" in relations:
                     document_stylesheet_targets.append(resolved_target)
+                if "manifest" in relations:
+                    document_manifest_targets.append(resolved_target)
             if (
                 "preload" in relations
                 and attributes.get("as", "").casefold()
@@ -4929,17 +5171,49 @@ def xhtml_document_resource_targets(
                 attributes["background"], effective_base, requires_file=True
             )
         if tag == "form" and "action" in attributes:
-            add_target(attributes["action"], effective_base, requires_file=False)
+            if html_form_method(attributes) == "dialog":
+                dialog_form_actions[id(element)] = xml_resolve_target(
+                    attributes["action"], effective_base
+                )
+            else:
+                add_target(
+                    attributes["action"],
+                    effective_base,
+                    requires_file=False,
+                )
+        if (
+            html_is_submit_control(tag, HTML_NAMESPACE, attributes)
+            and "formmethod" in attributes
+            and attributes.get("formmethod", "").strip().casefold()
+            != "dialog"
+            and "formaction" not in attributes
+        ):
+            explicit_form_id = attributes.get("form")
+            owner_key = (
+                inside_form_key
+                if explicit_form_id is None
+                else first_id_form_keys.get(explicit_form_id)
+            )
+            if owner_key is not None:
+                dialog_form_action_override_keys.add(owner_key)
         formaction = html_formaction_value(tag, HTML_NAMESPACE, attributes)
         if formaction is not None:
             explicit_form_id = attributes.get("form")
-            has_form_owner = (
-                inside_form
-                if explicit_form_id is None
-                else first_id_elements.get(explicit_form_id)
-                == ("form", XHTML_XML_NAMESPACE)
+            if explicit_form_id is None:
+                owner_method = inside_form_method
+            elif first_id_elements.get(explicit_form_id) == (
+                "form",
+                XHTML_XML_NAMESPACE,
+            ):
+                owner_method = first_id_form_methods.get(explicit_form_id, "")
+            else:
+                owner_method = None
+            submitter_method = (
+                attributes.get("formmethod", "").strip().casefold()
+                if "formmethod" in attributes
+                else owner_method
             )
-            if has_form_owner:
+            if owner_method is not None and submitter_method != "dialog":
                 add_target(formaction, effective_base, requires_file=False)
         if "style" in attributes:
             style_sources.append((attributes["style"], effective_base))
@@ -4957,21 +5231,35 @@ def xhtml_document_resource_targets(
                 )
         if tag == "iframe" and "srcdoc" in attributes:
             srcdocs.append((attributes["srcdoc"], effective_base))
-        descendant_inside_form = inside_form or tag == "form"
+        descendant_inside_form_method = (
+            html_form_method(attributes)
+            if tag == "form"
+            else inside_form_method
+        )
+        descendant_inside_form_key = (
+            id(element) if tag == "form" else inside_form_key
+        )
         for child in element:
             visit(
                 child,
                 effective_base,
                 (namespace, tag),
-                descendant_inside_form,
+                descendant_inside_form_method,
+                descendant_inside_form_key,
             )
 
     visit(root, document_base)
+    targets.extend(
+        (target, False, False)
+        for form_key, target in dialog_form_actions.items()
+        if form_key in dialog_form_action_override_keys
+    )
 
     targets.extend(
         svg_xml_element_resource_targets(
             root,
             stylesheet_targets=document_stylesheet_targets,
+            manifest_targets=document_manifest_targets,
             embedded_document_targets=document_resource_targets,
             module_script_targets=document_module_script_targets,
             used_custom_property_names=used_custom_property_names,
@@ -5003,6 +5291,7 @@ def xhtml_document_resource_targets(
                 srcdoc,
                 inherited_base=srcdoc_base,
                 stylesheet_targets=document_stylesheet_targets,
+                manifest_targets=document_manifest_targets,
                 embedded_document_targets=document_resource_targets,
                 module_script_targets=document_module_script_targets,
                 used_custom_property_names=used_custom_property_names,
@@ -5017,6 +5306,8 @@ def xhtml_document_resource_targets(
     document_stylesheet_targets.extend(processing_instruction_targets)
     if stylesheet_targets is not None:
         stylesheet_targets.extend(document_stylesheet_targets)
+    if manifest_targets is not None:
+        manifest_targets.extend(document_manifest_targets)
     if embedded_document_targets is not None:
         embedded_document_targets.extend(document_resource_targets)
     if module_script_targets is not None:
@@ -5059,6 +5350,7 @@ def html_fragment_resource_targets(
     *,
     inherited_base: str = "",
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
     used_custom_property_names: set[str] | None = None,
@@ -5098,6 +5390,17 @@ def html_fragment_resource_targets(
                     [
                         (target, False, True)
                         for target in parser.stylesheet_targets
+                    ],
+                    effective_base,
+                )
+            )
+        if manifest_targets is not None:
+            manifest_targets.extend(
+                target
+                for target, _, _ in resolve_html_targets(
+                    [
+                        (target, False, True)
+                        for target in parser.manifest_targets
                     ],
                     effective_base,
                 )
@@ -5397,6 +5700,7 @@ def html_resource_targets(
     additional_style_sources: list[str] | None = None,
     additional_module_script_sources: list[str] | None = None,
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
     used_custom_property_names: set[str] | None = None,
@@ -5411,12 +5715,14 @@ def html_resource_targets(
     targets: list[tuple[str, bool, bool]] = []
     document_resource_targets: list[str] = []
     document_stylesheet_targets: list[str] = []
+    document_manifest_targets: list[str] = []
     document_module_script_targets: list[str] = []
     targets.extend(
         html_context_resource_targets(
             text,
             embedded_document_targets=document_resource_targets,
             stylesheet_targets=document_stylesheet_targets,
+            manifest_targets=document_manifest_targets,
             module_script_targets=document_module_script_targets,
         )
     )
@@ -5489,6 +5795,17 @@ def html_resource_targets(
                 effective_base,
             )
         )
+    if manifest_targets is not None:
+        manifest_targets.extend(
+            target
+            for target, _, _ in resolve_html_targets(
+                [
+                    (target, False, True)
+                    for target in document_manifest_targets
+                ],
+                effective_base,
+            )
+        )
     if module_script_targets is not None:
         module_script_targets.extend(
             target
@@ -5511,6 +5828,7 @@ def html_resource_targets(
                 html_attribute_unescape(srcdoc),
                 inherited_base=effective_base,
                 stylesheet_targets=stylesheet_targets,
+                manifest_targets=manifest_targets,
                 embedded_document_targets=embedded_document_targets,
                 module_script_targets=module_script_targets,
                 used_custom_property_names=used_custom_property_names,
@@ -5832,6 +6150,7 @@ def markdown_link_targets(
     text: str,
     *,
     stylesheet_targets: list[str] | None = None,
+    manifest_targets: list[str] | None = None,
     embedded_document_targets: list[str] | None = None,
     module_script_targets: list[str] | None = None,
     used_custom_property_names: set[str] | None = None,
@@ -5980,6 +6299,7 @@ def markdown_link_targets(
             additional_style_sources=style_contents,
             additional_module_script_sources=module_script_contents,
             stylesheet_targets=stylesheet_targets,
+            manifest_targets=manifest_targets,
             embedded_document_targets=embedded_document_targets,
             module_script_targets=module_script_targets,
             used_custom_property_names=used_custom_property_names,
@@ -6610,6 +6930,66 @@ def javascript_static_module_specifiers(text: str) -> list[str]:
     return specifiers
 
 
+def web_manifest_resource_targets(
+    text: str,
+) -> list[tuple[str, bool, bool]] | None:
+    """Return browser-used URLs from a parsed web app manifest."""
+
+    try:
+        manifest = json.loads(text)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    targets: list[tuple[str, bool, bool]] = []
+
+    def add_member(
+        value: object, member: str, *, requires_file: bool
+    ) -> None:
+        if isinstance(value, dict) and isinstance(value.get(member), str):
+            targets.append((value[member], False, requires_file))
+
+    def add_resource_arrays(
+        value: object,
+        members: frozenset[str] = WEB_MANIFEST_RESOURCE_ARRAY_MEMBERS,
+    ) -> None:
+        if not isinstance(value, dict):
+            return
+        for member in members:
+            entries = value.get(member)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                add_member(entry, "src", requires_file=True)
+
+    add_member(manifest, "start_url", requires_file=False)
+    add_resource_arrays(manifest)
+
+    shortcuts = manifest.get("shortcuts")
+    if isinstance(shortcuts, list):
+        for shortcut in shortcuts:
+            add_member(shortcut, "url", requires_file=False)
+            add_resource_arrays(shortcut, frozenset({"icons"}))
+
+    share_target = manifest.get("share_target")
+    add_member(share_target, "action", requires_file=False)
+
+    for member, target_member in (
+        ("file_handlers", "action"),
+        ("protocol_handlers", "url"),
+        ("related_applications", "url"),
+    ):
+        entries = manifest.get(member)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            add_member(entry, target_member, requires_file=False)
+
+    add_member(manifest.get("serviceworker"), "src", requires_file=True)
+    return targets
+
+
 def find_broken_links(root: Path) -> list[str]:
     errors: list[str] = []
     repository_root = root.resolve()
@@ -6688,6 +7068,7 @@ def find_broken_links(root: Path) -> list[str]:
         )
 
     seen_stylesheets: set[tuple[Path, Path, Path]] = set()
+    seen_web_manifests: set[tuple[Path, Path]] = set()
     seen_html_documents: set[tuple[Path, Path]] = set()
     seen_svg_documents: set[tuple[Path, Path]] = set()
     seen_module_scripts: set[tuple[Path, Path]] = set()
@@ -6702,12 +7083,14 @@ def find_broken_links(root: Path) -> list[str]:
                 f"{fragment_target!r}"
             )
         stylesheet_targets: list[str] = []
+        manifest_targets: list[str] = []
         embedded_document_targets: list[str] = []
         module_script_targets: list[str] = []
         document_used_custom_properties: set[str] = set()
         link_targets = markdown_link_targets(
             text,
             stylesheet_targets=stylesheet_targets,
+            manifest_targets=manifest_targets,
             embedded_document_targets=embedded_document_targets,
             module_script_targets=module_script_targets,
             used_custom_property_names=document_used_custom_properties,
@@ -6720,6 +7103,7 @@ def find_broken_links(root: Path) -> list[str]:
             )
         )
         stylesheet_target_set = set(stylesheet_targets)
+        manifest_target_set = set(manifest_targets)
         embedded_document_target_set = set(embedded_document_targets)
         module_script_target_set = set(module_script_targets)
         pending_targets = [
@@ -6729,6 +7113,7 @@ def find_broken_links(root: Path) -> list[str]:
                 is_markdown,
                 requires_file,
                 raw_target in stylesheet_target_set,
+                raw_target in manifest_target_set,
                 raw_target in embedded_document_target_set,
                 raw_target in module_script_target_set,
                 path,
@@ -6741,6 +7126,7 @@ def find_broken_links(root: Path) -> list[str]:
             is_markdown,
             requires_file,
             scan_stylesheet,
+            scan_manifest,
             scan_embedded_document,
             scan_module_script,
             fragment_context_path,
@@ -6874,11 +7260,46 @@ def find_broken_links(root: Path) -> list[str]:
                             stylesheet_target in imported_target_set,
                             False,
                             False,
+                            False,
                             fragment_context_path,
                         )
                         for stylesheet_target, stylesheet_requires_file
                         in stylesheet_references
                     )
+            if (
+                scan_manifest
+                and resolved.is_file()
+                and (resolved, lexical_path) not in seen_web_manifests
+            ):
+                seen_web_manifests.add((resolved, lexical_path))
+                manifest_text = read_text_resource(resolved)
+                if manifest_text is not None:
+                    manifest_references = web_manifest_resource_targets(
+                        manifest_text
+                    )
+                    if manifest_references is None:
+                        errors.append(
+                            f"{display_path(lexical_path)}: invalid web manifest JSON"
+                        )
+                    else:
+                        pending_targets.extend(
+                            (
+                                lexical_path,
+                                manifest_target,
+                                manifest_is_markdown,
+                                manifest_requires_file,
+                                False,
+                                False,
+                                False,
+                                False,
+                                lexical_path,
+                            )
+                            for (
+                                manifest_target,
+                                manifest_is_markdown,
+                                manifest_requires_file,
+                            ) in manifest_references
+                        )
             if (
                 (not requires_file or scan_embedded_document)
                 and resolved.is_file()
@@ -6896,6 +7317,7 @@ def find_broken_links(root: Path) -> list[str]:
                                 f"{fragment_target!r}"
                             )
                     html_stylesheet_targets: list[str] = []
+                    html_manifest_targets: list[str] = []
                     html_document_targets: list[str] = []
                     html_module_script_targets: list[str] = []
                     html_used_custom_properties: set[str] = set()
@@ -6903,6 +7325,7 @@ def find_broken_links(root: Path) -> list[str]:
                         html_targets = xhtml_document_resource_targets(
                             html_text,
                             stylesheet_targets=html_stylesheet_targets,
+                            manifest_targets=html_manifest_targets,
                             embedded_document_targets=html_document_targets,
                             module_script_targets=html_module_script_targets,
                             used_custom_property_names=(
@@ -6913,6 +7336,7 @@ def find_broken_links(root: Path) -> list[str]:
                         html_targets = html_resource_targets(
                             html_text,
                             stylesheet_targets=html_stylesheet_targets,
+                            manifest_targets=html_manifest_targets,
                             embedded_document_targets=html_document_targets,
                             module_script_targets=html_module_script_targets,
                             used_custom_property_names=(
@@ -6927,6 +7351,7 @@ def find_broken_links(root: Path) -> list[str]:
                         )
                     )
                     html_stylesheet_target_set = set(html_stylesheet_targets)
+                    html_manifest_target_set = set(html_manifest_targets)
                     html_document_target_set = set(html_document_targets)
                     html_module_script_target_set = set(
                         html_module_script_targets
@@ -6938,6 +7363,7 @@ def find_broken_links(root: Path) -> list[str]:
                             html_is_markdown,
                             html_requires_file,
                             html_target in html_stylesheet_target_set,
+                            html_target in html_manifest_target_set,
                             html_target in html_document_target_set,
                             html_target in html_module_script_target_set,
                             lexical_path,
@@ -6955,12 +7381,14 @@ def find_broken_links(root: Path) -> list[str]:
                 svg_text = read_text_resource(resolved)
                 if svg_text is not None:
                     svg_stylesheet_targets: list[str] = []
+                    svg_manifest_targets: list[str] = []
                     svg_document_targets: list[str] = []
                     svg_module_script_targets: list[str] = []
                     svg_used_custom_properties: set[str] = set()
                     svg_targets = svg_document_resource_targets(
                         svg_text,
                         stylesheet_targets=svg_stylesheet_targets,
+                        manifest_targets=svg_manifest_targets,
                         embedded_document_targets=svg_document_targets,
                         module_script_targets=svg_module_script_targets,
                         used_custom_property_names=svg_used_custom_properties,
@@ -6973,6 +7401,7 @@ def find_broken_links(root: Path) -> list[str]:
                         )
                     )
                     svg_stylesheet_target_set = set(svg_stylesheet_targets)
+                    svg_manifest_target_set = set(svg_manifest_targets)
                     svg_document_target_set = set(svg_document_targets)
                     svg_module_script_target_set = set(
                         svg_module_script_targets
@@ -6984,6 +7413,7 @@ def find_broken_links(root: Path) -> list[str]:
                             svg_is_markdown,
                             svg_requires_file,
                             svg_target in svg_stylesheet_target_set,
+                            svg_target in svg_manifest_target_set,
                             svg_target in svg_document_target_set,
                             svg_target in svg_module_script_target_set,
                             lexical_path,
@@ -7005,6 +7435,7 @@ def find_broken_links(root: Path) -> list[str]:
                             module_target,
                             False,
                             True,
+                            False,
                             False,
                             False,
                             True,
