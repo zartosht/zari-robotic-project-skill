@@ -765,6 +765,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_keeps_indented_blocks_in_unused_footnotes_masked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "`[^unused]`\n\n"
+                "[^unused]: First paragraph\n\n"
+                "    ![inert](missing.png)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_rejects_footnote_fragment_for_unused_definition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1711,6 +1722,20 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("missing-large.png" in error for error in errors))
             self.assertTrue(any("missing-wide.png" in error for error in errors))
 
+    def test_suppresses_img_src_only_when_srcset_replaces_its_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<img src="overridden.png" srcset="existing.png 1x">\n'
+                '<img src="fallback.png" srcset="existing.png 2x">\n'
+                '<img src="width-overridden.png" srcset="existing.png 640w">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("fallback.png", errors[0])
+
     def test_decodes_srcset_entities_before_parsing_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1884,6 +1909,18 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("live.png", errors[0])
 
+    def test_excludes_inert_template_ids_from_fragment_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<template id="shell"><div id="hidden"></div></template>\n\n'
+                "[shell](#shell) [hidden](#hidden)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#hidden", errors[0])
+
     def test_ignores_markup_inside_html_raw_text_element_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2039,6 +2076,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("docs/picture.png", errors[0])
 
+    def test_applies_img_srcset_precedence_inside_srcdoc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<iframe srcdoc="<img src=\'missing.png\' '
+                'srcset=\'existing.png 1x\'>"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_inline_style_attribute_resource_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2063,6 +2111,53 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("missing.png" in error for error in errors))
             self.assertTrue(any("missing.css" in error for error in errors))
+
+    def test_validates_string_candidates_in_css_image_set_functions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div style="background-image:image-set(\'missing-inline.png\' 1x)"></div>\n'
+                "\n"
+                '<style>.hero { background-image: image-set("missing-block.png" 2x); }</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-inline.png" in error for error in errors))
+            self.assertTrue(any("missing-block.png" in error for error in errors))
+
+    def test_validates_same_document_css_url_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><filter id="blur"></filter></svg>\n'
+                '<div style="filter:url(#blur)"></div>\n'
+                '<div style="filter:url(#missing)"></div>\n'
+                "\n"
+                '<style>@import "#theme"; @import url(#theme-url);</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            self.assertFalse(any("#blur" in error for error in errors))
+            self.assertTrue(
+                any(
+                    "broken Markdown fragment #missing" in error
+                    for error in errors
+                )
+            )
+            self.assertTrue(
+                any(
+                    "resource target has no file path '#theme'" in error
+                    for error in errors
+                )
+            )
+            self.assertTrue(
+                any(
+                    "resource target has no file path '#theme-url'" in error
+                    for error in errors
+                )
+            )
 
     def test_rejects_fragment_only_file_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2170,18 +2265,22 @@ class LinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "page.html").write_text(
-                '<div id="present"></div><a name="legacy"></a>\n',
+                '<div id="present"></div><a name="legacy"></a>'
+                '<template id="shell"><div id="hidden"></div></template>\n',
                 encoding="utf-8",
             )
             (root / "README.md").write_text(
                 "[present](page.html#present) "
                 "[legacy](page.html#legacy) "
+                "[shell](page.html#shell) "
+                "[hidden](page.html#hidden) "
                 "[missing](page.html#missing)\n",
                 encoding="utf-8",
             )
             errors = validator.find_broken_links(root)
-            self.assertEqual(1, len(errors))
-            self.assertIn("page.html#missing", errors[0])
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("page.html#hidden" in error for error in errors))
+            self.assertTrue(any("page.html#missing" in error for error in errors))
 
     def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2360,6 +2459,17 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("existing.png", errors[0])
+
+    def test_removes_internal_url_tabs_and_newlines_before_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<img src="exis\nting.png">\n'
+                '<img src="ht\ntps://example.com/image.png">\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_handles_cr_only_line_end_after_type_one_html_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

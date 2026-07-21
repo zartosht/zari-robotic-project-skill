@@ -247,6 +247,7 @@ HTML_FLOATING_POINT_NUMBER = re.compile(
 HTML_ASCII_WHITESPACE = frozenset("\t\n\f\r ")
 HTML_CHARACTER_REFERENCE_MAX_LENGTH = max(len(name) for name in HTML5_ENTITIES)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+URL_INTERNAL_ASCII_WHITESPACE_TRANSLATION = str.maketrans("", "", "\t\n\r")
 CSS_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 PERCENT_ENCODED_PATH_SEPARATOR = re.compile(r"(%(?:2[fF]|5[cC]))")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
@@ -1005,8 +1006,79 @@ def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
     return 0
 
 
+def markdown_normalize_footnote_label(label: str) -> str:
+    """Normalize one GFM footnote label for matching."""
+
+    label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", label)
+    return markdown_unescape(label).casefold()
+
+
+def markdown_footnote_reference_labels(searchable_text: str) -> set[str]:
+    """Return rendered footnote labels referenced by searchable Markdown."""
+
+    characters = list(searchable_text)
+    lines_with_endings = searchable_text.splitlines(keepends=True)
+    lines = [line.rstrip("\r\n") for line in lines_with_endings]
+    container_lines = markdown_container_lines(lines)
+    offset = 0
+    for line, (_, content) in zip(lines_with_endings, container_lines):
+        if MARKDOWN_FOOTNOTE_DEFINITION.match(content) is not None:
+            for position in range(offset, offset + len(line)):
+                if characters[position] not in "\r\n":
+                    characters[position] = " "
+        offset += len(line)
+
+    paragraph_boundaries = markdown_paragraph_boundaries(searchable_text)
+    for tag in MARKDOWN_HTML_TAG.finditer(searchable_text):
+        if not markdown_html_tag_is_rendered(
+            searchable_text, tag, paragraph_boundaries
+        ):
+            continue
+        for position in range(*tag.span()):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+
+    labels_text = "".join(characters)
+    label_pairs = markdown_label_pairs(labels_text)
+    inline_context = markdown_inline_block_context(labels_text)
+    for label_start, label_end in label_pairs.items():
+        if (
+            label_start == 0
+            or labels_text[label_start - 1] != "!"
+            or markdown_character_is_escaped(labels_text, label_start - 1)
+        ):
+            continue
+        for position in range(label_start + 1, label_end):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+
+    for label_start, label_end in label_pairs.items():
+        opening = label_end + 1
+        if opening >= len(labels_text) or labels_text[opening] != "(":
+            continue
+        destination = markdown_destination_end(
+            labels_text,
+            opening,
+            markdown_inline_block_end(
+                labels_text, label_start, inline_context
+            ),
+        )
+        if destination is None:
+            continue
+        for position in range(opening, destination[1] + 1):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+
+    reference_text = "".join(characters)
+    return {
+        markdown_normalize_footnote_label(match.group("label"))
+        for match in MARKDOWN_FOOTNOTE_REFERENCE.finditer(reference_text)
+    }
+
+
 def markdown_footnote_continuation_lines(
     container_lines: list[tuple[tuple[str, ...], str]],
+    referenced_labels: set[str],
 ) -> set[int]:
     """Return indented block lines that remain inside footnote definitions."""
 
@@ -1023,8 +1095,10 @@ def markdown_footnote_continuation_lines(
                 continue
             else:
                 active_containers = None
-        if MARKDOWN_FOOTNOTE_DEFINITION.match(content) is not None:
-            active_containers = containers
+        definition = MARKDOWN_FOOTNOTE_DEFINITION.match(content)
+        if definition is not None:
+            label = markdown_normalize_footnote_label(definition.group("label"))
+            active_containers = containers if label in referenced_labels else None
     return continuation_lines
 
 
@@ -1033,6 +1107,7 @@ def markdown_searchable_text(
     *,
     mask_inline_code: bool = True,
     style_content_spans: list[tuple[int, int]] | None = None,
+    _footnote_reference_labels: set[str] | None = None,
 ) -> str:
     """Mask literal Markdown regions while preserving offsets and line structure."""
 
@@ -1052,8 +1127,24 @@ def markdown_searchable_text(
 
     lines = [line.rstrip("\r\n") for line in lines_with_endings]
     container_lines = markdown_container_lines(lines)
+    if _footnote_reference_labels is None:
+        has_footnote_definition = any(
+            MARKDOWN_FOOTNOTE_DEFINITION.match(content) is not None
+            for _, content in container_lines
+        )
+        if not has_footnote_definition:
+            _footnote_reference_labels = set()
+        else:
+            footnote_reference_text = markdown_searchable_text(
+                text,
+                mask_inline_code=True,
+                _footnote_reference_labels=set(),
+            )
+            _footnote_reference_labels = markdown_footnote_reference_labels(
+                footnote_reference_text
+            )
     footnote_continuation_lines = markdown_footnote_continuation_lines(
-        container_lines
+        container_lines, _footnote_reference_labels
     )
     _, reference_definition_lines = markdown_reference_definitions_with_lines(
         lines, container_lines
@@ -1743,6 +1834,8 @@ def html_attribute_values(
     excluded_attribute_names_by_tag: dict[str, frozenset[str]] | None = None,
     required_attribute_tokens: dict[str, frozenset[str]] | None = None,
     excluded_attribute_tokens: dict[str, frozenset[str]] | None = None,
+    excluded_attribute_predicate: Callable[[str, dict[str, str]], bool]
+    | None = None,
 ) -> list[str]:
     """Collect top-level HTML attribute values without scanning quoted values."""
 
@@ -1851,6 +1944,10 @@ def html_attribute_values(
             and required_tokens_match
             and not excluded_names.intersection(attributes)
             and not excluded_tokens_match
+            and not (
+                excluded_attribute_predicate is not None
+                and excluded_attribute_predicate(tag_name, attributes)
+            )
         ):
             values.extend(tag_values)
     return values
@@ -1898,10 +1995,10 @@ def html_srcset_descriptors_are_valid(descriptors: list[str]) -> bool:
     return future_compat_height is None or width is not None
 
 
-def html_srcset_candidates(value: str) -> list[str]:
-    """Extract URL candidates accepted by the HTML srcset parser."""
+def html_srcset_candidate_data(value: str) -> list[tuple[str, list[str]]]:
+    """Extract accepted srcset URLs together with their descriptors."""
 
-    candidates: list[str] = []
+    candidates: list[tuple[str, list[str]]] = []
     index = 0
     while index < len(value):
         while index < len(value) and (
@@ -1918,7 +2015,7 @@ def html_srcset_candidates(value: str) -> list[str]:
         trailing_commas = len(url) - len(url.rstrip(","))
         url = url.rstrip(",")
         if url and trailing_commas:
-            candidates.append(url)
+            candidates.append((url, []))
         if trailing_commas:
             continue
 
@@ -1937,10 +2034,42 @@ def html_srcset_candidates(value: str) -> list[str]:
             r"[^\t\n\f\r ]+", value[descriptors_start:index]
         )
         if url and html_srcset_descriptors_are_valid(descriptors):
-            candidates.append(url)
+            candidates.append((url, descriptors))
         if index < len(value) and value[index] == ",":
             index += 1
     return candidates
+
+
+def html_srcset_candidates(value: str) -> list[str]:
+    """Extract URL candidates accepted by the HTML srcset parser."""
+
+    return [url for url, _ in html_srcset_candidate_data(value)]
+
+
+def html_srcset_overrides_src(value: str) -> bool:
+    """Return whether a parsed srcset replaces an img src candidate."""
+
+    for _, descriptors in html_srcset_candidate_data(value):
+        if not descriptors or any(descriptor.endswith("w") for descriptor in descriptors):
+            return True
+        if len(descriptors) == 1 and descriptors[0].endswith("x"):
+            if float(descriptors[0][:-1]) == 1:
+                return True
+    return False
+
+
+def html_raw_img_src_is_overridden(
+    tag_name: str, attributes: dict[str, str]
+) -> bool:
+    """Return whether raw img attributes replace src with srcset."""
+
+    return (
+        tag_name == "img"
+        and "srcset" in attributes
+        and html_srcset_overrides_src(
+            html_attribute_unescape(attributes["srcset"])
+        )
+    )
 
 
 def css_escape_value(text: str, start: int) -> tuple[str, int] | None:
@@ -2056,16 +2185,92 @@ def css_identifier_value(text: str, start: int) -> tuple[str, int] | None:
     return ("".join(value), index) if value else None
 
 
-def css_resource_targets(text: str) -> list[str]:
-    """Extract resource URLs from CSS url() functions and @import strings."""
+def css_image_set_string_targets(text: str, start: int) -> list[str]:
+    """Extract top-level string candidates from one image-set function."""
 
     targets: list[str] = []
+    index = start
+    depth = 1
+    candidate_start = True
+    while index < len(text) and depth:
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        character = text[index]
+        if character in {'"', "'"}:
+            string = css_string_value(text, index)
+            if string is None:
+                index += 1
+                continue
+            if depth == 1 and candidate_start:
+                targets.append(string[0])
+            index = string[1]
+            if depth == 1:
+                candidate_start = False
+            continue
+        if character == "(":
+            if depth == 1:
+                candidate_start = False
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif depth == 1 and character == ",":
+            candidate_start = True
+        elif depth == 1 and character not in HTML_ASCII_WHITESPACE:
+            candidate_start = False
+        index += 1
+    return targets
+
+
+def css_url_requires_file(target: str) -> bool:
+    """Return whether a CSS URL is not a same-document fragment reference."""
+
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return True
+    return bool(
+        parsed.scheme
+        or parsed.netloc
+        or parsed.path
+        or parsed.query
+        or not parsed.fragment
+    )
+
+
+def css_resource_references(text: str) -> list[tuple[str, bool]]:
+    """Extract CSS resource URLs and whether each requires a file path."""
+
+    targets: list[tuple[str, bool]] = []
+    forced_file_url_starts: set[int] = set()
     index = 0
     while index < len(text):
         if text.startswith("/*", index):
             comment_end = text.find("*/", index + 2)
             index = len(text) if comment_end < 0 else comment_end + 2
             continue
+
+        previous = text[index - 1] if index else ""
+        function_identifier = (
+            css_identifier_value(text, index)
+            if css_name_character(text[index]) or text[index] == "\\"
+            else None
+        )
+        if (
+            function_identifier is not None
+            and function_identifier[0].casefold()
+            in {"image-set", "-webkit-image-set"}
+            and function_identifier[1] < len(text)
+            and text[function_identifier[1]] == "("
+            and not css_name_character(previous)
+        ):
+            targets.extend(
+                (target, True)
+                for target in css_image_set_string_targets(
+                    text, function_identifier[1] + 1
+                )
+            )
         if text[index] in {'"', "'"}:
             string = css_string_value(text, index)
             index = len(text) if string is None else string[1]
@@ -2086,11 +2291,22 @@ def css_resource_targets(text: str) -> list[str]:
             if value_start < len(text) and text[value_start] in {'"', "'"}:
                 string = css_string_value(text, value_start)
                 if string is not None:
-                    targets.append(string[0])
+                    targets.append((string[0], True))
                     index = string[1]
                     continue
+            import_url_identifier = (
+                css_identifier_value(text, value_start)
+                if value_start < len(text)
+                else None
+            )
+            if (
+                import_url_identifier is not None
+                and import_url_identifier[0].casefold() == "url"
+                and import_url_identifier[1] < len(text)
+                and text[import_url_identifier[1]] == "("
+            ):
+                forced_file_url_starts.add(value_start)
 
-        previous = text[index - 1] if index else ""
         url_identifier = (
             css_identifier_value(text, index)
             if text[index].casefold() == "u" or text[index] == "\\"
@@ -2113,7 +2329,13 @@ def css_resource_targets(text: str) -> list[str]:
                     while value_end < len(text) and text[value_end] in HTML_ASCII_WHITESPACE:
                         value_end += 1
                     if value_end < len(text) and text[value_end] == ")":
-                        targets.append(value)
+                        targets.append(
+                            (
+                                value,
+                                index in forced_file_url_starts
+                                or css_url_requires_file(value),
+                            )
+                        )
                         index = value_end + 1
                         continue
             else:
@@ -2129,11 +2351,23 @@ def css_resource_targets(text: str) -> list[str]:
                     value = text[value_start:value_end].rstrip(" \t\r\n\f")
                     decoded = css_unescape(value)
                     if decoded:
-                        targets.append(decoded)
+                        targets.append(
+                            (
+                                decoded,
+                                index in forced_file_url_starts
+                                or css_url_requires_file(decoded),
+                            )
+                        )
                     index = value_end + 1
                     continue
         index += 1
     return targets
+
+
+def css_resource_targets(text: str) -> list[str]:
+    """Extract resource URLs from CSS for compatibility callers."""
+
+    return [target for target, _ in css_resource_references(text)]
 
 
 def html_target_requires_file(target: str) -> bool:
@@ -2240,6 +2474,11 @@ class HTMLFragmentResourceParser(HTMLParser):
             tag in MARKDOWN_HTML_SRC_TAGS
             and "src" in values
             and not (tag == "iframe" and "srcdoc" in values)
+            and not (
+                tag == "img"
+                and "srcset" in values
+                and html_srcset_overrides_src(values["srcset"])
+            )
         ):
             self.targets.append((values["src"], False, True))
         if (
@@ -2261,8 +2500,10 @@ class HTMLFragmentResourceParser(HTMLParser):
             self.srcdocs.append(values["srcdoc"])
         if "style" in values:
             self.targets.extend(
-                (target, False, True)
-                for target in css_resource_targets(values["style"])
+                (target, False, requires_file)
+                for target, requires_file in css_resource_references(
+                    values["style"]
+                )
             )
         if (
             tag in MARKDOWN_HTML_META_TAGS
@@ -2293,8 +2534,10 @@ class HTMLFragmentResourceParser(HTMLParser):
             return
         if tag == "style" and self.style_content is not None:
             self.targets.extend(
-                (target, False, True)
-                for target in css_resource_targets("".join(self.style_content))
+                (target, False, requires_file)
+                for target, requires_file in css_resource_references(
+                    "".join(self.style_content)
+                )
             )
             self.style_content = None
 
@@ -2302,8 +2545,10 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.close()
         if self.style_content is not None:
             self.targets.extend(
-                (target, False, True)
-                for target in css_resource_targets("".join(self.style_content))
+                (target, False, requires_file)
+                for target, requires_file in css_resource_references(
+                    "".join(self.style_content)
+                )
             )
             self.style_content = None
 
@@ -2314,22 +2559,34 @@ class HTMLDocumentFragmentParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.fragments: set[str] = set()
+        self.template_depth = 0
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
+        tag = tag.casefold()
+        if self.template_depth:
+            if tag == "template":
+                self.template_depth += 1
+            return
         values: dict[str, str] = {}
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
         if "id" in values:
             self.fragments.add(values["id"])
-        if tag.casefold() == "a" and "name" in values:
+        if tag == "a" and "name" in values:
             self.fragments.add(values["name"])
+        if tag == "template":
+            self.template_depth += 1
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
         self.handle_starttag(tag, attributes)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "template" and self.template_depth:
+            self.template_depth -= 1
 
 
 def html_document_fragments(text: str) -> set[str]:
@@ -2538,6 +2795,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             excluded_attribute_names_by_tag={
                 "iframe": MARKDOWN_HTML_SRCDOC_ATTRIBUTES
             },
+            excluded_attribute_predicate=html_raw_img_src_is_overridden,
         )
     )
     targets.extend(
@@ -2576,16 +2834,16 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     )
     for style_content in html_style_contents(text):
         targets.extend(
-            (target, False, True)
-            for target in css_resource_targets(style_content)
+            (target, False, requires_file)
+            for target, requires_file in css_resource_references(style_content)
         )
     for style_attribute in html_attribute_values(
         text,
         MARKDOWN_HTML_STYLE_ATTRIBUTES,
     ):
         targets.extend(
-            (target, False, True)
-            for target in css_resource_targets(
+            (target, False, requires_file)
+            for target, requires_file in css_resource_references(
                 html_attribute_unescape(style_attribute)
             )
         )
@@ -3061,8 +3319,8 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     )
     for style_content in style_contents:
         targets.extend(
-            (target, False, True)
-            for target in css_resource_targets(style_content)
+            (target, False, requires_file)
+            for target, requires_file in css_resource_references(style_content)
         )
     return targets
 
@@ -3379,7 +3637,9 @@ def markdown_heading_fragments(text: str) -> set[str]:
             "\n", 0, max(definition.start(), definition.end() - 1)
         )
         reference_definition_lines.update(range(start_line, end_line + 1))
-    anchor_text = markdown_html_anchor_searchable_text(text)
+    anchor_text = mask_html_template_contents(
+        markdown_html_anchor_searchable_text(text)
+    )
     for anchor in html_attribute_values(anchor_text, MARKDOWN_HTML_ID_ATTRIBUTES):
         fragments.add(html_attribute_unescape(anchor))
     for anchor in html_attribute_values(
@@ -3497,6 +3757,7 @@ def find_broken_links(root: Path) -> list[str]:
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)
             target = markdown_unescape(target) if is_markdown else target
             if not is_markdown:
+                target = target.translate(URL_INTERNAL_ASCII_WHITESPACE_TRANSLATION)
                 suffix_positions = [
                     position
                     for separator in ("?", "#")
