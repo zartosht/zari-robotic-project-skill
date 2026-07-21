@@ -1888,6 +1888,31 @@ class LinkTests(unittest.TestCase):
             )
             self.assertFalse(any("ignored-" in error for error in errors))
 
+    def test_restricts_src_loading_to_html_namespace_elements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<script src="missing-html.js"></script>\n'
+                '<svg><script src="ignored-svg.js"></script>'
+                '<video src="ignored-svg-video.mp4"></video>'
+                '<input type="image" src="ignored-svg-input.png"></svg>\n'
+                '<math><script src="ignored-math.js"></script></math>\n'
+                '<iframe srcdoc="<script src=\047missing-srcdoc-html.js\047>'
+                '</script><svg><script src=\047ignored-srcdoc-svg.js\047>'
+                '</script><input type=\047image\047 '
+                'src=\047ignored-srcdoc-svg-input.png\047></svg>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-html.js" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-html.js" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-" in error for error in errors))
+
     def test_treats_resource_link_relations_as_file_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2434,6 +2459,22 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("#host-only" in error for error in errors))
             self.assertFalse(any("#blur" in error for error in errors))
 
+    def test_ignores_srcdoc_markup_inside_raw_text_elements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<textarea><iframe srcdoc="&lt;a href=\047#ignored\047&gt;">'
+                "</iframe></textarea>\n"
+                '<iframe srcdoc="<a href=\047#missing\047>missing</a>">'
+                "</iframe>\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#missing", errors[0])
+            self.assertFalse(any("#ignored" in error for error in errors))
+
     def test_validates_inline_style_attribute_resource_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2642,6 +2683,27 @@ class LinkTests(unittest.TestCase):
                 ],
                 validator.find_broken_links(root),
             )
+
+    def test_skips_css_comments_around_url_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>.quoted { background: url(/* before */'
+                '"missing-quoted.png"/* after */); } '
+                '.unquoted { background: url(/* before */'
+                'missing-unquoted.png/* after */); } '
+                '.joined { background: url(missing-joined/* middle */.png); }'
+                "</style>\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            self.assertTrue(any("missing-quoted.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-unquoted.png" in error for error in errors)
+            )
+            self.assertTrue(any("missing-joined.png" in error for error in errors))
 
     def test_scans_each_css_identifier_once(self) -> None:
         with mock.patch.object(
@@ -2856,6 +2918,53 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("docs/missing-form.md" in error for error in errors))
             self.assertTrue(any("docs/missing-button.md" in error for error in errors))
             self.assertTrue(any("docs/missing-input.md" in error for error in errors))
+
+    def test_validates_formaction_only_for_controls_with_form_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<form><button formaction="missing-ancestor.html">Send</button>'
+                "</form>\n"
+                '<button form="later" formaction="missing-explicit.html">'
+                'Send</button><form id="later"></form>\n'
+                '<button formaction="ignored-ownerless.html">Send</button>\n'
+                '<form><button form="absent" '
+                'formaction="ignored-override.html">Send</button></form>\n'
+                '<div id="collision"></div><form id="collision"></form>'
+                '<button form="collision" '
+                'formaction="ignored-id-collision.html">Send</button>\n'
+                '<iframe srcdoc="<form><input type=\047submit\047 '
+                'formaction=\047missing-srcdoc-ancestor.html\047></form>'
+                '<input type=\047submit\047 form=\047srcdoc-later\047 '
+                'formaction=\047missing-srcdoc-explicit.html\047>'
+                '<form id=\047srcdoc-later\047></form>'
+                '<button form=\047absent\047 '
+                'formaction=\047ignored-srcdoc-ownerless.html\047>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(4, len(errors))
+            self.assertTrue(
+                any("missing-ancestor.html" in error for error in errors)
+            )
+            self.assertTrue(
+                any("missing-explicit.html" in error for error in errors)
+            )
+            self.assertTrue(
+                any(
+                    "missing-srcdoc-ancestor.html" in error
+                    for error in errors
+                )
+            )
+            self.assertTrue(
+                any(
+                    "missing-srcdoc-explicit.html" in error
+                    for error in errors
+                )
+            )
+            self.assertFalse(any("ignored-" in error for error in errors))
 
     def test_ignores_action_on_discarded_nested_forms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

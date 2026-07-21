@@ -197,7 +197,6 @@ MARKDOWN_HTML_LINK_RESOURCE_RELATIONS = frozenset(
 )
 MARKDOWN_SVG_RESOURCE_HREF_ATTRIBUTES = frozenset({"href", "xlink:href"})
 MARKDOWN_SVG_RESOURCE_HREF_TAGS = frozenset({"feimage", "image", "use"})
-MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_HTML_SRC_TAGS = frozenset(
     {
         "audio",
@@ -226,7 +225,6 @@ MARKDOWN_HTML_BASE_TAGS = frozenset({"base"})
 MARKDOWN_HTML_META_TAGS = frozenset({"meta"})
 MARKDOWN_HTML_CONTENT_ATTRIBUTES = frozenset({"content"})
 MARKDOWN_HTML_FORM_TAGS = frozenset({"form"})
-MARKDOWN_HTML_FORMACTION_ATTRIBUTES = frozenset({"formaction"})
 MARKDOWN_HTML_BUTTON_TAGS = frozenset({"button"})
 MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES = frozenset({"button", "reset"})
 HTML_VOID_TAGS = frozenset(
@@ -1029,6 +1027,9 @@ def mask_markdown_raw_html_blocks(
                 mask_except_html_tags(closing_match.start(), skip_until)
             elif tag_name == "pre":
                 mask_except_html_tags(opening_tag.end(), skip_until)
+            elif closing_match is not None:
+                mask(opening_tag.end(), closing_match.start())
+                mask(closing_match.end(), skip_until)
             else:
                 mask(opening_tag.end(), skip_until)
             open_paragraph_containers = None
@@ -1075,7 +1076,11 @@ def mask_markdown_raw_html_blocks(
                         closing_match.end() if closing_match else raw_container_end
                     )
                     skip_until = line_end_after(raw_end, raw_container_end)
-                    mask(body_start, skip_until)
+                    if closing_match is None:
+                        mask(body_start, skip_until)
+                    else:
+                        mask(body_start, closing_match.start())
+                        mask(closing_match.end(), skip_until)
                 else:
                     blank_block_start = body_start
                     blank_block_end = raw_container_end
@@ -2216,28 +2221,6 @@ def html_style_type_uses_css(value: str) -> bool:
     return normalized.split(";", 1)[0].rstrip("\t\n\f\r ") == "text/css"
 
 
-def html_raw_src_is_ignored(
-    tag_name: str, attributes: dict[str, str]
-) -> bool:
-    """Return whether raw element attributes prevent src from loading."""
-
-    if (
-        tag_name == "img"
-        and "srcset" in attributes
-        and html_srcset_overrides_src(
-            html_attribute_unescape(attributes["srcset"])
-        )
-    ):
-        return True
-    if tag_name != "script":
-        return False
-    decoded_attributes = {
-        name: html_attribute_unescape(value)
-        for name, value in attributes.items()
-    }
-    return not html_script_attributes_use_src(decoded_attributes)
-
-
 def css_escape_value(text: str, start: int) -> tuple[str, int] | None:
     """Decode one CSS escape and return its value and following offset."""
 
@@ -2889,14 +2872,14 @@ def css_resource_references(
             and not css_name_character(previous)
         ):
             value_start = url_identifier[1] + 1
-            while value_start < len(text) and text[value_start] in HTML_ASCII_WHITESPACE:
-                value_start += 1
+            value_start = css_skip_whitespace_and_comments(text, value_start)
             if value_start < len(text) and text[value_start] in {'"', "'"}:
                 string = css_string_value(text, value_start)
                 if string is not None:
                     value, value_end = string
-                    while value_end < len(text) and text[value_end] in HTML_ASCII_WHITESPACE:
-                        value_end += 1
+                    value_end = css_skip_whitespace_and_comments(
+                        text, value_end
+                    )
                     if value_end < len(text) and text[value_end] == ")":
                         if (
                             index not in ignored_url_starts
@@ -2919,8 +2902,19 @@ def css_resource_references(
                         continue
             else:
                 value_end = value_start
+                value_parts: list[str] = []
+                value_part_start = value_start
                 has_internal_whitespace = False
                 while value_end < len(text) and text[value_end] != ")":
+                    if text.startswith("/*", value_end):
+                        value_parts.append(text[value_part_start:value_end])
+                        comment_end = text.find("*/", value_end + 2)
+                        if comment_end < 0:
+                            value_end = len(text)
+                            break
+                        value_end = comment_end + 2
+                        value_part_start = value_end
+                        continue
                     if text[value_end] in {'"', "'", "("}:
                         break
                     if text[value_end] == "\\" and value_end + 1 < len(text):
@@ -2930,19 +2924,19 @@ def css_resource_references(
                         _, value_end = escape
                         continue
                     if text[value_end] in HTML_ASCII_WHITESPACE:
-                        whitespace_end = value_end + 1
-                        while (
-                            whitespace_end < len(text)
-                            and text[whitespace_end] in HTML_ASCII_WHITESPACE
-                        ):
-                            whitespace_end += 1
+                        value_parts.append(text[value_part_start:value_end])
+                        whitespace_end = css_skip_whitespace_and_comments(
+                            text, value_end
+                        )
                         if whitespace_end >= len(text) or text[whitespace_end] != ")":
                             has_internal_whitespace = True
                         value_end = whitespace_end
+                        value_part_start = value_end
                         continue
                     value_end += 1
                 if value_end < len(text) and text[value_end] == ")":
-                    value = text[value_start:value_end].rstrip(" \t\r\n\f")
+                    value_parts.append(text[value_part_start:value_end])
+                    value = "".join(value_parts).rstrip(" \t\r\n\f")
                     decoded = css_unescape(value)
                     if (
                         decoded
@@ -3154,6 +3148,46 @@ def html_has_direct_parent(
     )
 
 
+def html_formaction_value(
+    tag: str, namespace: str, attributes: dict[str, str]
+) -> str | None:
+    """Return a submit control's formaction value, if it can override one."""
+
+    if namespace != HTML_NAMESPACE or "formaction" not in attributes:
+        return None
+    if (
+        tag in MARKDOWN_HTML_BUTTON_TAGS
+        and attributes.get("type", "").casefold()
+        not in MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES
+    ):
+        return attributes["formaction"]
+    if (
+        tag in MARKDOWN_HTML_INPUT_TAGS
+        and attributes.get("type", "").casefold()
+        in MARKDOWN_HTML_SUBMIT_INPUT_TYPES
+    ):
+        return attributes["formaction"]
+    return None
+
+
+def html_owned_formaction_targets(
+    candidates: list[tuple[str, str | None, bool]],
+    first_id_elements: dict[str, tuple[str, str]],
+) -> list[tuple[str, bool, bool]]:
+    """Return formaction targets whose controls have an effective form owner."""
+
+    return [
+        (target, False, False)
+        for target, explicit_form_id, inside_form in candidates
+        if (
+            inside_form
+            if explicit_form_id is None
+            else first_id_elements.get(explicit_form_id)
+            == ("form", HTML_NAMESPACE)
+        )
+    ]
+
+
 class HTMLContextResourceParser(HTMLParser):
     """Collect resources whose HTML meaning depends on ancestor context."""
 
@@ -3163,6 +3197,8 @@ class HTMLContextResourceParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.targets: list[tuple[str, bool, bool]] = []
         self.base_hrefs: list[str] = []
+        self.formaction_candidates: list[tuple[str, str | None, bool]] = []
+        self.first_id_elements: dict[str, tuple[str, str]] = {}
         self.form_active = False
         self.template_depth = 0
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
@@ -3174,6 +3210,9 @@ class HTMLContextResourceParser(HTMLParser):
         if self.template_depth:
             if tag == "template":
                 self.template_depth += 1
+            return
+        raw_tag = self.get_starttag_text()
+        if raw_tag is not None and MARKDOWN_HTML_TAG.fullmatch(raw_tag) is None:
             return
 
         values: dict[str, str] = {}
@@ -3191,6 +3230,19 @@ class HTMLContextResourceParser(HTMLParser):
             self.form_active = True
             if "action" in values:
                 self.targets.append((values["action"], False, False))
+        if "id" in values:
+            self.first_id_elements.setdefault(
+                values["id"], (canonical_tag, namespace)
+            )
+        formaction = html_formaction_value(canonical_tag, namespace, values)
+        if formaction is not None:
+            self.formaction_candidates.append(
+                (
+                    formaction,
+                    values.get("form") if "form" in values else None,
+                    self.form_active,
+                )
+            )
         picture_parent = html_has_direct_parent(
             self.element_stack, frozenset({"picture"})
         )
@@ -3199,6 +3251,30 @@ class HTMLContextResourceParser(HTMLParser):
         )
         if tag == "base" and "href" in values and namespace == HTML_NAMESPACE:
             self.base_hrefs.append(values["href"])
+        if (
+            canonical_tag in MARKDOWN_HTML_SRC_TAGS
+            and namespace == HTML_NAMESPACE
+            and "src" in values
+            and not (canonical_tag == "iframe" and "srcdoc" in values)
+            and not (
+                canonical_tag == "img"
+                and "srcset" in values
+                and html_srcset_overrides_src(values["srcset"])
+            )
+            and not (
+                canonical_tag == "script"
+                and not html_script_attributes_use_src(values)
+            )
+        ):
+            self.targets.append((values["src"], False, True))
+        if (
+            canonical_tag in MARKDOWN_HTML_INPUT_TAGS
+            and namespace == HTML_NAMESPACE
+            and values.get("type", "").casefold()
+            in MARKDOWN_HTML_IMAGE_INPUT_TYPES
+            and "src" in values
+        ):
+            self.targets.append((values["src"], False, True))
         if (
             canonical_tag == "source"
             and namespace == HTML_NAMESPACE
@@ -3222,16 +3298,6 @@ class HTMLContextResourceParser(HTMLParser):
             and "data" in values
         ):
             self.targets.append((values["data"], False, True))
-        if (
-            tag == "image"
-            and "src" in values
-            and namespace == HTML_NAMESPACE
-            and not (
-                "srcset" in values
-                and html_srcset_overrides_src(values["srcset"])
-            )
-        ):
-            self.targets.append((values["src"], False, True))
         if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
             target = values.get("href", values.get("xlink:href"))
             if target is not None:
@@ -3275,7 +3341,9 @@ def html_context_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     parser = HTMLContextResourceParser()
     parser.feed(text)
     parser.close()
-    return parser.targets
+    return parser.targets + html_owned_formaction_targets(
+        parser.formaction_candidates, parser.first_id_elements
+    )
 
 
 def html_context_base_hrefs(text: str) -> list[str]:
@@ -3300,6 +3368,8 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.style_content: list[str] | None = None
         self.style_sources: list[str] = []
         self.stylesheet_targets: list[str] = []
+        self.formaction_candidates: list[tuple[str, str | None, bool]] = []
+        self.first_id_elements: dict[str, tuple[str, str]] = {}
         self.form_active = False
         self.template_depth = 0
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
@@ -3327,6 +3397,19 @@ class HTMLFragmentResourceParser(HTMLParser):
             self.form_active = True
             if "action" in values:
                 self.targets.append((values["action"], False, False))
+        if "id" in values:
+            self.first_id_elements.setdefault(
+                values["id"], (canonical_tag, namespace)
+            )
+        formaction = html_formaction_value(canonical_tag, namespace, values)
+        if formaction is not None:
+            self.formaction_candidates.append(
+                (
+                    formaction,
+                    values.get("form") if "form" in values else None,
+                    self.form_active,
+                )
+            )
         picture_parent = html_has_direct_parent(
             self.element_stack, frozenset({"picture"})
         )
@@ -3386,20 +3469,6 @@ class HTMLFragmentResourceParser(HTMLParser):
                     (target, False, html_target_requires_file(target))
                 )
         if (
-            tag in MARKDOWN_HTML_BUTTON_TAGS
-            and "formaction" in values
-            and values.get("type", "").casefold()
-            not in MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES
-        ):
-            self.targets.append((values["formaction"], False, False))
-        if (
-            tag in MARKDOWN_HTML_INPUT_TAGS
-            and "formaction" in values
-            and values.get("type", "").casefold()
-            in MARKDOWN_HTML_SUBMIT_INPUT_TYPES
-        ):
-            self.targets.append((values["formaction"], False, False))
-        if (
             canonical_tag in MARKDOWN_HTML_SRC_TAGS
             and namespace == HTML_NAMESPACE
             and "src" in values
@@ -3423,7 +3492,8 @@ class HTMLFragmentResourceParser(HTMLParser):
         ):
             self.targets.append((values["src"], False, True))
         if (
-            tag in MARKDOWN_HTML_INPUT_TAGS
+            canonical_tag in MARKDOWN_HTML_INPUT_TAGS
+            and namespace == HTML_NAMESPACE
             and values.get("type", "").casefold() in MARKDOWN_HTML_IMAGE_INPUT_TYPES
             and "src" in values
         ):
@@ -3513,6 +3583,11 @@ class HTMLFragmentResourceParser(HTMLParser):
 
     def finish(self) -> None:
         self.close()
+        self.targets.extend(
+            html_owned_formaction_targets(
+                self.formaction_candidates, self.first_id_elements
+            )
+        )
         if self.style_content is not None:
             self.style_sources.append("".join(self.style_content))
             self.style_content = None
@@ -3712,7 +3787,9 @@ def html_fragment_resource_targets(
 def html_srcdoc_fragment_errors(text: str) -> list[str]:
     """Return missing same-document fragments from nested srcdoc documents."""
 
-    searchable_text = mask_html_template_contents(text)
+    searchable_text = mask_html_template_contents(
+        mask_html_raw_text_element_contents(text)
+    )
     pending_documents = [
         html_attribute_unescape(srcdoc)
         for srcdoc in html_attribute_values(
@@ -3993,49 +4070,6 @@ def html_resource_targets(
             required_attribute_tokens={
                 "rel": MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
             },
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, False)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_FORMACTION_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_BUTTON_TAGS,
-            excluded_attribute_values={
-                "type": MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES
-            },
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, False)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_FORMACTION_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_INPUT_TAGS,
-            required_attribute_values={
-                "type": MARKDOWN_HTML_SUBMIT_INPUT_TYPES
-            },
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, True)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_SRC_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_SRC_TAGS,
-            excluded_attribute_names_by_tag={
-                "iframe": MARKDOWN_HTML_SRCDOC_ATTRIBUTES
-            },
-            excluded_attribute_predicate=html_raw_src_is_ignored,
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, True)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_SRC_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_INPUT_TAGS,
-            required_attribute_values={"type": MARKDOWN_HTML_IMAGE_INPUT_TYPES},
         )
     )
     targets.extend(
