@@ -435,6 +435,19 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_does_not_mask_indented_frontmatter_delimiter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "    ---\n"
+                "title: [bad](missing.md)\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
+
     def test_keeps_heading_between_thematic_breaks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1744,6 +1757,36 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.pdf", errors[0])
 
+    def test_treats_resource_link_relations_as_file_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# Heading\n\n"
+                '<link rel="alternate stylesheet" href="#heading">\n'
+                '<link rel="icon" href="#heading">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                all("resource target has no file path" in error for error in errors)
+            )
+
+    def test_validates_svg_href_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><symbol id="present"></symbol>'
+                '<image href="missing.png"></image>'
+                '<use href="missing.svg#icon"></use>'
+                '<use href="#present"></use></svg>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertTrue(any("missing.svg#icon" in error for error in errors))
+
     def test_validates_src_only_for_resource_loading_elements(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2025,6 +2068,38 @@ class LinkTests(unittest.TestCase):
             (root / "docs").mkdir()
             (root / "docs" / "picture.png").write_bytes(b"docs image")
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_validates_base_resolved_meta_refresh_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs").mkdir()
+            (root / "docs" / "existing.md").write_text("existing\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                '<base href="docs/">\n'
+                '<meta http-equiv="refresh" content="0; url=existing.md">\n'
+                '<meta http-equiv="REFRESH" content="0; URL=missing.md">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("docs/missing.md", errors[0])
+
+    def test_validates_fragments_in_local_html_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text(
+                '<div id="present"></div><a name="legacy"></a>\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                "[present](page.html#present) "
+                "[legacy](page.html#legacy) "
+                "[missing](page.html#missing)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("page.html#missing", errors[0])
 
     def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

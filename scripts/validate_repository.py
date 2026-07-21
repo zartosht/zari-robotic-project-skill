@@ -13,6 +13,7 @@ from html import unescape as html_unescape
 from html.entities import html5 as HTML5_ENTITIES
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Callable
 from urllib.parse import unquote, urljoin, urlsplit
 
 
@@ -162,7 +163,25 @@ MARKDOWN_HTML_ID_ATTRIBUTES = frozenset({"id"})
 MARKDOWN_HTML_NAME_ATTRIBUTES = frozenset({"name"})
 MARKDOWN_HTML_LEGACY_ANCHOR_TAGS = frozenset({"a"})
 MARKDOWN_HTML_HREF_ATTRIBUTES = frozenset({"href"})
-MARKDOWN_HTML_HREF_TAGS = frozenset({"a", "area", "link"})
+MARKDOWN_HTML_NAVIGATION_HREF_TAGS = frozenset({"a", "area"})
+MARKDOWN_HTML_LINK_TAGS = frozenset({"link"})
+MARKDOWN_HTML_HREF_TAGS = MARKDOWN_HTML_NAVIGATION_HREF_TAGS | MARKDOWN_HTML_LINK_TAGS
+MARKDOWN_HTML_LINK_RESOURCE_RELATIONS = frozenset(
+    {
+        "apple-touch-icon",
+        "apple-touch-startup-image",
+        "icon",
+        "manifest",
+        "mask-icon",
+        "modulepreload",
+        "prefetch",
+        "preload",
+        "prerender",
+        "stylesheet",
+    }
+)
+MARKDOWN_SVG_RESOURCE_HREF_ATTRIBUTES = frozenset({"href", "xlink:href"})
+MARKDOWN_SVG_RESOURCE_HREF_TAGS = frozenset({"image", "use"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_HTML_SRC_TAGS = frozenset(
     {
@@ -189,6 +208,8 @@ MARKDOWN_HTML_SRCDOC_ATTRIBUTES = frozenset({"srcdoc"})
 MARKDOWN_HTML_SRCDOC_TAGS = frozenset({"iframe"})
 MARKDOWN_HTML_STYLE_ATTRIBUTES = frozenset({"style"})
 MARKDOWN_HTML_BASE_TAGS = frozenset({"base"})
+MARKDOWN_HTML_META_TAGS = frozenset({"meta"})
+MARKDOWN_HTML_CONTENT_ATTRIBUTES = frozenset({"content"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -227,6 +248,7 @@ MARKDOWN_SUFFIXES = frozenset(
         ".mkdown",
     }
 )
+HTML_SUFFIXES = frozenset({".htm", ".html", ".xht", ".xhtml"})
 PORTABLE_TEXT_SUFFIXES = frozenset(
     {
         ".cfg",
@@ -872,7 +894,10 @@ def mask_markdown_raw_html_blocks(
 def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
     """Return the end offset of recognized mapping frontmatter, if present."""
 
-    if not lines_with_endings or lines_with_endings[0].strip() != "---":
+    if not lines_with_endings:
+        return 0
+    opening = lines_with_endings[0].rstrip("\r\n").rstrip(" \t")
+    if opening != "---":
         return 0
 
     offset = len(lines_with_endings[0])
@@ -880,7 +905,8 @@ def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
     for line in lines_with_endings[1:]:
         offset += len(line)
         stripped = line.strip()
-        if stripped in {"---", "..."}:
+        delimiter = line.rstrip("\r\n").rstrip(" \t")
+        if delimiter in {"---", "..."}:
             return offset if keys else 0
         if not stripped or stripped.startswith("#"):
             continue
@@ -1606,6 +1632,8 @@ def html_attribute_values(
     tag_names: frozenset[str] | None = None,
     required_attribute_values: dict[str, frozenset[str]] | None = None,
     excluded_attribute_names_by_tag: dict[str, frozenset[str]] | None = None,
+    required_attribute_tokens: dict[str, frozenset[str]] | None = None,
+    excluded_attribute_tokens: dict[str, frozenset[str]] | None = None,
 ) -> list[str]:
     """Collect top-level HTML attribute values without scanning quoted values."""
 
@@ -1683,7 +1711,32 @@ def html_attribute_values(
             if excluded_attribute_names_by_tag is not None
             else frozenset()
         )
-        if required_values_match and not excluded_names.intersection(attributes):
+        attribute_tokens = {
+            name: frozenset(
+                re.findall(
+                    r"[^\t\n\f\r ]+",
+                    html_attribute_unescape(attributes.get(name, "")).casefold(),
+                )
+            )
+            for name in {
+                *(required_attribute_tokens or {}),
+                *(excluded_attribute_tokens or {}),
+            }
+        }
+        required_tokens_match = required_attribute_tokens is None or all(
+            attribute_tokens[name].intersection(allowed_tokens)
+            for name, allowed_tokens in required_attribute_tokens.items()
+        )
+        excluded_tokens_match = excluded_attribute_tokens is not None and any(
+            attribute_tokens[name].intersection(excluded_tokens)
+            for name, excluded_tokens in excluded_attribute_tokens.items()
+        )
+        if (
+            required_values_match
+            and required_tokens_match
+            and not excluded_names.intersection(attributes)
+            and not excluded_tokens_match
+        ):
             values.extend(tag_values)
     return values
 
@@ -1923,6 +1976,36 @@ def css_resource_targets(text: str) -> list[str]:
     return targets
 
 
+def html_target_requires_file(target: str) -> bool:
+    """Return whether an HTML resource URL identifies an external file path."""
+
+    try:
+        return bool(urlsplit(target).path)
+    except ValueError:
+        return True
+
+
+def html_meta_refresh_target(content: str) -> str | None:
+    """Extract the navigation URL from a valid-enough meta refresh value."""
+
+    match = re.match(
+        r"^[\t\n\f\r ]*[0-9]+(?:\.[0-9]+)?[\t\n\f\r ]*[;,]",
+        content,
+    )
+    if match is None:
+        return None
+    target = content[match.end() :].lstrip("\t\n\f\r ")
+    url_prefix = re.match(r"url(?=[\t\n\f\r =]|$)", target, re.IGNORECASE)
+    if url_prefix is not None:
+        target = target[url_prefix.end() :].lstrip("\t\n\f\r ")
+        if target.startswith("="):
+            target = target[1:].lstrip("\t\n\f\r ")
+    target = target.strip("\t\n\f\r ")
+    if len(target) >= 2 and target[0] == target[-1] and target[0] in {'"', "'"}:
+        target = target[1:-1]
+    return target or None
+
+
 class HTMLFragmentResourceParser(HTMLParser):
     """Collect browser-loaded targets from an iframe srcdoc HTML fragment."""
 
@@ -1956,8 +2039,27 @@ class HTMLFragmentResourceParser(HTMLParser):
                 pass
             else:
                 self.base_href = values["href"]
-        if tag in MARKDOWN_HTML_HREF_TAGS and "href" in values:
+        if tag in MARKDOWN_HTML_NAVIGATION_HREF_TAGS and "href" in values:
             self.targets.append((values["href"], False, False))
+        if tag in MARKDOWN_HTML_LINK_TAGS and "href" in values:
+            relations = frozenset(
+                re.findall(
+                    r"[^\t\n\f\r ]+", values.get("rel", "").casefold()
+                )
+            )
+            self.targets.append(
+                (
+                    values["href"],
+                    False,
+                    bool(relations.intersection(MARKDOWN_HTML_LINK_RESOURCE_RELATIONS)),
+                )
+            )
+        if tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
+            target = values.get("href", values.get("xlink:href"))
+            if target is not None:
+                self.targets.append(
+                    (target, False, html_target_requires_file(target))
+                )
         if (
             tag in MARKDOWN_HTML_SRC_TAGS
             and "src" in values
@@ -1986,6 +2088,14 @@ class HTMLFragmentResourceParser(HTMLParser):
                 (target, False, True)
                 for target in css_resource_targets(values["style"])
             )
+        if (
+            tag in MARKDOWN_HTML_META_TAGS
+            and values.get("http-equiv", "").strip().casefold() == "refresh"
+            and "content" in values
+        ):
+            refresh_target = html_meta_refresh_target(values["content"])
+            if refresh_target is not None:
+                self.targets.append((refresh_target, False, False))
         if tag == "style":
             self.style_content = []
 
@@ -2020,6 +2130,39 @@ class HTMLFragmentResourceParser(HTMLParser):
                 for target in css_resource_targets("".join(self.style_content))
             )
             self.style_content = None
+
+
+class HTMLDocumentFragmentParser(HTMLParser):
+    """Collect addressable fragments from a standalone HTML document."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fragments: set[str] = set()
+
+    def handle_starttag(
+        self, tag: str, attributes: list[tuple[str, str | None]]
+    ) -> None:
+        values: dict[str, str] = {}
+        for name, value in attributes:
+            values.setdefault(name.casefold(), value or "")
+        if "id" in values:
+            self.fragments.add(values["id"])
+        if tag.casefold() == "a" and "name" in values:
+            self.fragments.add(values["name"])
+
+    def handle_startendtag(
+        self, tag: str, attributes: list[tuple[str, str | None]]
+    ) -> None:
+        self.handle_starttag(tag, attributes)
+
+
+def html_document_fragments(text: str) -> set[str]:
+    """Return IDs and legacy anchor names from a standalone HTML document."""
+
+    parser = HTMLDocumentFragmentParser()
+    parser.feed(text)
+    parser.close()
+    return parser.fragments
 
 
 def html_fragment_resource_targets(
@@ -2146,9 +2289,38 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
         for target in html_attribute_values(
             text,
             MARKDOWN_HTML_HREF_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_HREF_TAGS,
+            tag_names=MARKDOWN_HTML_NAVIGATION_HREF_TAGS,
         )
     )
+    targets.extend(
+        (html_attribute_unescape(target), False, False)
+        for target in html_attribute_values(
+            text,
+            MARKDOWN_HTML_HREF_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_LINK_TAGS,
+            excluded_attribute_tokens={
+                "rel": MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
+            },
+        )
+    )
+    targets.extend(
+        (html_attribute_unescape(target), False, True)
+        for target in html_attribute_values(
+            text,
+            MARKDOWN_HTML_HREF_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_LINK_TAGS,
+            required_attribute_tokens={
+                "rel": MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
+            },
+        )
+    )
+    for raw_target in html_attribute_values(
+        text,
+        MARKDOWN_SVG_RESOURCE_HREF_ATTRIBUTES,
+        tag_names=MARKDOWN_SVG_RESOURCE_HREF_TAGS,
+    ):
+        target = html_attribute_unescape(raw_target)
+        targets.append((target, False, html_target_requires_file(target)))
     targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
@@ -2209,6 +2381,17 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
                 html_attribute_unescape(style_attribute)
             )
         )
+    for content in html_attribute_values(
+        text,
+        MARKDOWN_HTML_CONTENT_ATTRIBUTES,
+        tag_names=MARKDOWN_HTML_META_TAGS,
+        required_attribute_values={"http-equiv": frozenset({"refresh"})},
+    ):
+        refresh_target = html_meta_refresh_target(
+            html_attribute_unescape(content)
+        )
+        if refresh_target is not None:
+            targets.append((refresh_target, False, False))
 
     targets = resolve_html_targets(targets, effective_base)
 
@@ -3071,19 +3254,19 @@ def find_broken_links(root: Path) -> list[str]:
     repository_root = root.resolve()
     skill_root = (repository_root / "build-robot-project").resolve()
     fragment_cache: dict[Path, set[str]] = {}
-    decoded_markdown_cache: dict[Path, str | None] = {}
+    decoded_text_cache: dict[Path, str | None] = {}
 
-    def read_markdown(path: Path) -> str | None:
-        if path not in decoded_markdown_cache:
-            decoded_markdown_cache[path] = decode_text_data(path.read_bytes())
-            if decoded_markdown_cache[path] is None:
+    def read_text_resource(path: Path) -> str | None:
+        if path not in decoded_text_cache:
+            decoded_text_cache[path] = decode_text_data(path.read_bytes())
+            if decoded_text_cache[path] is None:
                 errors.append(
                     f"{path.relative_to(root)}: undecodable textual resource"
                 )
-        return decoded_markdown_cache[path]
+        return decoded_text_cache[path]
 
     for path in markdown_files(root):
-        text = read_markdown(path)
+        text = read_text_resource(path)
         if text is None:
             continue
         for raw_target, is_markdown, requires_file in markdown_link_targets(text):
@@ -3157,19 +3340,26 @@ def find_broken_links(root: Path) -> list[str]:
                     f"{path.relative_to(root)}: resource target is not a file {raw_target!r}"
                 )
                 continue
-            if (
-                fragment
-                and resolved.is_file()
-                and resolved.suffix.lower() in MARKDOWN_SUFFIXES
-            ):
+            if fragment and resolved.is_file():
+                suffix = resolved.suffix.lower()
+                fragment_kind: str | None = None
+                fragment_loader: Callable[[str], set[str]] | None = None
+                if suffix in MARKDOWN_SUFFIXES:
+                    fragment_kind = "Markdown"
+                    fragment_loader = markdown_heading_fragments
+                elif suffix in HTML_SUFFIXES:
+                    fragment_kind = "HTML"
+                    fragment_loader = html_document_fragments
+                if fragment_loader is None:
+                    continue
                 if resolved not in fragment_cache:
-                    resolved_text = read_markdown(resolved)
+                    resolved_text = read_text_resource(resolved)
                     if resolved_text is None:
                         continue
-                    fragment_cache[resolved] = markdown_heading_fragments(resolved_text)
+                    fragment_cache[resolved] = fragment_loader(resolved_text)
                 if fragment not in fragment_cache[resolved]:
                     errors.append(
-                        f"{path.relative_to(root)}: broken Markdown fragment "
+                        f"{path.relative_to(root)}: broken {fragment_kind} fragment "
                         f"#{fragment!s} in {raw_target!r}"
                     )
     return errors
