@@ -123,6 +123,17 @@ MARKDOWN_HTML_TAG = re.compile(
 MARKDOWN_HTML_TAG_OR_CLOSING = re.compile(
     rf"(?:{MARKDOWN_HTML_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\r\n]*>)"
 )
+HTML_RAW_BLOCK_ATTRIBUTE_NAME = r'''[^\t\n\f\r "'=<>`/]+'''
+HTML_RAW_BLOCK_ATTRIBUTE_VALUE = r'''(?:[^\t\n\f\r "'=<>`]+|"[^"]*"|'[^']*')'''
+HTML_RAW_BLOCK_TAG = re.compile(
+    rf"<[A-Za-z][A-Za-z0-9-]*"
+    rf"(?:[ \t\r\n]+{HTML_RAW_BLOCK_ATTRIBUTE_NAME}"
+    rf"(?:[ \t\r\n]*=[ \t\r\n]*{HTML_RAW_BLOCK_ATTRIBUTE_VALUE})?)*"
+    rf"[ \t\r\n]*/?>"
+)
+HTML_RAW_BLOCK_TAG_OR_CLOSING = re.compile(
+    rf"(?:{HTML_RAW_BLOCK_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\r\n]*>)"
+)
 MARKDOWN_HTML_RAW_TEXT_OR_RCDATA_TAGS = frozenset(
     {
         "iframe",
@@ -210,6 +221,12 @@ MARKDOWN_HTML_STYLE_ATTRIBUTES = frozenset({"style"})
 MARKDOWN_HTML_BASE_TAGS = frozenset({"base"})
 MARKDOWN_HTML_META_TAGS = frozenset({"meta"})
 MARKDOWN_HTML_CONTENT_ATTRIBUTES = frozenset({"content"})
+MARKDOWN_HTML_ACTION_ATTRIBUTES = frozenset({"action"})
+MARKDOWN_HTML_FORM_TAGS = frozenset({"form"})
+MARKDOWN_HTML_FORMACTION_ATTRIBUTES = frozenset({"formaction"})
+MARKDOWN_HTML_BUTTON_TAGS = frozenset({"button"})
+MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES = frozenset({"button", "reset"})
+MARKDOWN_HTML_SUBMIT_INPUT_TYPES = frozenset({"image", "submit"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -639,6 +656,63 @@ def mask_markdown_raw_html_blocks(
             if characters[position] not in "\r\n":
                 characters[position] = " "
 
+    def normalize_raw_html_attribute_names(start: int, end: int) -> None:
+        index = start + 1
+        if index < end and text[index] == "/":
+            return
+        while index < end and (
+            text[index].isascii() and (text[index].isalnum() or text[index] == "-")
+        ):
+            index += 1
+        while index < end:
+            while index < end and text[index] in HTML_ASCII_WHITESPACE:
+                index += 1
+            if index >= end or text[index] in {"/", ">"}:
+                return
+            name_start = index
+            while (
+                index < end
+                and text[index] not in HTML_ASCII_WHITESPACE
+                and text[index] not in "\"'=<>`/"
+            ):
+                index += 1
+            for position in range(name_start, index):
+                character = text[position]
+                valid = (
+                    character.isascii()
+                    and (
+                        character.isalpha()
+                        or character in {"_", ":"}
+                        or (
+                            position > name_start
+                            and (character.isdigit() or character in {".", "-"})
+                        )
+                    )
+                )
+                if not valid:
+                    characters[position] = "x"
+            while index < end and text[index] in HTML_ASCII_WHITESPACE:
+                index += 1
+            if index >= end or text[index] != "=":
+                continue
+            index += 1
+            while index < end and text[index] in HTML_ASCII_WHITESPACE:
+                index += 1
+            if index < end and text[index] in {'"', "'"}:
+                quote = text[index]
+                index += 1
+                while index < end and text[index] != quote:
+                    index += 1
+                if index < end:
+                    index += 1
+            else:
+                while (
+                    index < end
+                    and text[index] not in HTML_ASCII_WHITESPACE
+                    and text[index] not in "\"'=<>`"
+                ):
+                    index += 1
+
     def mask_except_html_tags(start: int, end: int) -> None:
         quoted_spans: list[tuple[int, int]] = []
         cursor = start
@@ -732,7 +806,7 @@ def mask_markdown_raw_html_blocks(
 
         cursor = start
         span_index = 0
-        for tag in MARKDOWN_HTML_TAG_OR_CLOSING.finditer(text, start, end):
+        for tag in HTML_RAW_BLOCK_TAG_OR_CLOSING.finditer(text, start, end):
             while (
                 span_index < len(merged_spans)
                 and merged_spans[span_index][1] <= tag.start()
@@ -744,6 +818,7 @@ def mask_markdown_raw_html_blocks(
             ):
                 continue
             mask(cursor, tag.start())
+            normalize_raw_html_attribute_names(*tag.span())
             cursor = tag.end()
         mask(cursor, end)
 
@@ -800,9 +875,11 @@ def mask_markdown_raw_html_blocks(
             raw_container_end = container_end(line_index, containers)
             tag_name = type_1.group("tag").casefold()
             tag_start = content_start + len(content) - len(content.lstrip(" \t"))
-            opening_tag = MARKDOWN_HTML_TAG.match(
+            opening_tag = HTML_RAW_BLOCK_TAG.match(
                 text, tag_start, raw_container_end
             )
+            if opening_tag is not None:
+                normalize_raw_html_attribute_names(*opening_tag.span())
             closing = re.compile(
                 rf"</{re.escape(tag_name)}[ \t]*>", re.IGNORECASE
             )
@@ -849,9 +926,11 @@ def mask_markdown_raw_html_blocks(
             if raw_tag:
                 raw_container_end = container_end(line_index, containers)
                 tag_start = content_start + len(content) - len(content.lstrip(" \t"))
-                opening_tag = MARKDOWN_HTML_TAG.match(
+                opening_tag = HTML_RAW_BLOCK_TAG.match(
                     text, tag_start, raw_container_end
                 )
+                if opening_tag is not None:
+                    normalize_raw_html_attribute_names(*opening_tag.span())
                 body_start = opening_tag.end() if opening_tag else content_start
                 opening_name = (
                     re.match(r"<([A-Za-z][A-Za-z0-9-]*)", opening_tag.group(0))
@@ -1631,6 +1710,7 @@ def html_attribute_values(
     *,
     tag_names: frozenset[str] | None = None,
     required_attribute_values: dict[str, frozenset[str]] | None = None,
+    excluded_attribute_values: dict[str, frozenset[str]] | None = None,
     excluded_attribute_names_by_tag: dict[str, frozenset[str]] | None = None,
     required_attribute_tokens: dict[str, frozenset[str]] | None = None,
     excluded_attribute_tokens: dict[str, frozenset[str]] | None = None,
@@ -1706,6 +1786,11 @@ def html_attribute_values(
             in allowed_values
             for name, allowed_values in required_attribute_values.items()
         )
+        excluded_values_match = excluded_attribute_values is not None and any(
+            html_attribute_unescape(attributes.get(name, "")).casefold()
+            in excluded_values
+            for name, excluded_values in excluded_attribute_values.items()
+        )
         excluded_names = (
             excluded_attribute_names_by_tag.get(tag_name, frozenset())
             if excluded_attribute_names_by_tag is not None
@@ -1733,6 +1818,7 @@ def html_attribute_values(
         )
         if (
             required_values_match
+            and not excluded_values_match
             and required_tokens_match
             and not excluded_names.intersection(attributes)
             and not excluded_tokens_match
@@ -2060,6 +2146,22 @@ class HTMLFragmentResourceParser(HTMLParser):
                 self.targets.append(
                     (target, False, html_target_requires_file(target))
                 )
+        if tag in MARKDOWN_HTML_FORM_TAGS and "action" in values:
+            self.targets.append((values["action"], False, False))
+        if (
+            tag in MARKDOWN_HTML_BUTTON_TAGS
+            and "formaction" in values
+            and values.get("type", "").casefold()
+            not in MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES
+        ):
+            self.targets.append((values["formaction"], False, False))
+        if (
+            tag in MARKDOWN_HTML_INPUT_TAGS
+            and "formaction" in values
+            and values.get("type", "").casefold()
+            in MARKDOWN_HTML_SUBMIT_INPUT_TYPES
+        ):
+            self.targets.append((values["formaction"], False, False))
         if (
             tag in MARKDOWN_HTML_SRC_TAGS
             and "src" in values
@@ -2166,37 +2268,39 @@ def html_document_fragments(text: str) -> set[str]:
 
 
 def html_fragment_resource_targets(
-    text: str, *, srcdoc_depth: int, inherited_base: str = ""
+    text: str, *, inherited_base: str = ""
 ) -> list[tuple[str, bool, bool]]:
     """Collect targets from HTML parsed inside an iframe srcdoc document."""
 
-    parser = HTMLFragmentResourceParser()
-    parser.feed(text)
-    parser.finish()
-    effective_base = inherited_base
-    if parser.base_href is not None:
-        try:
-            effective_base = urljoin(inherited_base, parser.base_href)
-            urlsplit(effective_base)
-        except ValueError:
-            effective_base = inherited_base
-
     targets: list[tuple[str, bool, bool]] = []
-    for target, is_markdown, requires_file in parser.targets:
-        try:
-            resolved_target = urljoin(effective_base, target)
-        except ValueError:
-            resolved_target = target
-        targets.append((resolved_target, is_markdown, requires_file))
-    if srcdoc_depth >= 8:
-        return targets
-    for srcdoc in parser.srcdocs:
-        targets.extend(
-            html_fragment_resource_targets(
-                srcdoc,
-                srcdoc_depth=srcdoc_depth + 1,
-                inherited_base=effective_base,
-            )
+    pending_documents = [(text, inherited_base)]
+    seen_documents: set[tuple[str, str]] = set()
+    while pending_documents:
+        document, parent_base = pending_documents.pop()
+        document_key = (document, parent_base)
+        if document_key in seen_documents:
+            continue
+        seen_documents.add(document_key)
+
+        parser = HTMLFragmentResourceParser()
+        parser.feed(document)
+        parser.finish()
+        effective_base = parent_base
+        if parser.base_href is not None:
+            try:
+                effective_base = urljoin(parent_base, parser.base_href)
+                urlsplit(effective_base)
+            except ValueError:
+                effective_base = parent_base
+
+        for target, is_markdown, requires_file in parser.targets:
+            try:
+                resolved_target = urljoin(effective_base, target)
+            except ValueError:
+                resolved_target = target
+            targets.append((resolved_target, is_markdown, requires_file))
+        pending_documents.extend(
+            (srcdoc, effective_base) for srcdoc in reversed(parser.srcdocs)
         )
     return targets
 
@@ -2322,6 +2426,36 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
         target = html_attribute_unescape(raw_target)
         targets.append((target, False, html_target_requires_file(target)))
     targets.extend(
+        (html_attribute_unescape(target), False, False)
+        for target in html_attribute_values(
+            text,
+            MARKDOWN_HTML_ACTION_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_FORM_TAGS,
+        )
+    )
+    targets.extend(
+        (html_attribute_unescape(target), False, False)
+        for target in html_attribute_values(
+            text,
+            MARKDOWN_HTML_FORMACTION_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_BUTTON_TAGS,
+            excluded_attribute_values={
+                "type": MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES
+            },
+        )
+    )
+    targets.extend(
+        (html_attribute_unescape(target), False, False)
+        for target in html_attribute_values(
+            text,
+            MARKDOWN_HTML_FORMACTION_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_INPUT_TAGS,
+            required_attribute_values={
+                "type": MARKDOWN_HTML_SUBMIT_INPUT_TYPES
+            },
+        )
+    )
+    targets.extend(
         (html_attribute_unescape(target), False, True)
         for target in html_attribute_values(
             text,
@@ -2403,7 +2537,6 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
         targets.extend(
             html_fragment_resource_targets(
                 html_attribute_unescape(srcdoc),
-                srcdoc_depth=1,
                 inherited_base=effective_base,
             )
         )
@@ -3270,8 +3403,13 @@ def find_broken_links(root: Path) -> list[str]:
         if text is None:
             continue
         for raw_target, is_markdown, requires_file in markdown_link_targets(text):
-            target = raw_target.strip()
+            target = raw_target.strip("\t\n\f\r ")
             if not target:
+                if requires_file:
+                    errors.append(
+                        f"{path.relative_to(root)}: resource target has no file path "
+                        f"{raw_target!r}"
+                    )
                 continue
             if is_markdown:
                 if target.startswith("<") and target.endswith(">"):
@@ -3294,7 +3432,14 @@ def find_broken_links(root: Path) -> list[str]:
                 target = (
                     target[:path_end].replace("\\", "/") + target[path_end:]
                 )
-            if not target or target.startswith("/") or URI_SCHEME.match(target):
+            if not target:
+                if requires_file:
+                    errors.append(
+                        f"{path.relative_to(root)}: resource target has no file path "
+                        f"{raw_target!r}"
+                    )
+                continue
+            if target.startswith("/") or URI_SCHEME.match(target):
                 continue
             parsed_target = urlsplit(target)
             path_target = unquote_url_path(parsed_target.path)

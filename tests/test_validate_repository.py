@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import tempfile
 import time
 import unittest
@@ -66,6 +67,19 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text("[top]()\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_rejects_empty_file_resource_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "![bad]()\n<img src=\"\">\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(
+                all("resource target has no file path" in error for error in errors)
+            )
 
     def test_decodes_utf16_markdown_before_scanning_links(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1190,14 +1204,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(all("README.md/" in error for error in errors))
 
-    def test_accepts_empty_angle_reference_image_destination(self) -> None:
+    def test_rejects_empty_reference_image_without_scanning_its_alt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "README.md").write_text(
                 '[r]: <>\n\n![<img src="missing.png">][r]\n',
                 encoding="utf-8",
             )
-            self.assertEqual([], validator.find_broken_links(root))
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("resource target has no file path", errors[0])
+            self.assertNotIn("missing.png", errors[0])
 
     def test_does_not_attach_spaced_reference_label_to_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1965,6 +1982,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_validates_resources_beyond_eight_nested_srcdoc_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = '<img src="missing.png">'
+            for _ in range(9):
+                nested = f'<iframe srcdoc="{html.escape(nested, quote=True)}"></iframe>'
+            (root / "README.md").write_text(nested + "\n", encoding="utf-8")
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
+
     def test_iframe_srcdoc_suppresses_src_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2083,6 +2111,25 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("docs/missing.md", errors[0])
+
+    def test_validates_form_submission_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<base href="docs/">\n'
+                '<form action="missing-form.md">'
+                '<button formaction="missing-button.md">Send</button>'
+                '<input type="submit" formaction="missing-input.md">'
+                '<button type="button" formaction="ignored-button.md">No submit</button>'
+                '<input type="text" formaction="ignored-input.md">'
+                "</form>\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(3, len(errors))
+            self.assertTrue(any("docs/missing-form.md" in error for error in errors))
+            self.assertTrue(any("docs/missing-button.md" in error for error in errors))
+            self.assertTrue(any("docs/missing-input.md" in error for error in errors))
 
     def test_validates_fragments_in_local_html_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2239,6 +2286,34 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_validates_permissive_resource_tags_inside_raw_html_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "<div>\n"
+                '<img @click="preview" src="missing.png">\n'
+                "</div>\n\n"
+                '<script @load="ready" src="missing.js"></script>\n\n'
+                'Inline <img @click="preview" src="ignored.png"> text.\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertTrue(any("missing.js" in error for error in errors))
+
+    def test_preserves_non_ascii_whitespace_in_html_resource_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<img src="\N{NO-BREAK SPACE}existing.png">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("existing.png", errors[0])
 
     def test_handles_cr_only_line_end_after_type_one_html_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
