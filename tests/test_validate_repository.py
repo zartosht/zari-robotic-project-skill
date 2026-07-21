@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -349,6 +350,16 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_disambiguates_many_interleaved_heading_slugs_quickly(self) -> None:
+        text = "".join(
+            f"# foo-{index}\n# foo\n" for index in range(1, 6_001)
+        )
+        started = time.perf_counter()
+        fragments = validator.markdown_heading_fragments(text)
+        elapsed = time.perf_counter() - started
+        self.assertIn("foo-6001", fragments)
+        self.assertLess(elapsed, 2.0)
+
     def test_reports_stale_same_file_and_cross_file_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -376,6 +387,25 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(2, len(errors))
             self.assertTrue(all("broken Markdown fragment" in error for error in errors))
+
+    def test_keeps_heading_between_thematic_breaks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "---\n# Real heading\n---\n[go](#real-heading)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_excludes_lazy_blockquote_text_from_root_setext_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "> foo\nbar\n---\n[bad](#bar)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#bar", errors[0])
 
     def test_scans_links_between_thematic_breaks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -500,6 +530,26 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.md", errors[0])
+
+    def test_ignores_link_label_crossing_empty_atx_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide\n#\n](missing.md)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_scans_link_label_across_empty_unordered_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for marker in ("*", "+", "*   ", "+   "):
+                with self.subTest(marker=repr(marker)):
+                    (root / "README.md").write_text(
+                        f"[guide\n{marker}\n](missing.md)\n", encoding="utf-8"
+                    )
+                    errors = validator.find_broken_links(root)
+                    self.assertEqual(1, len(errors))
+                    self.assertIn("missing.md", errors[0])
 
     def test_scans_link_label_across_lazy_blockquote_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1297,6 +1347,15 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.pdf", errors[0])
+
+    def test_ignores_html_resources_inside_image_description(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "outer.png").write_bytes(b"outer")
+            (root / "README.md").write_text(
+                '![<img src="missing.png">](outer.png)\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_keeps_markdown_link_after_inline_html_crosses_blank_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

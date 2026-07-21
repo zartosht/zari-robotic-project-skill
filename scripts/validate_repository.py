@@ -99,7 +99,9 @@ MARKDOWN_LIST_PREFIX = re.compile(
 )
 MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}| {0,3}\t)")
 MARKDOWN_FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-MARKDOWN_ATX_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
+MARKDOWN_ATX_HEADING = re.compile(
+    r"^[ \t]{0,3}#{1,6}(?:[ \t]+(.*?))?[ \t]*$"
+)
 MARKDOWN_SETEXT_HEADING = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 MARKDOWN_THEMATIC_BREAK = re.compile(
     r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$"
@@ -691,7 +693,7 @@ def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
         offset += len(line)
         stripped = line.strip()
         if stripped in {"---", "..."}:
-            return offset
+            return offset if keys else 0
         if not stripped or stripped.startswith("#"):
             continue
         if ":" not in line or line.startswith((" ", "\t", "-")):
@@ -1511,7 +1513,15 @@ def markdown_inline_block_end(text: str, start: int) -> int:
             and int(direct_list_item.group("marker")[:-1]) != 1
             and parent_containers == start_containers
         )
-        if non_one_ordered_item:
+        empty_unordered_item = (
+            direct_list_item is not None
+            and direct_list_item.group("marker") in {"*", "+"}
+            and not parent_content[
+                markdown_list_prefix_end(direct_list_item) :
+            ].strip()
+            and parent_containers == start_containers
+        )
+        if non_one_ordered_item or empty_unordered_item:
             containers = parent_containers
             content = parent_content
         interrupts_paragraph = markdown_line_interrupts_paragraph(content)
@@ -1707,7 +1717,6 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
             if markdown_characters[position] not in "\r\n":
                 markdown_characters[position] = " "
     text = "".join(markdown_characters)
-    rendered_html_text = "".join(html_characters)
     reference_definitions = markdown_reference_definitions(text)
     first_reference_definitions: dict[str, re.Match[str]] = {}
     for match in reference_definitions:
@@ -1721,6 +1730,11 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     image_label_ranges = markdown_active_image_label_ranges(
         text, reference_labels, label_pairs
     )
+    for label_start, label_end in image_label_ranges:
+        for position in range(label_start + 1, label_end):
+            if html_characters[position] not in "\r\n":
+                html_characters[position] = " "
+    rendered_html_text = "".join(html_characters)
     reference_usages = markdown_reference_usages(
         text, reference_labels, label_pairs, definition_ranges
     )
@@ -1979,6 +1993,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
 
     fragments: set[str] = set()
     used_slugs: set[str] = set()
+    next_duplicate_indexes: dict[str, int] = {}
     setext_candidate: tuple[tuple[str, ...], list[str]] | None = None
 
     reference_labels: set[str] = set()
@@ -1989,10 +2004,15 @@ def markdown_heading_fragments(text: str) -> set[str]:
         if not base:
             return
         candidate = base
-        duplicate_index = 0
-        while candidate in used_slugs:
-            duplicate_index += 1
+        if candidate in used_slugs:
+            duplicate_index = next_duplicate_indexes.get(base, 1)
             candidate = f"{base}-{duplicate_index}"
+            while candidate in used_slugs:
+                duplicate_index += 1
+                candidate = f"{base}-{duplicate_index}"
+            next_duplicate_indexes[base] = duplicate_index + 1
+        else:
+            next_duplicate_indexes.setdefault(base, 1)
         used_slugs.add(candidate)
         fragments.add(candidate)
 
@@ -2033,12 +2053,8 @@ def markdown_heading_fragments(text: str) -> set[str]:
         tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
     ):
         fragments.add(html_unescape(anchor))
-    content_start = 0
-    if lines and lines[0].strip() == "---":
-        for line_index, line in enumerate(lines[1:], start=1):
-            if line.strip() in {"---", "..."}:
-                content_start = line_index + 1
-                break
+    frontmatter_end = markdown_frontmatter_end(text.splitlines(keepends=True))
+    content_start = len(text[:frontmatter_end].splitlines()) if frontmatter_end else 0
 
     for line_index, line in enumerate(lines[content_start:], start=content_start):
         containers, structure_content = structure_containers[line_index]
@@ -2056,21 +2072,29 @@ def markdown_heading_fragments(text: str) -> set[str]:
             containers = parent_containers
             structure_content = parent_content
             raw_content = parent_content
+        lazy_continuation = (
+            setext_candidate is not None
+            and containers != setext_candidate[0]
+            and len(containers) < len(setext_candidate[0])
+            and setext_candidate[0][: len(containers)] == containers
+            and not markdown_line_interrupts_paragraph(structure_content)
+        )
+        if lazy_continuation:
+            containers = setext_candidate[0]
         if line_index in reference_definition_lines:
             setext_candidate = None
             continue
         atx_heading = MARKDOWN_ATX_HEADING.match(structure_content)
         if atx_heading:
             raw_heading = MARKDOWN_ATX_HEADING.match(raw_content)
-            add_heading(raw_heading.group(1) if raw_heading else atx_heading.group(1))
+            add_heading(
+                (raw_heading.group(1) if raw_heading else atx_heading.group(1)) or ""
+            )
             setext_candidate = None
             continue
-        if (
-            MARKDOWN_SETEXT_HEADING.match(structure_content)
-            and setext_candidate
-            and setext_candidate[0] == containers
-        ):
-            add_heading(" ".join(setext_candidate[1]))
+        if MARKDOWN_SETEXT_HEADING.match(structure_content):
+            if setext_candidate and setext_candidate[0] == containers:
+                add_heading(" ".join(setext_candidate[1]))
             setext_candidate = None
             continue
         if not structure_content.strip():
