@@ -149,6 +149,7 @@ MARKDOWN_HTML_ID_ATTRIBUTES = frozenset({"id"})
 MARKDOWN_HTML_NAME_ATTRIBUTES = frozenset({"name"})
 MARKDOWN_HTML_LEGACY_ANCHOR_TAGS = frozenset({"a"})
 MARKDOWN_HTML_HREF_ATTRIBUTES = frozenset({"href"})
+MARKDOWN_HTML_HREF_TAGS = frozenset({"a", "area", "link"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_HTML_SRC_TAGS = frozenset(
     {
@@ -2003,7 +2004,9 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
-            rendered_html_text, MARKDOWN_HTML_HREF_ATTRIBUTES
+            rendered_html_text,
+            MARKDOWN_HTML_HREF_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_HREF_TAGS,
         )
     )
     targets.extend(
@@ -2294,11 +2297,25 @@ def markdown_heading_fragments(text: str) -> set[str]:
     structure_containers = markdown_container_lines(structure_lines)
     raw_containers = markdown_container_lines(lines)
     structure_text = "\n".join(content for _, content in structure_containers)
+    reference_definitions = markdown_reference_definitions(structure_text)
+    reference_labels.update(
+        markdown_normalize_reference_label(definition.group("label"))
+        for definition in reference_definitions
+    )
     footnote_characters = list(searchable_text)
     for tag in MARKDOWN_HTML_TAG.finditer(searchable_text):
         if not markdown_html_tag_is_rendered(searchable_text, tag):
             continue
         for position in range(*tag.span()):
+            if footnote_characters[position] not in "\r\n":
+                footnote_characters[position] = " "
+    image_label_ranges = markdown_active_image_label_ranges(
+        searchable_text,
+        reference_labels,
+        markdown_label_pairs(searchable_text),
+    )
+    for label_start, label_end in image_label_ranges:
+        for position in range(label_start + 1, label_end):
             if footnote_characters[position] not in "\r\n":
                 footnote_characters[position] = " "
     footnote_lines = "".join(footnote_characters).splitlines()
@@ -2307,11 +2324,6 @@ def markdown_heading_fragments(text: str) -> set[str]:
     )
     footnote_text = markdown_strip_inline_link_destinations(footnote_text)
     reference_definition_lines: set[int] = set()
-    reference_definitions = markdown_reference_definitions(structure_text)
-    reference_labels.update(
-        markdown_normalize_reference_label(definition.group("label"))
-        for definition in reference_definitions
-    )
     footnote_labels: set[str] = set()
     for footnote in MARKDOWN_FOOTNOTE_DEFINITION.finditer(footnote_text):
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
@@ -2424,6 +2436,9 @@ def find_broken_links(root: Path) -> list[str]:
             if is_markdown:
                 if target.startswith("<") and target.endswith(">"):
                     target = target[1:-1]
+                    leading_spaces = len(target) - len(target.lstrip(" "))
+                    if leading_spaces:
+                        target = "%20" * leading_spaces + target[leading_spaces:]
                 else:
                     target = target.split(maxsplit=1)[0]
                 target = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", target)

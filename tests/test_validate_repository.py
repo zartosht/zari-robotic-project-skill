@@ -428,6 +428,20 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_preserves_leading_space_in_angle_bracketed_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guide.md").write_text("wrong target\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide](< guide.md>)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("< guide.md>", errors[0])
+
+            (root / " guide.md").write_text("rendered target\n", encoding="utf-8")
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_reports_html_looking_angle_bracketed_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -667,6 +681,20 @@ class LinkTests(unittest.TestCase):
             root = Path(directory)
             (root / "README.md").write_text(
                 '[outer](README.md "[^1]")\n\n'
+                "[^1]: Footnote text\n\n"
+                "[stale](#user-content-fnref-1)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#user-content-fnref-1", errors[0])
+
+    def test_ignores_footnote_reference_text_inside_image_description(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "outer.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                "![alt[^1]](outer.png)\n\n"
                 "[^1]: Footnote text\n\n"
                 "[stale](#user-content-fnref-1)\n",
                 encoding="utf-8",
@@ -1428,6 +1456,16 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("references/missing.md" in error for error in errors))
             self.assertTrue(any("assets/missing.png" in error for error in errors))
+
+    def test_ignores_href_on_elements_that_do_not_use_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<div href="missing-page.md">content</div>\n'
+                '<img href="missing-image.md">\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_ignores_duplicate_html_resource_attributes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
