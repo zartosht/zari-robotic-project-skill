@@ -2380,6 +2380,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
 
+    def test_ignores_poster_on_foreign_video_elements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><video poster="ignored-outer.png"></video></svg>\n'
+                '<iframe srcdoc="<svg><video '
+                'poster=\047ignored-srcdoc.png\047></video></svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_iframe_srcdoc_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3060,6 +3071,17 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("page.html#hidden" in error for error in errors))
             self.assertTrue(any("page.html#ignored" in error for error in errors))
 
+    def test_ignores_resource_tags_discarded_inside_selects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<select><img src="ignored-outer.png"></select>\n'
+                '<iframe srcdoc="<select><img '
+                'src=\047ignored-srcdoc.png\047></select>"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_fragments_in_local_svg_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3076,6 +3098,20 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("icons.svg#missing", errors[0])
+
+    def test_recognizes_xml_id_fragments_in_local_svg_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "icons.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<g xml:id="target"></g></svg>\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                '<svg><use href="icons.svg#target"></use></svg>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3236,7 +3272,7 @@ class LinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "README.md").write_text(
-                '<div>\n<img\f src="missing.png">\n</div>\n',
+                '<img\f src\f=\f"missing.png">\n',
                 encoding="utf-8",
             )
             errors = validator.find_broken_links(root)
@@ -3643,6 +3679,21 @@ class WorkflowTests(unittest.TestCase):
             )
         ]
         self.assertIn("persist-credentials: false", checkout_step)
+
+    def test_secret_scan_is_isolated_from_pr_controlled_commands(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "validate.yml").read_text(
+            encoding="utf-8"
+        )
+        validate_start = workflow.index("  validate:\n")
+        secret_scan_start = workflow.index("  secret-scan:\n")
+        validate_job = workflow[validate_start:secret_scan_start]
+        secret_scan_job = workflow[secret_scan_start:]
+        self.assertNotIn("GITHUB_TOKEN", validate_job)
+        self.assertNotIn("gitleaks/gitleaks-action@", validate_job)
+        self.assertIn("GITHUB_TOKEN", secret_scan_job)
+        self.assertIn("gitleaks/gitleaks-action@", secret_scan_job)
+        self.assertEqual(2, workflow.count("uses: actions/checkout@"))
+        self.assertEqual(2, workflow.count("persist-credentials: false"))
 
 
 class SkillWorkflowTests(unittest.TestCase):

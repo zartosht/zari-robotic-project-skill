@@ -117,12 +117,12 @@ MARKDOWN_HTML_ATTRIBUTE_NAME = r"[A-Za-z_:][A-Za-z0-9_.:-]*"
 MARKDOWN_HTML_ATTRIBUTE_VALUE = r'''(?:[^\s"'=<>`]+|"[^"]*"|'[^']*')'''
 MARKDOWN_HTML_TAG = re.compile(
     rf"<[A-Za-z][A-Za-z0-9-]*"
-    rf"(?:[ \t\r\n]+{MARKDOWN_HTML_ATTRIBUTE_NAME}"
-    rf"(?:[ \t\r\n]*=[ \t\r\n]*{MARKDOWN_HTML_ATTRIBUTE_VALUE})?)*"
-    rf"[ \t\r\n]*/?>"
+    rf"(?:[ \t\f\r\n]+{MARKDOWN_HTML_ATTRIBUTE_NAME}"
+    rf"(?:[ \t\f\r\n]*=[ \t\f\r\n]*{MARKDOWN_HTML_ATTRIBUTE_VALUE})?)*"
+    rf"[ \t\f\r\n]*/?>"
 )
 MARKDOWN_HTML_TAG_OR_CLOSING = re.compile(
-    rf"(?:{MARKDOWN_HTML_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\r\n]*>)"
+    rf"(?:{MARKDOWN_HTML_TAG.pattern}|</[A-Za-z][A-Za-z0-9-]*[ \t\f\r\n]*>)"
 )
 HTML_RAW_BLOCK_ATTRIBUTE_NAME = r'''[^\t\n\f\r "'=<>`/]+'''
 HTML_RAW_BLOCK_ATTRIBUTE_VALUE = r'''(?:[^\t\n\f\r "'=<>`]+|"[^"]*"|'[^']*')'''
@@ -212,7 +212,6 @@ MARKDOWN_HTML_SRC_TAGS = frozenset(
 MARKDOWN_HTML_INPUT_TAGS = frozenset({"input"})
 MARKDOWN_HTML_IMAGE_INPUT_TYPES = frozenset({"image"})
 MARKDOWN_HTML_DATA_TAGS = frozenset({"object"})
-MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
 MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
 MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img"})
@@ -252,6 +251,7 @@ MARKDOWN_HTML_SUBMIT_INPUT_TYPES = frozenset({"image", "submit"})
 HTML_NAMESPACE = "html"
 SVG_NAMESPACE = "svg"
 MATHML_NAMESPACE = "mathml"
+XML_ID_ATTRIBUTE = "{http://www.w3.org/XML/1998/namespace}id"
 SVG_HTML_INTEGRATION_POINTS = frozenset({"desc", "foreignobject", "title"})
 MATHML_TEXT_INTEGRATION_POINTS = frozenset({"mi", "mn", "mo", "ms", "mtext"})
 HTML_FOREIGN_CONTENT_BREAKOUT_START_TAGS = frozenset(
@@ -3201,6 +3201,7 @@ class HTMLContextResourceParser(HTMLParser):
         self.first_id_elements: dict[str, tuple[str, str]] = {}
         self.form_active = False
         self.template_depth = 0
+        self.in_select = False
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
@@ -3214,6 +3215,14 @@ class HTMLContextResourceParser(HTMLParser):
         raw_tag = self.get_starttag_text()
         if raw_tag is not None and MARKDOWN_HTML_TAG.fullmatch(raw_tag) is None:
             return
+        if self.in_select:
+            if tag in HTML_SELECT_BREAKOUT_START_TAGS:
+                self.in_select = False
+            elif tag == "select":
+                self.in_select = False
+                return
+            elif tag not in HTML_SELECT_ALLOWED_START_TAGS:
+                return
 
         values: dict[str, str] = {}
         for name, value in attributes:
@@ -3298,12 +3307,20 @@ class HTMLContextResourceParser(HTMLParser):
             and "data" in values
         ):
             self.targets.append((values["data"], False, True))
+        if (
+            canonical_tag in MARKDOWN_HTML_POSTER_TAGS
+            and namespace == HTML_NAMESPACE
+            and "poster" in values
+        ):
+            self.targets.append((values["poster"], False, True))
         if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
             target = values.get("href", values.get("xlink:href"))
             if target is not None:
                 self.targets.append(
                     (target, False, html_target_requires_file(target))
                 )
+        if tag == "select" and namespace == HTML_NAMESPACE:
+            self.in_select = True
         html_push_element_context(self.element_stack, tag, namespace, values)
 
     def handle_startendtag(
@@ -3333,6 +3350,9 @@ class HTMLContextResourceParser(HTMLParser):
                 return
             self.form_active = False
         html_pop_element_context(self.element_stack, tag)
+        self.in_select = html_has_ancestor(
+            self.element_stack, frozenset({"select"})
+        )
 
 
 def html_context_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
@@ -3372,6 +3392,7 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.first_id_elements: dict[str, tuple[str, str]] = {}
         self.form_active = False
         self.template_depth = 0
+        self.in_select = False
         self.element_stack: list[tuple[str, str, dict[str, str]]] = []
 
     def handle_starttag(
@@ -3386,6 +3407,14 @@ class HTMLFragmentResourceParser(HTMLParser):
             if tag == "template":
                 self.template_depth += 1
             return
+        if self.in_select:
+            if tag in HTML_SELECT_BREAKOUT_START_TAGS:
+                self.in_select = False
+            elif tag == "select":
+                self.in_select = False
+                return
+            elif tag not in HTML_SELECT_ALLOWED_START_TAGS:
+                return
         namespace = html_start_tag_namespace(self.element_stack, tag, values)
         canonical_tag = html_canonical_tag_name(tag, namespace)
         if tag == "template" and namespace == HTML_NAMESPACE:
@@ -3504,7 +3533,11 @@ class HTMLFragmentResourceParser(HTMLParser):
             and "data" in values
         ):
             self.targets.append((values["data"], False, True))
-        if tag in MARKDOWN_HTML_POSTER_TAGS and "poster" in values:
+        if (
+            canonical_tag in MARKDOWN_HTML_POSTER_TAGS
+            and namespace == HTML_NAMESPACE
+            and "poster" in values
+        ):
             self.targets.append((values["poster"], False, True))
         if (
             canonical_tag in MARKDOWN_HTML_SRCSET_TAGS
@@ -3544,6 +3577,8 @@ class HTMLFragmentResourceParser(HTMLParser):
                 self.targets.append((refresh_target, False, False))
         if tag == "style" and html_style_type_uses_css(values.get("type", "")):
             self.style_content = []
+        if tag == "select" and namespace == HTML_NAMESPACE:
+            self.in_select = True
         html_push_element_context(self.element_stack, tag, namespace, values)
 
     def handle_startendtag(
@@ -3580,6 +3615,9 @@ class HTMLFragmentResourceParser(HTMLParser):
             self.style_sources.append("".join(self.style_content))
             self.style_content = None
         html_pop_element_context(self.element_stack, tag)
+        self.in_select = html_has_ancestor(
+            self.element_stack, frozenset({"select"})
+        )
 
     def finish(self) -> None:
         self.close()
@@ -3692,11 +3730,14 @@ def svg_document_fragments(text: str) -> set[str]:
         root = ElementTree.fromstring(text)
     except ElementTree.ParseError:
         return set()
-    return {
-        identifier
-        for element in root.iter()
-        if (identifier := element.attrib.get("id")) is not None
-    }
+    fragments: set[str] = set()
+    for element in root.iter():
+        identifier = element.attrib.get(
+            "id", element.attrib.get(XML_ID_ATTRIBUTE)
+        )
+        if identifier is not None:
+            fragments.add(identifier)
+    return fragments
 
 
 def url_element_fragment(fragment: str) -> str:
@@ -4070,14 +4111,6 @@ def html_resource_targets(
             required_attribute_tokens={
                 "rel": MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
             },
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, True)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_POSTER_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_POSTER_TAGS,
         )
     )
     targets.extend(
