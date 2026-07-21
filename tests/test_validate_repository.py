@@ -138,6 +138,17 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertIn("#apimd", errors[0])
 
+    def test_strips_nested_image_destination_from_linked_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "badge.svg").write_text("<svg></svg>\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "# [![Build](badge.svg)](README.md)\n\n"
+                "[section](#build)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_preserves_literal_underscores_in_heading_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -440,6 +451,20 @@ class LinkTests(unittest.TestCase):
             self.assertIn("< guide.md>", errors[0])
 
             (root / " guide.md").write_text("rendered target\n", encoding="utf-8")
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_preserves_tab_in_angle_bracketed_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guide.md").write_text("wrong target\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide](<guide\t.md>)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn(r"<guide\t.md>", errors[0])
+
+            (root / "guide\t.md").write_text("rendered target\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
 
     def test_reports_html_looking_angle_bracketed_destination(self) -> None:
@@ -1038,6 +1063,15 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("resource target is not a file", errors[0])
+
+    def test_accepts_empty_angle_reference_image_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '[r]: <>\n\n![<img src="missing.png">][r]\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_does_not_attach_spaced_reference_label_to_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

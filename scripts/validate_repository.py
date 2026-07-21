@@ -84,7 +84,7 @@ SECRET_PATTERNS = {
 MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?!\^)(?P<label>(?:\\.|[^\]\\\n]|\n(?![ \t]*\n))+)\]:[ \t]*"
     r"(?:\n[ \t]{0,3})?"
-    r"(?P<target><(?:\\.|[^<>\\\n])+>|(?:\\.|[^\s\\<>])+)"
+    r"(?P<target><(?:\\.|[^<>\\\n])*>|(?:\\.|[^\s\\<>])+)"
     r"(?:(?:[ \t]+|\n[ \t]{0,3})(?:"
     r"\"(?:\\.|[^\"\\\n]|\n(?=[ \t]*\S))*\"|"
     r"'(?:\\.|[^'\\\n]|\n(?=[ \t]*\S))*'|"
@@ -2173,8 +2173,13 @@ def github_heading_slug(
     """Approximate GitHub's generated heading IDs for ordinary Markdown headings."""
 
     heading = markdown_render_code_spans(heading)
-    heading = markdown_strip_active_reference_links(heading, reference_labels or set())
-    heading = markdown_strip_inline_link_destinations(heading)
+    previous_heading: str | None = None
+    while heading != previous_heading:
+        previous_heading = heading
+        heading = markdown_strip_active_reference_links(
+            heading, reference_labels or set()
+        )
+        heading = markdown_strip_inline_link_destinations(heading)
     heading = MARKDOWN_AUTOLINK.sub(r"\1", heading)
     heading = markdown_strip_inline_html_constructs(heading)
     heading = heading.replace(MARKDOWN_CODE_SPAN_LT, "<").replace(
@@ -2436,6 +2441,7 @@ def find_broken_links(root: Path) -> list[str]:
             if is_markdown:
                 if target.startswith("<") and target.endswith(">"):
                     target = target[1:-1]
+                    target = target.replace("\t", "%09")
                     leading_spaces = len(target) - len(target.lstrip(" "))
                     if leading_spaces:
                         target = "%20" * leading_spaces + target[leading_spaces:]
