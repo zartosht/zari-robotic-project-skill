@@ -92,9 +92,12 @@ MARKDOWN_REFERENCE_DEFINITION = re.compile(
 MARKDOWN_FOOTNOTE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[\^(?P<label>(?:\\.|[^\]\\\r\n])+)\]:"
 )
+MARKDOWN_FOOTNOTE_REFERENCE = re.compile(
+    r"\[\^(?P<label>(?:\\.|[^\]\\\r\n])+)\](?!:)"
+)
 MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 MARKDOWN_LIST_PREFIX = re.compile(
-    r"^(?P<indent>[ \t]{0,3})(?P<marker>[*+-]|\d{1,9}[.)])"
+    r"^(?P<indent> {0,3})(?P<marker>[*+-]|\d{1,9}[.)])"
     r"(?P<padding>[ \t]+|$)"
 )
 MARKDOWN_INDENTED_CODE = re.compile(r"^(?: {4,}| {0,3}\t)")
@@ -1533,7 +1536,7 @@ def markdown_inline_block_end(text: str, start: int) -> int:
         )
         if (
             containers != start_containers and not lazy_continuation
-        ) or interrupts_paragraph:
+        ) or not content.strip() or interrupts_paragraph:
             return line_offsets[line_index]
     return paragraph_end
 
@@ -1734,7 +1737,6 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         for position in range(label_start + 1, label_end):
             if html_characters[position] not in "\r\n":
                 html_characters[position] = " "
-    rendered_html_text = "".join(html_characters)
     reference_usages = markdown_reference_usages(
         text, reference_labels, label_pairs, definition_ranges
     )
@@ -1789,11 +1791,15 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
                 paragraph_end,
             ):
                 continue
+            for position in range(label_end + 1, destination[1] + 1):
+                if html_characters[position] not in "\r\n":
+                    html_characters[position] = " "
             targets.append(
                 (markdown_restore_escaped_openers(destination[0]), True, is_image)
             )
             inline_link_suffix_end = max(inline_link_suffix_end, destination[1] + 1)
 
+    rendered_html_text = "".join(html_characters)
     targets.extend(
         (
             markdown_restore_escaped_openers(match.group("target")),
@@ -2036,9 +2042,22 @@ def markdown_heading_fragments(text: str) -> set[str]:
         markdown_normalize_reference_label(definition.group("label"))
         for definition in reference_definitions
     )
+    footnote_labels: set[str] = set()
     for footnote in MARKDOWN_FOOTNOTE_DEFINITION.finditer(structure_text):
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
-        fragments.add(f"user-content-fn-{markdown_unescape(label).casefold()}")
+        normalized_label = markdown_unescape(label).casefold()
+        footnote_labels.add(normalized_label)
+        fragments.add(f"user-content-fn-{normalized_label}")
+    footnote_reference_counts: dict[str, int] = {}
+    for footnote in MARKDOWN_FOOTNOTE_REFERENCE.finditer(structure_text):
+        label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
+        normalized_label = markdown_unescape(label).casefold()
+        if normalized_label not in footnote_labels:
+            continue
+        count = footnote_reference_counts.get(normalized_label, 0) + 1
+        footnote_reference_counts[normalized_label] = count
+        suffix = "" if count == 1 else f"-{count}"
+        fragments.add(f"user-content-fnref-{normalized_label}{suffix}")
     for definition in reference_definitions:
         start_line = structure_text.count("\n", 0, definition.start())
         end_line = structure_text.count(
