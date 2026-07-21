@@ -87,7 +87,7 @@ Keep confirmed facts separate from assumptions. Make the next hands-on or implem
 
 ### 6. Begin the First Phase
 
-Begin the first phase selected by the roadmap without forcing a software phase. Safe automatic work may include project files, mock interfaces, simulations, unit tests, non-uploaded firmware, wiring plans, mechanical specifications, or verification checklists.
+Begin the first phase selected by the roadmap without forcing a software phase, unless the user set an explicit earlier stage or scope limit. Treat limits such as scaffold-only, documentation-only, planning-only, research-only, or another named stage as valid completion boundaries; do not create downstream implementation artifacts beyond them. Safe automatic work within the authorized boundary may include project files, mock interfaces, simulations, unit tests, non-uploaded firmware, wiring plans, mechanical specifications, or verification checklists.
 
 Stop before any mandatory approval gate. When stopped, prepare everything safe up to the gate, state the exact unresolved condition, and ask for explicit confirmation.
 
@@ -120,4 +120,4 @@ For a first physical lab, specify exact parts, tools, pins, wire endpoints, brea
 
 ## Completion Standard
 
-Unless the user explicitly limited the task to read-only discovery, research, or planning, finish an invocation only after the project has an evidence-backed brief, classified inventory, compatibility-aware sourcing state, phased roadmap, appropriate scaffold, a safely started first phase or a clearly identified mandatory gate, validation instructions, and an explicit next action.
+Honor every explicit stage or scope limit as a valid completion boundary. Unless the user limited the task to read-only discovery, research, planning, scaffolding, documentation, or another named stage, finish an invocation only after the project has an evidence-backed brief, classified inventory, compatibility-aware sourcing state, phased roadmap, appropriate scaffold, a safely started first phase or a clearly identified mandatory gate, validation instructions, and an explicit next action.

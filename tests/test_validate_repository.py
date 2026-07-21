@@ -136,6 +136,17 @@ class LinkTests(unittest.TestCase):
             (root / "guide.md").write_text("# Details\n", encoding="utf-8")
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_drops_non_ascii_separators_from_heading_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "# foo&nbsp;bar\n\n[working](#foobar) [stale](#foo-bar)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#foo-bar", errors[0])
+
     def test_strips_balanced_inline_destination_from_heading_fragment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1722,6 +1733,21 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("missing-large.png" in error for error in errors))
             self.assertTrue(any("missing-wide.png" in error for error in errors))
 
+    def test_validates_responsive_image_preload_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<link rel="preload" as="image" '
+                'imagesrcset="missing-preload.png 1x">\n'
+                '<iframe srcdoc="<link rel=\047preload\047 as=\047image\047 '
+                'imagesrcset=\047missing-srcdoc.png 1x\047>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-preload.png" in error for error in errors))
+            self.assertTrue(any("missing-srcdoc.png" in error for error in errors))
+
     def test_suppresses_img_src_only_when_srcset_replaces_its_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1869,6 +1895,22 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing-image.png", errors[0])
+
+    def test_ignores_src_on_non_executable_script_data_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<script type="application/json" src="ignored.json">{}</script>\n'
+                '<script type="module" src="missing-module.js"></script>\n'
+                '<iframe srcdoc="<script type=\047application/ld+json\047 '
+                'src=\047ignored-srcdoc.json\047>{}</script>'
+                '<script src=\047missing-srcdoc.js\047></script>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-module.js" in error for error in errors))
+            self.assertTrue(any("missing-srcdoc.js" in error for error in errors))
 
     def test_preserves_resource_tags_inside_pre_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2162,6 +2204,19 @@ class LinkTests(unittest.TestCase):
                     for error in errors
                 )
             )
+
+    def test_ignores_css_namespace_uris(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>@namespace svg url(ignored.xml); '
+                '@namespace url("ignored-default.xml"); '
+                '.hero { background: url(missing.png); }</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.png", errors[0])
 
     def test_rejects_fragment_only_file_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2844,6 +2899,16 @@ class InstallationDocumentationTests(unittest.TestCase):
         self.assertTrue(
             all('"/path/to/robot-project' in line for line in project_commands)
         )
+
+
+class SkillWorkflowTests(unittest.TestCase):
+    def test_explicit_stage_limits_are_completion_boundaries(self) -> None:
+        skill = (REPOSITORY_ROOT / "build-robot-project" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("explicit earlier stage or scope limit", skill)
+        self.assertIn("scaffold-only", skill)
+        self.assertIn("Honor every explicit stage or scope limit", skill)
 
 
 class SafetyDocumentationTests(unittest.TestCase):

@@ -215,6 +215,8 @@ MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
 MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
 MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img", "source"})
+MARKDOWN_HTML_IMAGESRCSET_ATTRIBUTES = frozenset({"imagesrcset"})
+MARKDOWN_HTML_IMAGE_PRELOAD_AS_VALUES = frozenset({"image"})
 MARKDOWN_HTML_SRCDOC_ATTRIBUTES = frozenset({"srcdoc"})
 MARKDOWN_HTML_SRCDOC_TAGS = frozenset({"iframe"})
 MARKDOWN_HTML_STYLE_ATTRIBUTES = frozenset({"style"})
@@ -227,6 +229,26 @@ MARKDOWN_HTML_FORMACTION_ATTRIBUTES = frozenset({"formaction"})
 MARKDOWN_HTML_BUTTON_TAGS = frozenset({"button"})
 MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES = frozenset({"button", "reset"})
 MARKDOWN_HTML_SUBMIT_INPUT_TYPES = frozenset({"image", "submit"})
+HTML_JAVASCRIPT_MIME_TYPE_ESSENCES = frozenset(
+    {
+        "application/ecmascript",
+        "application/javascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/javascript",
+        "text/javascript1.0",
+        "text/javascript1.1",
+        "text/javascript1.2",
+        "text/javascript1.3",
+        "text/javascript1.4",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+    }
+)
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -2058,17 +2080,31 @@ def html_srcset_overrides_src(value: str) -> bool:
     return False
 
 
-def html_raw_img_src_is_overridden(
+def html_script_type_uses_src(value: str) -> bool:
+    """Return whether a script type can fetch and execute its src URL."""
+
+    normalized = value.strip("\t\n\f\r ").casefold()
+    if normalized in {"", "module"}:
+        return True
+    essence = normalized.split(";", 1)[0].rstrip("\t\n\f\r ")
+    return essence in HTML_JAVASCRIPT_MIME_TYPE_ESSENCES
+
+
+def html_raw_src_is_ignored(
     tag_name: str, attributes: dict[str, str]
 ) -> bool:
-    """Return whether raw img attributes replace src with srcset."""
+    """Return whether raw element attributes prevent src from loading."""
 
-    return (
+    if (
         tag_name == "img"
         and "srcset" in attributes
         and html_srcset_overrides_src(
             html_attribute_unescape(attributes["srcset"])
         )
+    ):
+        return True
+    return tag_name == "script" and not html_script_type_uses_src(
+        html_attribute_unescape(attributes.get("type", ""))
     )
 
 
@@ -2239,11 +2275,28 @@ def css_url_requires_file(target: str) -> bool:
     )
 
 
+def css_skip_whitespace_and_comments(text: str, start: int) -> int:
+    """Return the next CSS token offset after whitespace and comments."""
+
+    index = start
+    while index < len(text):
+        while index < len(text) and text[index] in HTML_ASCII_WHITESPACE:
+            index += 1
+        if not text.startswith("/*", index):
+            break
+        comment_end = text.find("*/", index + 2)
+        if comment_end < 0:
+            return len(text)
+        index = comment_end + 2
+    return index
+
+
 def css_resource_references(text: str) -> list[tuple[str, bool]]:
     """Extract CSS resource URLs and whether each requires a file path."""
 
     targets: list[tuple[str, bool]] = []
     forced_file_url_starts: set[int] = set()
+    ignored_url_starts: set[int] = set()
     index = 0
     while index < len(text):
         if text.startswith("/*", index):
@@ -2276,29 +2329,18 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
             index = len(text) if string is None else string[1]
             continue
 
-        import_identifier = (
+        at_rule_identifier = (
             css_identifier_value(text, index + 1)
             if text[index] == "@"
             else None
         )
         if (
-            import_identifier is not None
-            and import_identifier[0].casefold() == "import"
+            at_rule_identifier is not None
+            and at_rule_identifier[0].casefold() == "import"
         ):
-            value_start = import_identifier[1]
-            while value_start < len(text):
-                while (
-                    value_start < len(text)
-                    and text[value_start] in HTML_ASCII_WHITESPACE
-                ):
-                    value_start += 1
-                if not text.startswith("/*", value_start):
-                    break
-                comment_end = text.find("*/", value_start + 2)
-                if comment_end < 0:
-                    value_start = len(text)
-                    break
-                value_start = comment_end + 2
+            value_start = css_skip_whitespace_and_comments(
+                text, at_rule_identifier[1]
+            )
             if value_start < len(text) and text[value_start] in {'"', "'"}:
                 string = css_string_value(text, value_start)
                 if string is not None:
@@ -2317,6 +2359,37 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                 and text[import_url_identifier[1]] == "("
             ):
                 forced_file_url_starts.add(value_start)
+        if (
+            at_rule_identifier is not None
+            and at_rule_identifier[0].casefold() == "namespace"
+        ):
+            value_start = css_skip_whitespace_and_comments(
+                text, at_rule_identifier[1]
+            )
+            namespace_value_identifier = (
+                css_identifier_value(text, value_start)
+                if value_start < len(text)
+                else None
+            )
+            if (
+                namespace_value_identifier is not None
+                and namespace_value_identifier[0].casefold() != "url"
+            ):
+                value_start = css_skip_whitespace_and_comments(
+                    text, namespace_value_identifier[1]
+                )
+                namespace_value_identifier = (
+                    css_identifier_value(text, value_start)
+                    if value_start < len(text)
+                    else None
+                )
+            if (
+                namespace_value_identifier is not None
+                and namespace_value_identifier[0].casefold() == "url"
+                and namespace_value_identifier[1] < len(text)
+                and text[namespace_value_identifier[1]] == "("
+            ):
+                ignored_url_starts.add(value_start)
 
         url_identifier = (
             css_identifier_value(text, index)
@@ -2340,13 +2413,14 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                     while value_end < len(text) and text[value_end] in HTML_ASCII_WHITESPACE:
                         value_end += 1
                     if value_end < len(text) and text[value_end] == ")":
-                        targets.append(
-                            (
-                                value,
-                                index in forced_file_url_starts
-                                or css_url_requires_file(value),
+                        if index not in ignored_url_starts:
+                            targets.append(
+                                (
+                                    value,
+                                    index in forced_file_url_starts
+                                    or css_url_requires_file(value),
+                                )
                             )
-                        )
                         index = value_end + 1
                         continue
             else:
@@ -2373,7 +2447,11 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                 if value_end < len(text) and text[value_end] == ")":
                     value = text[value_start:value_end].rstrip(" \t\r\n\f")
                     decoded = css_unescape(value)
-                    if decoded and not has_internal_whitespace:
+                    if (
+                        decoded
+                        and not has_internal_whitespace
+                        and index not in ignored_url_starts
+                    ):
                         targets.append(
                             (
                                 decoded,
@@ -2458,19 +2536,36 @@ class HTMLFragmentResourceParser(HTMLParser):
                 self.base_href = values["href"]
         if tag in MARKDOWN_HTML_NAVIGATION_HREF_TAGS and "href" in values:
             self.targets.append((values["href"], False, False))
-        if tag in MARKDOWN_HTML_LINK_TAGS and "href" in values:
+        if tag in MARKDOWN_HTML_LINK_TAGS:
             relations = frozenset(
                 re.findall(
                     r"[^\t\n\f\r ]+", values.get("rel", "").casefold()
                 )
             )
-            self.targets.append(
-                (
-                    values["href"],
-                    False,
-                    bool(relations.intersection(MARKDOWN_HTML_LINK_RESOURCE_RELATIONS)),
+            if "href" in values:
+                self.targets.append(
+                    (
+                        values["href"],
+                        False,
+                        bool(
+                            relations.intersection(
+                                MARKDOWN_HTML_LINK_RESOURCE_RELATIONS
+                            )
+                        ),
+                    )
                 )
-            )
+            if (
+                "preload" in relations
+                and values.get("as", "").casefold()
+                in MARKDOWN_HTML_IMAGE_PRELOAD_AS_VALUES
+                and "imagesrcset" in values
+            ):
+                self.targets.extend(
+                    (candidate, False, True)
+                    for candidate in html_srcset_candidates(
+                        values["imagesrcset"]
+                    )
+                )
         if tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
             target = values.get("href", values.get("xlink:href"))
             if target is not None:
@@ -2501,6 +2596,10 @@ class HTMLFragmentResourceParser(HTMLParser):
                 tag == "img"
                 and "srcset" in values
                 and html_srcset_overrides_src(values["srcset"])
+            )
+            and not (
+                tag == "script"
+                and not html_script_type_uses_src(values.get("type", ""))
             )
         ):
             self.targets.append((values["src"], False, True))
@@ -2842,7 +2941,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             excluded_attribute_names_by_tag={
                 "iframe": MARKDOWN_HTML_SRCDOC_ATTRIBUTES
             },
-            excluded_attribute_predicate=html_raw_img_src_is_overridden,
+            excluded_attribute_predicate=html_raw_src_is_ignored,
         )
     )
     targets.extend(
@@ -2876,6 +2975,19 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             text,
             MARKDOWN_HTML_SRCSET_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_SRCSET_TAGS,
+        )
+        for candidate in html_srcset_candidates(html_attribute_unescape(value))
+    )
+    targets.extend(
+        (candidate, False, True)
+        for value in html_attribute_values(
+            text,
+            MARKDOWN_HTML_IMAGESRCSET_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_LINK_TAGS,
+            required_attribute_values={
+                "as": MARKDOWN_HTML_IMAGE_PRELOAD_AS_VALUES
+            },
+            required_attribute_tokens={"rel": frozenset({"preload"})},
         )
         for candidate in html_srcset_candidates(html_attribute_unescape(value))
     )
@@ -3513,7 +3625,7 @@ def github_heading_slug(
         heading,
     )
     heading = re.sub(r"[*~`]", "", heading).lower()
-    heading = re.sub(r"\s", "-", heading)
+    heading = heading.replace(" ", "-")
     characters = [
         character
         for character in heading
