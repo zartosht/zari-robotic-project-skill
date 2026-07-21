@@ -419,6 +419,19 @@ class LinkTests(unittest.TestCase):
             validator.markdown_heading_fragments(text)
         self.assertLess(inline_context.call_count, 20)
 
+    def test_does_not_reparse_each_reference_definition_suffix(self) -> None:
+        text = "# Heading\n" + "".join(
+            f"[ref-{index}]: file-{index}.md\n" for index in range(2_000)
+        )
+        with mock.patch.object(
+            validator,
+            "markdown_label_end",
+            wraps=validator.markdown_label_end,
+        ) as label_end:
+            fragments = validator.markdown_heading_fragments(text)
+        self.assertIn("heading", fragments)
+        self.assertLess(label_end.call_count, 10)
+
     def test_reports_stale_same_file_and_cross_file_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1451,6 +1464,15 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_preserves_line_alignment_when_indented_code_contains_form_feed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "\t\fx\n# Heading\n[working](#heading)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_ignores_indented_code_after_thematic_break(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1879,6 +1901,19 @@ class LinkTests(unittest.TestCase):
                 any("missing-filter.png" in error for error in errors)
             )
             self.assertTrue(any("missing.svg#icon" in error for error in errors))
+
+    def test_ignores_svg_named_href_elements_in_the_html_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<use href="ignored.svg#icon"></use>\n'
+                '<feImage href="ignored-filter.png"></feImage>\n'
+                '<iframe srcdoc="<use href=\047ignored-srcdoc.svg#icon\047>'
+                '</use><feImage href=\047ignored-srcdoc-filter.png\047>'
+                '</feImage>"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_validates_contextual_source_src_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2442,6 +2477,14 @@ class LinkTests(unittest.TestCase):
         ) as identifier:
             self.assertEqual([], validator.css_resource_references("a" * 8_000))
         self.assertLess(identifier.call_count, 10)
+
+    def test_resolves_query_only_file_resources_to_the_current_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<iframe src="?view=compact"></iframe>\n', encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_rejects_fragment_only_file_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

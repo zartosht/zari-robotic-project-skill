@@ -334,6 +334,19 @@ PORTABLE_TEXT_SUFFIXES = frozenset(
 ) | MARKDOWN_SUFFIXES
 
 
+def markdown_splitlines(text: str, *, keepends: bool = False) -> list[str]:
+    """Split Markdown on its CR/LF line endings, not other Unicode separators."""
+
+    parts = re.split(r"(\r\n|\r|\n)", text)
+    lines = [
+        parts[index] + (parts[index + 1] if keepends else "")
+        for index in range(0, len(parts) - 1, 2)
+    ]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
 def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
     """Parse the intentionally simple scalar YAML frontmatter used by this skill."""
 
@@ -342,7 +355,7 @@ def parse_frontmatter(path: Path) -> tuple[dict[str, str], str, list[str]]:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return {}, "", [f"{path}: SKILL.md must be valid UTF-8"]
-    lines = text.splitlines()
+    lines = markdown_splitlines(text)
     if not lines or lines[0] != "---":
         return {}, text, [f"{path}: frontmatter must start on line 1"]
 
@@ -681,7 +694,7 @@ def mask_markdown_raw_html_blocks(
     """Mask CommonMark raw HTML block bodies while retaining opening tags."""
 
     text = "".join(characters)
-    lines_with_endings = text.splitlines(keepends=True)
+    lines_with_endings = markdown_splitlines(text, keepends=True)
     lines = [line.rstrip("\r\n") for line in lines_with_endings]
     container_lines = markdown_container_lines(lines)
     if reference_definition_lines is None:
@@ -1076,7 +1089,7 @@ def markdown_footnote_reference_labels(searchable_text: str) -> set[str]:
     """Return rendered footnote labels referenced by searchable Markdown."""
 
     characters = list(searchable_text)
-    lines_with_endings = searchable_text.splitlines(keepends=True)
+    lines_with_endings = markdown_splitlines(searchable_text, keepends=True)
     lines = [line.rstrip("\r\n") for line in lines_with_endings]
     container_lines = markdown_container_lines(lines)
     offset = 0
@@ -1171,7 +1184,7 @@ def markdown_searchable_text(
     """Mask literal Markdown regions while preserving offsets and line structure."""
 
     characters = list(text)
-    lines_with_endings = text.splitlines(keepends=True)
+    lines_with_endings = markdown_splitlines(text, keepends=True)
     frontmatter_end = markdown_frontmatter_end(lines_with_endings)
     if frontmatter_end:
         for index in range(frontmatter_end):
@@ -1571,7 +1584,9 @@ def markdown_reference_definitions(
 ) -> list[re.Match[str]]:
     """Return definitions that occur where a new Markdown block may begin."""
 
-    definitions, _ = markdown_reference_definitions_with_lines(text.splitlines())
+    definitions, _ = markdown_reference_definitions_with_lines(
+        markdown_splitlines(text)
+    )
     return definitions
 
 
@@ -1583,9 +1598,10 @@ def markdown_reference_definition_ranges(
     if not definitions:
         return []
 
-    lines_with_endings = text.splitlines(keepends=True)
+    lines_with_endings = markdown_splitlines(text, keepends=True)
     container_text = "\n".join(
-        content for _, content in markdown_container_lines(text.splitlines())
+        content
+        for _, content in markdown_container_lines(markdown_splitlines(text))
     )
     container_line_endings = [
         index for index, character in enumerate(container_text) if character == "\n"
@@ -2885,6 +2901,12 @@ class HTMLContextResourceParser(HTMLParser):
             )
         ):
             self.targets.append((values["src"], False, True))
+        if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
+            target = values.get("href", values.get("xlink:href"))
+            if target is not None:
+                self.targets.append(
+                    (target, False, html_target_requires_file(target))
+                )
         html_push_element_context(self.element_stack, tag, namespace, values)
 
     def handle_startendtag(
@@ -3011,7 +3033,7 @@ class HTMLFragmentResourceParser(HTMLParser):
                         values["imagesrcset"]
                     )
                 )
-        if tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
+        if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
             target = values.get("href", values.get("xlink:href"))
             if target is not None:
                 self.targets.append(
@@ -3526,13 +3548,6 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             },
         )
     )
-    for raw_target in html_attribute_values(
-        text,
-        MARKDOWN_SVG_RESOURCE_HREF_ATTRIBUTES,
-        tag_names=MARKDOWN_SVG_RESOURCE_HREF_TAGS,
-    ):
-        target = html_attribute_unescape(raw_target)
-        targets.append((target, False, html_target_requires_file(target)))
     targets.extend(
         (html_attribute_unescape(target), False, False)
         for target in html_attribute_values(
@@ -3675,7 +3690,7 @@ def markdown_inline_block_context(
 ]:
     """Precompute line containers and blank-line paragraph ends once."""
 
-    lines_with_endings = text.splitlines(keepends=True)
+    lines_with_endings = markdown_splitlines(text, keepends=True)
     lines = [line.rstrip("\r\n") for line in lines_with_endings]
     line_offsets: list[int] = []
     offset = 0
@@ -4120,7 +4135,7 @@ def markdown_strip_inline_link_destinations(text: str) -> str:
 
     result: list[str] = []
     index = 0
-    inline_context = markdown_inline_block_context(text)
+    label_pairs = markdown_label_pairs(text)
     while index < len(text):
         is_image = (
             text.startswith("![", index)
@@ -4135,7 +4150,7 @@ def markdown_strip_inline_link_destinations(text: str) -> str:
             index += 1
             continue
 
-        label_end = markdown_label_end(text, label_start, inline_context)
+        label_end = label_pairs.get(label_start)
         if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":
             result.append(text[index])
             index += 1
@@ -4182,7 +4197,7 @@ def markdown_strip_active_reference_links(
 
     result: list[str] = []
     index = 0
-    inline_context = markdown_inline_block_context(text)
+    label_pairs = markdown_label_pairs(text)
     while index < len(text):
         is_image = (
             text.startswith("![", index)
@@ -4198,7 +4213,7 @@ def markdown_strip_active_reference_links(
             index += 1
             continue
 
-        label_end = markdown_label_end(text, label_start, inline_context)
+        label_end = label_pairs.get(label_start)
         reference_start = None if label_end is None else label_end + 1
         if (
             reference_start is None
@@ -4208,7 +4223,7 @@ def markdown_strip_active_reference_links(
             result.append(text[index])
             index += 1
             continue
-        reference_end = markdown_label_end(text, reference_start, inline_context)
+        reference_end = label_pairs.get(reference_start)
         if reference_end is None:
             result.append(text[index])
             index += 1
@@ -4351,7 +4366,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
         used_slugs.add(candidate)
         fragments.add(candidate)
 
-    lines = text.splitlines()
+    lines = markdown_splitlines(text)
     searchable_text = markdown_searchable_text(text)
     structure_text_with_tags = markdown_searchable_text(text, mask_inline_code=False)
     structure_characters = list(structure_text_with_tags)
@@ -4366,7 +4381,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
         for position in range(*tag.span()):
             if structure_characters[position] not in "\r\n":
                 structure_characters[position] = " "
-    structure_lines = "".join(structure_characters).splitlines()
+    structure_lines = markdown_splitlines("".join(structure_characters))
     structure_containers = markdown_container_lines(structure_lines)
     raw_containers = markdown_container_lines(lines)
     structure_text = "\n".join(content for _, content in structure_containers)
@@ -4394,7 +4409,7 @@ def markdown_heading_fragments(text: str) -> set[str]:
         for position in range(label_start + 1, label_end):
             if footnote_characters[position] not in "\r\n":
                 footnote_characters[position] = " "
-    footnote_lines = "".join(footnote_characters).splitlines()
+    footnote_lines = markdown_splitlines("".join(footnote_characters))
     footnote_text = "\n".join(
         content for _, content in markdown_container_lines(footnote_lines)
     )
@@ -4438,8 +4453,12 @@ def markdown_heading_fragments(text: str) -> set[str]:
         tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
     ):
         fragments.add(html_attribute_unescape(anchor))
-    frontmatter_end = markdown_frontmatter_end(text.splitlines(keepends=True))
-    content_start = len(text[:frontmatter_end].splitlines()) if frontmatter_end else 0
+    frontmatter_end = markdown_frontmatter_end(
+        markdown_splitlines(text, keepends=True)
+    )
+    content_start = (
+        len(markdown_splitlines(text[:frontmatter_end])) if frontmatter_end else 0
+    )
 
     for line_index, line in enumerate(lines[content_start:], start=content_start):
         containers, structure_content = structure_containers[line_index]
@@ -4566,7 +4585,7 @@ def find_broken_links(root: Path) -> list[str]:
             parsed_target = urlsplit(target)
             path_target = unquote_url_path(parsed_target.path)
             fragment = url_element_fragment(unquote(parsed_target.fragment))
-            if requires_file and not path_target:
+            if requires_file and not path_target and not parsed_target.query:
                 errors.append(
                     f"{path.relative_to(root)}: resource target has no file path "
                     f"{raw_target!r}"
@@ -4758,7 +4777,7 @@ def validate_repository(root: Path) -> list[str]:
         except UnicodeDecodeError:
             skill_text = None
         if skill_text is not None:
-            line_count = len(skill_text.splitlines())
+            line_count = len(markdown_splitlines(skill_text))
             if line_count >= 500:
                 errors.append(f"SKILL.md must stay below 500 lines; found {line_count}")
         estimated_tokens = math.ceil(len(body) / 4)
