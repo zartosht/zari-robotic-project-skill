@@ -188,6 +188,7 @@ MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img", "source"})
 MARKDOWN_HTML_SRCDOC_ATTRIBUTES = frozenset({"srcdoc"})
 MARKDOWN_HTML_SRCDOC_TAGS = frozenset({"iframe"})
 MARKDOWN_HTML_STYLE_ATTRIBUTES = frozenset({"style"})
+MARKDOWN_HTML_BASE_TAGS = frozenset({"base"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -210,6 +211,7 @@ HTML_CHARACTER_REFERENCE_MAX_LENGTH = max(len(name) for name in HTML5_ENTITIES)
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 CSS_IMPORT_RULE = re.compile(r"@import(?![-_A-Za-z0-9])", re.IGNORECASE)
 CSS_URL_FUNCTION = re.compile(r"url\(", re.IGNORECASE)
+CSS_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 PERCENT_ENCODED_PATH_SEPARATOR = re.compile(r"(%(?:2[fF]|5[cC]))")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
 MARKDOWN_SUFFIXES = frozenset(
@@ -1773,6 +1775,65 @@ def html_srcset_candidates(value: str) -> list[str]:
     return candidates
 
 
+def css_escape_value(text: str, start: int) -> tuple[str, int] | None:
+    """Decode one CSS escape and return its value and following offset."""
+
+    index = start + 1
+    if index >= len(text):
+        return None
+    if text[index] in CSS_HEX_DIGITS:
+        value_end = index
+        while (
+            value_end < len(text)
+            and value_end - index < 6
+            and text[value_end] in CSS_HEX_DIGITS
+        ):
+            value_end += 1
+        code_point = int(text[index:value_end], 16)
+        if value_end < len(text) and text[value_end] in HTML_ASCII_WHITESPACE:
+            if (
+                text[value_end] == "\r"
+                and value_end + 1 < len(text)
+                and text[value_end + 1] == "\n"
+            ):
+                value_end += 2
+            else:
+                value_end += 1
+        if (
+            code_point == 0
+            or code_point > 0x10FFFF
+            or 0xD800 <= code_point <= 0xDFFF
+        ):
+            return "\N{REPLACEMENT CHARACTER}", value_end
+        return chr(code_point), value_end
+    if text[index] == "\r":
+        return "", index + 2 if text.startswith("\r\n", index) else index + 1
+    if text[index] in "\n\f":
+        return "", index + 1
+    return text[index], index + 1
+
+
+def css_unescape(text: str) -> str | None:
+    """Decode CSS escapes in an unquoted URL token."""
+
+    value: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "\\":
+            value.append(text[index])
+            index += 1
+            continue
+        escaped = css_escape_value(text, index)
+        if escaped is None:
+            return None
+        decoded, next_index = escaped
+        if not decoded and next_index > index + 1:
+            return None
+        value.append(decoded)
+        index = next_index
+    return "".join(value)
+
+
 def css_string_value(text: str, start: int) -> tuple[str, int] | None:
     """Return a quoted CSS string and the offset after its closing quote."""
 
@@ -1784,10 +1845,11 @@ def css_string_value(text: str, start: int) -> tuple[str, int] | None:
         if character == quote:
             return "".join(value), index + 1
         if character == "\\":
-            if index + 1 >= len(text):
+            escaped = css_escape_value(text, index)
+            if escaped is None:
                 return None
-            value.extend(text[index : index + 2])
-            index += 2
+            decoded, index = escaped
+            value.append(decoded)
             continue
         if character in "\r\n\f":
             return None
@@ -1852,8 +1914,9 @@ def css_resource_targets(text: str) -> list[str]:
                     value_end += 1
                 if value_end < len(text) and text[value_end] == ")":
                     value = text[value_start:value_end].rstrip(" \t\r\n\f")
-                    if value:
-                        targets.append(value)
+                    decoded = css_unescape(value)
+                    if decoded:
+                        targets.append(decoded)
                     index = value_end + 1
                     continue
         index += 1
@@ -2040,10 +2103,43 @@ def html_style_contents(text: str) -> list[str]:
     return contents
 
 
+def html_effective_base(text: str, inherited_base: str = "") -> str:
+    """Return the first valid rendered base URL, or the inherited base."""
+
+    for value in html_attribute_values(
+        text,
+        MARKDOWN_HTML_HREF_ATTRIBUTES,
+        tag_names=MARKDOWN_HTML_BASE_TAGS,
+    ):
+        try:
+            candidate = urljoin(inherited_base, html_attribute_unescape(value))
+            urlsplit(candidate)
+        except ValueError:
+            continue
+        return candidate
+    return inherited_base
+
+
+def resolve_html_targets(
+    targets: list[tuple[str, bool, bool]], base_url: str
+) -> list[tuple[str, bool, bool]]:
+    """Resolve collected HTML targets against the document base URL."""
+
+    resolved: list[tuple[str, bool, bool]] = []
+    for target, is_markdown, requires_file in targets:
+        try:
+            target = urljoin(base_url, target)
+        except ValueError:
+            pass
+        resolved.append((target, is_markdown, requires_file))
+    return resolved
+
+
 def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     """Collect navigations and resource requests from rendered HTML."""
 
     text = mask_html_template_contents(text)
+    effective_base = html_effective_base(text)
     targets: list[tuple[str, bool, bool]] = []
     targets.extend(
         (html_attribute_unescape(target), False, False)
@@ -2114,6 +2210,8 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             )
         )
 
+    targets = resolve_html_targets(targets, effective_base)
+
     for srcdoc in html_attribute_values(
         text,
         MARKDOWN_HTML_SRCDOC_ATTRIBUTES,
@@ -2123,6 +2221,7 @@ def html_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
             html_fragment_resource_targets(
                 html_attribute_unescape(srcdoc),
                 srcdoc_depth=1,
+                inherited_base=effective_base,
             )
         )
     return targets
@@ -2872,7 +2971,6 @@ def markdown_heading_fragments(text: str) -> set[str]:
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
         normalized_label = markdown_unescape(label).casefold()
         footnote_labels.add(normalized_label)
-        fragments.add(f"user-content-fn-{normalized_label}")
     footnote_reference_counts: dict[str, int] = {}
     for footnote in MARKDOWN_FOOTNOTE_REFERENCE.finditer(footnote_text):
         label = MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", footnote.group("label"))
@@ -2881,6 +2979,8 @@ def markdown_heading_fragments(text: str) -> set[str]:
             continue
         count = footnote_reference_counts.get(normalized_label, 0) + 1
         footnote_reference_counts[normalized_label] = count
+        if count == 1:
+            fragments.add(f"user-content-fn-{normalized_label}")
         suffix = "" if count == 1 else f"-{count}"
         fragments.add(f"user-content-fnref-{normalized_label}{suffix}")
     for definition in reference_definitions:

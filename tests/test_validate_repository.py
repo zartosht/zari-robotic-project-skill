@@ -720,10 +720,22 @@ class LinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "README.md").write_text(
-                "[^1]: Note\n\n[footnote](#user-content-fn-1)\n",
+                "Use[^1].\n\n[^1]: Note\n\n[footnote](#user-content-fn-1)\n",
                 encoding="utf-8",
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_rejects_footnote_fragment_for_unused_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[^unused]: Note\n\n"
+                "[stale](#user-content-fn-unused)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("#user-content-fn-unused", errors[0])
 
     def test_accepts_generated_gfm_footnote_reference_fragment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1977,6 +1989,42 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("missing.css" in error for error in errors))
             self.assertTrue(any("missing-theme.css" in error for error in errors))
             self.assertTrue(any("missing.png" in error for error in errors))
+
+    def test_decodes_css_escapes_in_resource_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "picture.png").write_bytes(b"image")
+            (root / "icon.png").write_bytes(b"image")
+            (root / "theme.css").write_text("/* theme */\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "<style>\n"
+                '@import "theme\\2e css";\n'
+                ".a { background: url(picture\\2e png); }\n"
+                '.b { background: url("icon\\2e png"); }\n'
+                "</style>\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_applies_first_document_base_to_raw_html_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "picture.png").write_bytes(b"root image")
+            (root / "other").mkdir()
+            (root / "other" / "picture.png").write_bytes(b"other image")
+            (root / "README.md").write_text(
+                '<base href="docs/">\n'
+                '<base href="other/">\n'
+                '<img src="picture.png">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("docs/picture.png", errors[0])
+
+            (root / "docs").mkdir()
+            (root / "docs" / "picture.png").write_bytes(b"docs image")
+            self.assertEqual([], validator.find_broken_links(root))
 
     def test_masks_raw_html_block_bodies_but_validates_opening_tag_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
