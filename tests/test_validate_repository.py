@@ -398,6 +398,25 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_reports_html_looking_angle_bracketed_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[guide](<missing file.md>)\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing file.md", errors[0])
+
+    def test_does_not_parse_html_attributes_inside_angle_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "object data=asset.bin").write_text("guide\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[guide](<object data=asset.bin>)\n", encoding="utf-8"
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_accepts_escaped_closer_in_angle_bracketed_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -426,6 +445,19 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_reports_missing_destination_before_link_title_whitespace(self) -> None:
+        separators = ("\t", "\n", "\r\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for separator in separators:
+                with self.subTest(separator=repr(separator)):
+                    (root / "README.md").write_text(
+                        f'[guide](missing.md{separator}"Guide")\n', encoding="utf-8"
+                    )
+                    errors = validator.find_broken_links(root)
+                    self.assertEqual(1, len(errors))
+                    self.assertIn("missing.md", errors[0])
+
     def test_ignores_inline_construct_with_invalid_bare_whitespace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -437,10 +469,12 @@ class LinkTests(unittest.TestCase):
     def test_ignores_inline_link_crossing_blank_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "README.md").write_text(
-                "[example](missing.md\n\n)\n", encoding="utf-8"
-            )
-            self.assertEqual([], validator.find_broken_links(root))
+            for blank_line in ("\n\n", "\r\n\r\n"):
+                with self.subTest(blank_line=repr(blank_line)):
+                    (root / "README.md").write_text(
+                        f"[example](missing.md{blank_line})\n", encoding="utf-8"
+                    )
+                    self.assertEqual([], validator.find_broken_links(root))
 
     def test_ignores_link_label_crossing_blank_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1252,6 +1286,18 @@ class LinkTests(unittest.TestCase):
             self.assertTrue(any("missing-large.png" in error for error in errors))
             self.assertTrue(any("missing-wide.png" in error for error in errors))
 
+    def test_validates_local_html_object_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<object data="missing.pdf"></object>\n'
+                '<div data="ignored.bin"></div>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.pdf", errors[0])
+
     def test_keeps_markdown_link_after_inline_html_crosses_blank_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1865,6 +1911,18 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn(
                 "build-robot-project/optional.txt: symlink resolves outside "
                 "distributable skill directory",
+                errors,
+            )
+
+    def test_rejects_dangling_optional_skill_resource_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill_root = root / "build-robot-project"
+            skill_root.mkdir(parents=True)
+            (skill_root / "optional.txt").symlink_to("missing.txt")
+            errors = validator.validate_repository(root)
+            self.assertIn(
+                "build-robot-project/optional.txt: symlink target does not exist",
                 errors,
             )
 

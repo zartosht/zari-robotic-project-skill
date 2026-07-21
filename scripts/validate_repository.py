@@ -141,6 +141,8 @@ MARKDOWN_HTML_NAME_ATTRIBUTES = frozenset({"name"})
 MARKDOWN_HTML_LEGACY_ANCHOR_TAGS = frozenset({"a"})
 MARKDOWN_HTML_HREF_ATTRIBUTES = frozenset({"href"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
+MARKDOWN_HTML_DATA_ATTRIBUTES = frozenset({"data"})
+MARKDOWN_HTML_DATA_TAGS = frozenset({"object"})
 MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
 MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
@@ -151,7 +153,9 @@ MARKDOWN_BACKSLASH_ESCAPE = re.compile(
 MARKDOWN_CHARACTER_REFERENCE = re.compile(
     r"&(?:#[xX][0-9A-Fa-f]{1,8}|#[0-9]{1,8}|[A-Za-z][A-Za-z0-9]{1,31});"
 )
-MARKDOWN_PARAGRAPH_BOUNDARY = re.compile(r"(?:\r\n?|\n)[ \t]*(?:\r\n?|\n)")
+MARKDOWN_PARAGRAPH_BOUNDARY = re.compile(
+    r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)"
+)
 MARKDOWN_REFERENCE_LABEL_MAX_LENGTH = 999
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 IGNORED_DIRECTORY_NAMES = frozenset({".git", ".pytest_cache", ".venv", "__pycache__", "venv"})
@@ -257,6 +261,10 @@ def find_escaping_skill_symlinks(skill_root: Path) -> list[str]:
 
     errors: list[str] = []
     for path in sorted(entry for entry in entries if entry.is_symlink()):
+        if not path.exists():
+            relative = path.relative_to(skill_root.parent)
+            errors.append(f"{relative}: symlink target does not exist")
+            continue
         try:
             resolves_within_skill = path.resolve().is_relative_to(expected_boundary)
         except (OSError, RuntimeError):
@@ -1569,7 +1577,9 @@ def markdown_destination_end(
         depth = 0
         while index < paragraph_end:
             character = text[index]
-            if ord(character) < 0x20 or ord(character) == 0x7F:
+            if (
+                ord(character) < 0x20 or ord(character) == 0x7F
+            ) and not character.isspace():
                 return None
             if character == "\\":
                 escape = MARKDOWN_BACKSLASH_ESCAPE.match(text, index)
@@ -1672,13 +1682,32 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
 
     rendered_text = markdown_searchable_text(text)
     markdown_characters = list(rendered_text)
+    html_characters = list(rendered_text)
+    inline_label_ends = set(markdown_label_pairs(rendered_text).values())
     for tag in MARKDOWN_HTML_TAG.finditer(rendered_text):
         if not markdown_html_tag_is_rendered(rendered_text, tag):
+            continue
+        opening = tag.start() - 1
+        if (
+            opening >= 1
+            and rendered_text[opening] == "("
+            and opening - 1 in inline_label_ends
+            and markdown_destination_end(
+                rendered_text,
+                opening,
+                markdown_paragraph_end(rendered_text, opening),
+            )
+            is not None
+        ):
+            for position in range(*tag.span()):
+                if html_characters[position] not in "\r\n":
+                    html_characters[position] = " "
             continue
         for position in range(*tag.span()):
             if markdown_characters[position] not in "\r\n":
                 markdown_characters[position] = " "
     text = "".join(markdown_characters)
+    rendered_html_text = "".join(html_characters)
     reference_definitions = markdown_reference_definitions(text)
     first_reference_definitions: dict[str, re.Match[str]] = {}
     for match in reference_definitions:
@@ -1763,19 +1792,27 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (target, False, False)
         for target in html_attribute_values(
-            rendered_text, MARKDOWN_HTML_HREF_ATTRIBUTES
+            rendered_html_text, MARKDOWN_HTML_HREF_ATTRIBUTES
         )
     )
     targets.extend(
         (target, False, True)
         for target in html_attribute_values(
-            rendered_text, MARKDOWN_HTML_SRC_ATTRIBUTES
+            rendered_html_text, MARKDOWN_HTML_SRC_ATTRIBUTES
         )
     )
     targets.extend(
         (target, False, True)
         for target in html_attribute_values(
-            rendered_text,
+            rendered_html_text,
+            MARKDOWN_HTML_DATA_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_DATA_TAGS,
+        )
+    )
+    targets.extend(
+        (target, False, True)
+        for target in html_attribute_values(
+            rendered_html_text,
             MARKDOWN_HTML_POSTER_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_POSTER_TAGS,
         )
@@ -1783,7 +1820,7 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
     targets.extend(
         (candidate, False, True)
         for value in html_attribute_values(
-            rendered_text,
+            rendered_html_text,
             MARKDOWN_HTML_SRCSET_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_SRCSET_TAGS,
         )
