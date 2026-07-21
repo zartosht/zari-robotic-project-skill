@@ -1725,7 +1725,7 @@ class LinkTests(unittest.TestCase):
             (root / "README.md").write_text(
                 '<img srcset="data:image/png;base64,AAAA 1x, small.png 2x, '
                 'missing-large.png 3x">\n'
-                '<source srcset="missing-wide.png 640w">\n',
+                '<picture><source srcset="missing-wide.png 640w"></picture>\n',
                 encoding="utf-8",
             )
             errors = validator.find_broken_links(root)
@@ -1910,6 +1910,48 @@ class LinkTests(unittest.TestCase):
             self.assertFalse(
                 any("ignored-srcdoc-picture.png" in error for error in errors)
             )
+
+    def test_preserves_nonvoid_slash_tag_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<video/><source src="missing-video.mp4">\n'
+                '<iframe srcdoc="<video/><source '
+                'src=\047missing-srcdoc-video.mp4\047>"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-video.mp4" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-video.mp4" in error for error in errors)
+            )
+
+    def test_restricts_source_srcset_to_picture_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing.mp4").write_bytes(b"video")
+            (root / "README.md").write_text(
+                '<picture><source srcset="missing-picture.png 1x"></picture>\n'
+                '<video><source src="existing.mp4" '
+                'srcset="ignored-video.png 1x"></video>\n'
+                '<source srcset="ignored-orphan.png 1x">\n'
+                '<iframe srcdoc="<picture><source '
+                'srcset=\047missing-srcdoc-picture.png 1x\047></picture>'
+                '<video><source src=\047existing.mp4\047 '
+                'srcset=\047ignored-srcdoc-video.png 1x\047></video>'
+                '<source srcset=\047ignored-srcdoc-orphan.png 1x\047>'
+                '"></iframe>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-picture.png" in error for error in errors))
+            self.assertTrue(
+                any("missing-srcdoc-picture.png" in error for error in errors)
+            )
+            self.assertFalse(any("ignored-video.png" in error for error in errors))
+            self.assertFalse(any("ignored-orphan.png" in error for error in errors))
 
     def test_recognizes_legacy_html_image_alias(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2289,6 +2331,32 @@ class LinkTests(unittest.TestCase):
             self.assertFalse(any("ignored.png" in error for error in errors))
             self.assertFalse(any("ignored-set.png" in error for error in errors))
 
+    def test_ignores_late_and_nested_css_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<style>@import "missing-early.css"; '
+                'body {} @import "ignored-late.css"; '
+                '@media print { @import "ignored-nested.css"; '
+                '.hero { background: url(missing.png); }}</style>\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-early.css" in error for error in errors))
+            self.assertTrue(any("missing.png" in error for error in errors))
+            self.assertFalse(any("ignored-late.css" in error for error in errors))
+            self.assertFalse(any("ignored-nested.css" in error for error in errors))
+
+    def test_scans_each_css_identifier_once(self) -> None:
+        with mock.patch.object(
+            validator,
+            "css_identifier_value",
+            wraps=validator.css_identifier_value,
+        ) as identifier:
+            self.assertEqual([], validator.css_resource_references("a" * 8_000))
+        self.assertLess(identifier.call_count, 10)
+
     def test_rejects_fragment_only_file_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2308,10 +2376,10 @@ class LinkTests(unittest.TestCase):
             (root / "README.md").write_text(
                 "<style>\n"
                 "/* url(commented.png) */\n"
-                '.example::before { content: "url(string.png)"; }\n'
                 "@import url('missing.css');\n"
                 '@import "missing-theme.css";\n'
                 '@import/* note */"missing-commented.css";\n'
+                '.example::before { content: "url(string.png)"; }\n'
                 ".example { background-image: url(missing.png); }\n"
                 "</style>\n",
                 encoding="utf-8",
@@ -2384,6 +2452,21 @@ class LinkTests(unittest.TestCase):
             )
             self.assertEqual([], validator.find_broken_links(root))
 
+    def test_ignores_foreign_namespace_base_elements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "picture.png").write_bytes(b"image")
+            (root / "README.md").write_text(
+                '<svg><base href="docs/"></base></svg>'
+                '<math><base href="other/"></base></math>'
+                '<img src="picture.png">\n'
+                '<iframe srcdoc="<svg><base href=\047docs/\047></base></svg>'
+                '<math><base href=\047other/\047></base></math>'
+                '<img src=\047picture.png\047>"></iframe>\n',
+                encoding="utf-8",
+            )
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_validates_base_resolved_meta_refresh_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2438,6 +2521,27 @@ class LinkTests(unittest.TestCase):
             self.assertEqual(2, len(errors))
             self.assertTrue(any("page.html#hidden" in error for error in errors))
             self.assertTrue(any("page.html#missing" in error for error in errors))
+
+    def test_excludes_ids_on_elements_ignored_inside_selects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text(
+                '<select><div id="hidden"></div>'
+                '<option id="shown"><span id="ignored"></span></option>'
+                '<input id="breakout"></select>\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                "[hidden](page.html#hidden) "
+                "[shown](page.html#shown) "
+                "[ignored](page.html#ignored) "
+                "[breakout](page.html#breakout)\n",
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("page.html#hidden" in error for error in errors))
+            self.assertTrue(any("page.html#ignored" in error for error in errors))
 
     def test_validates_fragments_in_local_svg_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -214,7 +214,7 @@ MARKDOWN_HTML_DATA_TAGS = frozenset({"object"})
 MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
 MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
-MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img", "source"})
+MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img"})
 MARKDOWN_HTML_IMAGESRCSET_ATTRIBUTES = frozenset({"imagesrcset"})
 MARKDOWN_HTML_IMAGE_PRELOAD_AS_VALUES = frozenset({"image"})
 MARKDOWN_HTML_SRCDOC_ATTRIBUTES = frozenset({"srcdoc"})
@@ -228,6 +228,27 @@ MARKDOWN_HTML_FORM_TAGS = frozenset({"form"})
 MARKDOWN_HTML_FORMACTION_ATTRIBUTES = frozenset({"formaction"})
 MARKDOWN_HTML_BUTTON_TAGS = frozenset({"button"})
 MARKDOWN_HTML_NON_SUBMIT_BUTTON_TYPES = frozenset({"button", "reset"})
+HTML_VOID_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+HTML_SELECT_ALLOWED_START_TAGS = frozenset(
+    {"hr", "optgroup", "option", "script", "template"}
+)
+HTML_SELECT_BREAKOUT_START_TAGS = frozenset({"input", "keygen", "textarea"})
 MARKDOWN_HTML_SUBMIT_INPUT_TYPES = frozenset({"image", "submit"})
 HTML_JAVASCRIPT_MIME_TYPE_ESSENCES = frozenset(
     {
@@ -2328,6 +2349,106 @@ def css_at_rule_block_start(text: str, start: int) -> int | None:
     return None
 
 
+def css_block_end(text: str, start: int) -> int:
+    """Return the offset after a balanced CSS block starting after its brace."""
+
+    index = start
+    depth = 1
+    while index < len(text) and depth:
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        if text[index] == "\\":
+            escaped = css_escape_value(text, index)
+            index = index + 1 if escaped is None else escaped[1]
+            continue
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+        index += 1
+    return index
+
+
+def css_rule_boundary(text: str, start: int) -> tuple[str, int]:
+    """Return a CSS rule's form and the offset after that complete rule."""
+
+    index = start
+    parentheses = 0
+    brackets = 0
+    while index < len(text):
+        if text.startswith("/*", index):
+            comment_end = text.find("*/", index + 2)
+            index = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if text[index] in {'"', "'"}:
+            string = css_string_value(text, index)
+            index = len(text) if string is None else string[1]
+            continue
+        if text[index] == "\\":
+            escaped = css_escape_value(text, index)
+            index = index + 1 if escaped is None else escaped[1]
+            continue
+        if text[index] == "(":
+            parentheses += 1
+        elif text[index] == ")" and parentheses:
+            parentheses -= 1
+        elif text[index] == "[":
+            brackets += 1
+        elif text[index] == "]" and brackets:
+            brackets -= 1
+        elif not parentheses and not brackets:
+            if text[index] == ";":
+                return "statement", index + 1
+            if text[index] == "{":
+                return "block", css_block_end(text, index + 1)
+        index += 1
+    return "eof", len(text)
+
+
+def css_top_level_import_starts(text: str) -> set[int]:
+    """Return offsets of imports accepted by top-level stylesheet ordering."""
+
+    starts: set[int] = set()
+    imports_allowed = True
+    index = 0
+    while index < len(text):
+        index = css_skip_whitespace_and_comments(text, index)
+        if text.startswith("<!--", index):
+            index += 4
+            continue
+        if text.startswith("-->", index):
+            index += 3
+            continue
+        if index >= len(text):
+            break
+        if text[index] != "@":
+            imports_allowed = False
+            _, index = css_rule_boundary(text, index)
+            continue
+
+        identifier = css_identifier_value(text, index + 1)
+        if identifier is None:
+            imports_allowed = False
+            index += 1
+            continue
+        rule_form, rule_end = css_rule_boundary(text, identifier[1])
+        name = identifier[0].casefold()
+        if name == "import" and imports_allowed and rule_form == "statement":
+            starts.add(index)
+        elif not (
+            rule_form == "statement" and name in {"charset", "layer"}
+        ):
+            imports_allowed = False
+        index = rule_end
+    return starts
+
+
 def css_resource_references(text: str) -> list[tuple[str, bool]]:
     """Extract CSS resource URLs and whether each requires a file path."""
 
@@ -2335,6 +2456,7 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
     forced_file_url_starts: set[int] = set()
     ignored_url_starts: set[int] = set()
     ignored_supports_condition_end = -1
+    valid_import_starts = css_top_level_import_starts(text)
     index = 0
     while index < len(text):
         if text.startswith("/*", index):
@@ -2345,7 +2467,8 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
         previous = text[index - 1] if index else ""
         function_identifier = (
             css_identifier_value(text, index)
-            if css_name_character(text[index]) or text[index] == "\\"
+            if (css_name_character(text[index]) or text[index] == "\\")
+            and not css_name_character(previous)
             else None
         )
         if (
@@ -2377,6 +2500,9 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
             at_rule_identifier is not None
             and at_rule_identifier[0].casefold() == "import"
         ):
+            if index not in valid_import_starts:
+                _, index = css_rule_boundary(text, at_rule_identifier[1])
+                continue
             value_start = css_skip_whitespace_and_comments(
                 text, at_rule_identifier[1]
             )
@@ -2439,11 +2565,7 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                     ignored_supports_condition_end, block_start
                 )
 
-        url_identifier = (
-            css_identifier_value(text, index)
-            if text[index].casefold() == "u" or text[index] == "\\"
-            else None
-        )
+        url_identifier = function_identifier
         if (
             url_identifier is not None
             and url_identifier[0].casefold() == "url"
@@ -2513,6 +2635,9 @@ def css_resource_references(text: str) -> list[tuple[str, bool]]:
                         )
                     index = value_end + 1
                     continue
+        if function_identifier is not None:
+            index = function_identifier[1]
+            continue
         index += 1
     return targets
 
@@ -2553,6 +2678,12 @@ def html_meta_refresh_target(content: str) -> str | None:
     return target or None
 
 
+def html_slash_closes_context(tag: str, *, inside_foreign: bool) -> bool:
+    """Return whether HTML parsing honors a start tag's self-closing flag."""
+
+    return inside_foreign or tag in {"math", "svg"} or tag in HTML_VOID_TAGS
+
+
 class HTMLContextResourceParser(HTMLParser):
     """Collect resources whose HTML meaning depends on ancestor context."""
 
@@ -2561,8 +2692,10 @@ class HTMLContextResourceParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.targets: list[tuple[str, bool, bool]] = []
+        self.base_hrefs: list[str] = []
         self.template_depth = 0
         self.svg_depth = 0
+        self.math_depth = 0
         self.picture_depth = 0
         self.media_depth = 0
 
@@ -2580,7 +2713,9 @@ class HTMLContextResourceParser(HTMLParser):
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
 
-        inside_svg = bool(self.svg_depth)
+        inside_foreign = bool(self.svg_depth or self.math_depth)
+        if tag == "base" and "href" in values and not inside_foreign:
+            self.base_hrefs.append(values["href"])
         if (
             tag == "source"
             and "src" in values
@@ -2588,10 +2723,15 @@ class HTMLContextResourceParser(HTMLParser):
             and not self.picture_depth
         ):
             self.targets.append((values["src"], False, True))
+        if tag == "source" and "srcset" in values and self.picture_depth:
+            self.targets.extend(
+                (candidate, False, True)
+                for candidate in html_srcset_candidates(values["srcset"])
+            )
         if (
             tag == "image"
             and "src" in values
-            and not inside_svg
+            and not inside_foreign
             and not (
                 "srcset" in values
                 and html_srcset_overrides_src(values["srcset"])
@@ -2601,6 +2741,8 @@ class HTMLContextResourceParser(HTMLParser):
 
         if tag == "svg":
             self.svg_depth += 1
+        elif tag == "math":
+            self.math_depth += 1
         elif tag == "picture":
             self.picture_depth += 1
         elif tag in {"audio", "video"}:
@@ -2609,8 +2751,11 @@ class HTMLContextResourceParser(HTMLParser):
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
+        tag = tag.casefold()
+        inside_foreign = bool(self.svg_depth or self.math_depth)
         self.handle_starttag(tag, attributes)
-        self.handle_endtag(tag)
+        if html_slash_closes_context(tag, inside_foreign=inside_foreign):
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.casefold()
@@ -2621,6 +2766,8 @@ class HTMLContextResourceParser(HTMLParser):
             return
         if tag == "svg" and self.svg_depth:
             self.svg_depth -= 1
+        elif tag == "math" and self.math_depth:
+            self.math_depth -= 1
         elif tag == "picture" and self.picture_depth:
             self.picture_depth -= 1
         elif tag in {"audio", "video"} and self.media_depth:
@@ -2636,6 +2783,15 @@ def html_context_resource_targets(text: str) -> list[tuple[str, bool, bool]]:
     return parser.targets
 
 
+def html_context_base_hrefs(text: str) -> list[str]:
+    """Return HTML-namespace base href values in document order."""
+
+    parser = HTMLContextResourceParser()
+    parser.feed(text)
+    parser.close()
+    return parser.base_hrefs
+
+
 class HTMLFragmentResourceParser(HTMLParser):
     """Collect browser-loaded targets from an iframe srcdoc HTML fragment."""
 
@@ -2649,6 +2805,7 @@ class HTMLFragmentResourceParser(HTMLParser):
         self.style_content: list[str] | None = None
         self.template_depth = 0
         self.svg_depth = 0
+        self.math_depth = 0
         self.picture_depth = 0
         self.media_depth = 0
 
@@ -2665,14 +2822,21 @@ class HTMLFragmentResourceParser(HTMLParser):
             return
         if self.template_depth:
             return
-        inside_svg = bool(self.svg_depth)
+        inside_foreign = bool(self.svg_depth or self.math_depth)
         if tag == "svg":
             self.svg_depth += 1
+        elif tag == "math":
+            self.math_depth += 1
         elif tag == "picture":
             self.picture_depth += 1
         elif tag in {"audio", "video"}:
             self.media_depth += 1
-        if tag == "base" and self.base_href is None and "href" in values:
+        if (
+            tag == "base"
+            and self.base_href is None
+            and "href" in values
+            and not inside_foreign
+        ):
             try:
                 urlsplit(values["href"])
             except ValueError:
@@ -2758,7 +2922,7 @@ class HTMLFragmentResourceParser(HTMLParser):
         if (
             tag == "image"
             and "src" in values
-            and not inside_svg
+            and not inside_foreign
             and not (
                 "srcset" in values
                 and html_srcset_overrides_src(values["srcset"])
@@ -2776,6 +2940,11 @@ class HTMLFragmentResourceParser(HTMLParser):
         if tag in MARKDOWN_HTML_POSTER_TAGS and "poster" in values:
             self.targets.append((values["poster"], False, True))
         if tag in MARKDOWN_HTML_SRCSET_TAGS and "srcset" in values:
+            self.targets.extend(
+                (candidate, False, True)
+                for candidate in html_srcset_candidates(values["srcset"])
+            )
+        if tag == "source" and "srcset" in values and self.picture_depth:
             self.targets.extend(
                 (candidate, False, True)
                 for candidate in html_srcset_candidates(values["srcset"])
@@ -2803,8 +2972,11 @@ class HTMLFragmentResourceParser(HTMLParser):
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
     ) -> None:
+        tag = tag.casefold()
+        inside_foreign = bool(self.svg_depth or self.math_depth)
         self.handle_starttag(tag, attributes)
-        self.handle_endtag(tag)
+        if html_slash_closes_context(tag, inside_foreign=inside_foreign):
+            self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
         if self.style_content is not None:
@@ -2819,6 +2991,8 @@ class HTMLFragmentResourceParser(HTMLParser):
             return
         if tag == "svg" and self.svg_depth:
             self.svg_depth -= 1
+        elif tag == "math" and self.math_depth:
+            self.math_depth -= 1
         elif tag == "picture" and self.picture_depth:
             self.picture_depth -= 1
         elif tag in {"audio", "video"} and self.media_depth:
@@ -2851,6 +3025,7 @@ class HTMLDocumentFragmentParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.fragments: set[str] = set()
         self.template_depth = 0
+        self.in_select = False
 
     def handle_starttag(
         self, tag: str, attributes: list[tuple[str, str | None]]
@@ -2860,6 +3035,14 @@ class HTMLDocumentFragmentParser(HTMLParser):
             if tag == "template":
                 self.template_depth += 1
             return
+        if self.in_select:
+            if tag in HTML_SELECT_BREAKOUT_START_TAGS:
+                self.in_select = False
+            elif tag == "select":
+                self.in_select = False
+                return
+            elif tag not in HTML_SELECT_ALLOWED_START_TAGS:
+                return
         values: dict[str, str] = {}
         for name, value in attributes:
             values.setdefault(name.casefold(), value or "")
@@ -2869,6 +3052,8 @@ class HTMLDocumentFragmentParser(HTMLParser):
             self.fragments.add(values["name"])
         if tag == "template":
             self.template_depth += 1
+        elif tag == "select":
+            self.in_select = True
 
     def handle_startendtag(
         self, tag: str, attributes: list[tuple[str, str | None]]
@@ -2876,8 +3061,11 @@ class HTMLDocumentFragmentParser(HTMLParser):
         self.handle_starttag(tag, attributes)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.casefold() == "template" and self.template_depth:
+        tag = tag.casefold()
+        if tag == "template" and self.template_depth:
             self.template_depth -= 1
+        elif tag == "select":
+            self.in_select = False
 
 
 def html_document_fragments(text: str) -> set[str]:
@@ -2995,15 +3183,11 @@ def html_style_contents(text: str) -> list[str]:
 def html_effective_base(text: str, inherited_base: str = "") -> str:
     """Return the first valid rendered base URL, or the inherited base."""
 
-    for value in html_attribute_values(
-        text,
-        MARKDOWN_HTML_HREF_ATTRIBUTES,
-        tag_names=MARKDOWN_HTML_BASE_TAGS,
-    ):
+    for value in html_context_base_hrefs(text):
         try:
             candidate = urljoin(
                 html_url_for_resolution(inherited_base),
-                html_url_for_resolution(html_attribute_unescape(value)),
+                html_url_for_resolution(value),
             )
             urlsplit(candidate)
         except ValueError:
