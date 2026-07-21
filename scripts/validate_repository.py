@@ -136,6 +136,8 @@ MARKDOWN_HTML_HREF_ATTRIBUTES = frozenset({"href"})
 MARKDOWN_HTML_SRC_ATTRIBUTES = frozenset({"src"})
 MARKDOWN_HTML_POSTER_ATTRIBUTES = frozenset({"poster"})
 MARKDOWN_HTML_POSTER_TAGS = frozenset({"video"})
+MARKDOWN_HTML_SRCSET_ATTRIBUTES = frozenset({"srcset"})
+MARKDOWN_HTML_SRCSET_TAGS = frozenset({"img", "source"})
 MARKDOWN_BACKSLASH_ESCAPE = re.compile(
     r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"""
 )
@@ -239,7 +241,7 @@ def decode_text_data(data: bytes) -> str | None:
     """Decode UTF-8 or BOM-marked Unicode text without guessing binary data."""
 
     try:
-        return data.decode("utf-8")
+        return data.decode("utf-8-sig")
     except UnicodeDecodeError:
         for byte_order_mark, encoding in (
             (b"\xff\xfe\x00\x00", "utf-32"),
@@ -612,19 +614,39 @@ def mask_markdown_raw_html_blocks(characters: list[str]) -> None:
         mask_except_html_tags(blank_block_start, blank_block_end)
 
 
+def markdown_frontmatter_end(lines_with_endings: list[str]) -> int:
+    """Return the end offset of recognized scalar frontmatter, if present."""
+
+    if not lines_with_endings or lines_with_endings[0].strip() != "---":
+        return 0
+
+    offset = len(lines_with_endings[0])
+    keys: set[str] = set()
+    for line in lines_with_endings[1:]:
+        offset += len(line)
+        stripped = line.strip()
+        if stripped in {"---", "..."}:
+            return offset
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in line or line.startswith((" ", "\t", "-")):
+            return 0
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value or key in keys:
+            return 0
+        keys.add(key)
+    return 0
+
+
 def markdown_searchable_text(text: str, *, mask_inline_code: bool = True) -> str:
     """Mask literal Markdown regions while preserving offsets and line structure."""
 
     characters = list(text)
     lines_with_endings = text.splitlines(keepends=True)
-    if lines_with_endings and lines_with_endings[0].strip() == "---":
-        offset = len(lines_with_endings[0])
-        frontmatter_end = 0
-        for line in lines_with_endings[1:]:
-            offset += len(line)
-            if line.strip() in {"---", "..."}:
-                frontmatter_end = offset
-                break
+    frontmatter_end = markdown_frontmatter_end(lines_with_endings)
+    if frontmatter_end:
         for index in range(frontmatter_end):
             if characters[index] not in "\r\n":
                 characters[index] = " "
@@ -986,18 +1008,24 @@ def markdown_bare_destination_is_balanced(destination: str) -> bool:
 
 
 def markdown_reference_usages(
-    text: str, reference_labels: set[str]
+    text: str,
+    reference_labels: set[str],
+    label_pairs: dict[int, int] | None = None,
 ) -> dict[str, bool]:
     """Collect active reference labels and whether any use renders an image."""
 
+    if label_pairs is None:
+        label_pairs = markdown_label_pairs(text)
     usages: dict[str, bool] = {}
-    image_label_ranges = markdown_active_image_label_ranges(text, reference_labels)
+    image_label_ranges = markdown_active_image_label_ranges(
+        text, reference_labels, label_pairs
+    )
     for label_start, character in enumerate(text):
         if character != "[" or markdown_character_is_escaped(text, label_start):
             continue
         if any(start < label_start < end for start, end in image_label_ranges):
             continue
-        label_end = markdown_label_end(text, label_start)
+        label_end = label_pairs.get(label_start)
         if label_end is None:
             continue
         is_image = (
@@ -1007,11 +1035,6 @@ def markdown_reference_usages(
         )
         if label_end + 1 < len(text) and text[label_end + 1] == ":":
             continue
-        if not is_image and markdown_label_contains_active_link(
-            text, label_start, label_end, reference_labels
-        ):
-            continue
-
         primary_label = text[label_start + 1 : label_end]
         cursor = label_end + 1
         if (
@@ -1021,7 +1044,7 @@ def markdown_reference_usages(
         ):
             continue
         if cursor < len(text) and text[cursor] == "[":
-            reference_end = markdown_label_end(text, cursor)
+            reference_end = label_pairs.get(cursor)
             if reference_end is None:
                 continue
             reference_label = text[cursor + 1 : reference_end] or primary_label
@@ -1030,8 +1053,13 @@ def markdown_reference_usages(
         if len(reference_label) > MARKDOWN_REFERENCE_LABEL_MAX_LENGTH:
             continue
         normalized = markdown_normalize_reference_label(reference_label)
-        if normalized in reference_labels:
-            usages[normalized] = usages.get(normalized, False) or is_image
+        if normalized not in reference_labels:
+            continue
+        if not is_image and markdown_label_contains_active_link(
+            text, label_start, label_end, reference_labels, label_pairs
+        ):
+            continue
+        usages[normalized] = usages.get(normalized, False) or is_image
     return usages
 
 
@@ -1040,6 +1068,7 @@ def markdown_label_contains_active_link(
     label_start: int,
     label_end: int,
     reference_labels: set[str],
+    label_pairs: dict[int, int] | None = None,
 ) -> bool:
     """Return whether a link label contains a nested link that deactivates it."""
 
@@ -1077,7 +1106,11 @@ def markdown_label_contains_active_link(
             if destination is not None and destination[1] < label_end:
                 return True
         if cursor < label_end and text[cursor] == "[":
-            reference_end = markdown_label_end(text, cursor)
+            reference_end = (
+                label_pairs.get(cursor)
+                if label_pairs is not None
+                else markdown_label_end(text, cursor)
+            )
             if reference_end is not None and reference_end < label_end:
                 reference_label = text[cursor + 1 : reference_end]
                 if not reference_label:
@@ -1208,6 +1241,72 @@ def html_attribute_values(
             if name in names:
                 values.append(value)
     return values
+
+
+def html_srcset_candidates(value: str) -> list[str]:
+    """Extract URL candidates from an HTML srcset attribute value."""
+
+    candidates: list[str] = []
+    index = 0
+    while index < len(value):
+        while index < len(value) and (
+            value[index].isspace() or value[index] == ","
+        ):
+            index += 1
+        if index >= len(value):
+            break
+
+        url_start = index
+        while index < len(value) and not value[index].isspace():
+            index += 1
+        url = value[url_start:index]
+        trailing_commas = len(url) - len(url.rstrip(","))
+        url = url.rstrip(",")
+        if url:
+            candidates.append(url)
+        if trailing_commas:
+            continue
+
+        parentheses = 0
+        while index < len(value):
+            character = value[index]
+            if character == "(":
+                parentheses += 1
+            elif character == ")" and parentheses:
+                parentheses -= 1
+            elif character == "," and parentheses == 0:
+                index += 1
+                break
+            index += 1
+    return candidates
+
+
+def markdown_label_pairs(text: str) -> dict[int, int]:
+    """Parse matching label brackets once per inline Markdown block."""
+
+    pairs: dict[int, int] = {}
+    search_from = 0
+    while search_from < len(text):
+        label_start = text.find("[", search_from)
+        while label_start >= 0 and markdown_character_is_escaped(text, label_start):
+            label_start = text.find("[", label_start + 1)
+        if label_start < 0:
+            break
+
+        block_end = markdown_inline_block_end(text, label_start)
+        stack: list[int] = []
+        index = label_start
+        while index < block_end:
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == "[":
+                stack.append(index)
+            elif text[index] == "]" and stack:
+                pairs[stack.pop()] = index
+            index += 1
+        search_from = max(block_end, label_start + 1)
+    return pairs
 
 
 def markdown_label_end(text: str, start: int) -> int | None:
@@ -1368,17 +1467,21 @@ def markdown_destination_end(text: str, opening: int) -> tuple[str, int] | None:
 
 
 def markdown_active_image_label_ranges(
-    text: str, reference_labels: set[str]
+    text: str,
+    reference_labels: set[str],
+    label_pairs: dict[int, int] | None = None,
 ) -> list[tuple[int, int]]:
     """Return rendered image-label ranges whose nested targets are alt text only."""
 
+    if label_pairs is None:
+        label_pairs = markdown_label_pairs(text)
     ranges: list[tuple[int, int]] = []
     for label_start, character in enumerate(text):
         if character != "[" or label_start == 0 or text[label_start - 1] != "!":
             continue
         if markdown_character_is_escaped(text, label_start - 1):
             continue
-        label_end = markdown_label_end(text, label_start)
+        label_end = label_pairs.get(label_start)
         if label_end is None:
             continue
 
@@ -1391,7 +1494,7 @@ def markdown_active_image_label_ranges(
         )
         if not active:
             if cursor < len(text) and text[cursor] == "[":
-                reference_end = markdown_label_end(text, cursor)
+                reference_end = label_pairs.get(cursor)
                 if reference_end is None:
                     continue
                 reference_label = text[cursor + 1 : reference_end] or primary_label
@@ -1425,8 +1528,13 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
         label = markdown_normalize_reference_label(match.group("label"))
         first_reference_definitions.setdefault(label, match)
     reference_labels = set(first_reference_definitions)
-    image_label_ranges = markdown_active_image_label_ranges(text, reference_labels)
-    reference_usages = markdown_reference_usages(text, reference_labels)
+    label_pairs = markdown_label_pairs(text)
+    image_label_ranges = markdown_active_image_label_ranges(
+        text, reference_labels, label_pairs
+    )
+    reference_usages = markdown_reference_usages(
+        text, reference_labels, label_pairs
+    )
     targets: list[tuple[str, bool, bool]] = []
     inline_link_suffix_ranges: list[tuple[int, int]] = []
     for label_start, character in enumerate(text):
@@ -1436,7 +1544,7 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
             continue
         if any(start < label_start < end for start, end in image_label_ranges):
             continue
-        label_end = markdown_label_end(text, label_start)
+        label_end = label_pairs.get(label_start)
         if label_end is None or label_end + 1 >= len(text) or text[label_end + 1] != "(":
             continue
         destination = markdown_destination_end(text, label_end + 1)
@@ -1447,7 +1555,7 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
                 and not markdown_character_is_escaped(text, label_start - 1)
             )
             if not is_image and markdown_label_contains_active_link(
-                text, label_start, label_end, reference_labels
+                text, label_start, label_end, reference_labels, label_pairs
             ):
                 continue
             targets.append(
@@ -1483,6 +1591,15 @@ def markdown_link_targets(text: str) -> list[tuple[str, bool, bool]]:
             MARKDOWN_HTML_POSTER_ATTRIBUTES,
             tag_names=MARKDOWN_HTML_POSTER_TAGS,
         )
+    )
+    targets.extend(
+        (candidate, False, True)
+        for value in html_attribute_values(
+            rendered_text,
+            MARKDOWN_HTML_SRCSET_ATTRIBUTES,
+            tag_names=MARKDOWN_HTML_SRCSET_TAGS,
+        )
+        for candidate in html_srcset_candidates(value)
     )
     return targets
 

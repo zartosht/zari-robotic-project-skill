@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import sys
 
@@ -82,6 +83,15 @@ class LinkTests(unittest.TestCase):
                 "[details](guide.md#details)\n", encoding="utf-8"
             )
             (root / "guide.md").write_text("# Details\n", encoding="utf-16")
+            self.assertEqual([], validator.find_broken_links(root))
+
+    def test_strips_utf8_bom_from_markdown_fragment_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[details](guide.md#details)\n", encoding="utf-8"
+            )
+            (root / "guide.md").write_bytes(b"\xef\xbb\xbf# Details\n")
             self.assertEqual([], validator.find_broken_links(root))
 
     def test_accepts_mixed_case_external_uri_scheme(self) -> None:
@@ -336,6 +346,16 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(2, len(errors))
             self.assertTrue(all("broken Markdown fragment" in error for error in errors))
+
+    def test_scans_links_between_thematic_breaks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "---\nintro text\n[guide](missing.md)\n---\n", encoding="utf-8"
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.md", errors[0])
 
     def test_accepts_angle_bracketed_destination_with_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -637,6 +657,20 @@ class LinkTests(unittest.TestCase):
                 f"{nested}(README.md)\n", encoding="utf-8"
             )
             self.assertEqual([], validator.find_broken_links(root))
+
+    def test_parses_deeply_nested_labels_once_per_inline_block(self) -> None:
+        nested = "[" * 4000 + "x" + "]" * 4000
+        text = f"{nested}(README.md)\n"
+        with mock.patch.object(
+            validator,
+            "markdown_inline_block_end",
+            wraps=validator.markdown_inline_block_end,
+        ) as inline_block_end:
+            self.assertEqual(
+                [("README.md", True, False)],
+                validator.markdown_link_targets(text),
+            )
+        self.assertLess(inline_block_end.call_count, 10)
 
     def test_rejects_markdown_image_targeting_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1044,6 +1078,21 @@ class LinkTests(unittest.TestCase):
             errors = validator.find_broken_links(root)
             self.assertEqual(1, len(errors))
             self.assertIn("missing.png", errors[0])
+
+    def test_validates_local_html_srcset_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "small.png").write_bytes(b"small")
+            (root / "README.md").write_text(
+                '<img srcset="data:image/png;base64,AAAA 1x, small.png 2x, '
+                'missing-large.png 3x">\n'
+                '<source srcset="missing-wide.png 640w">\n',
+                encoding="utf-8",
+            )
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-large.png" in error for error in errors))
+            self.assertTrue(any("missing-wide.png" in error for error in errors))
 
     def test_keeps_markdown_link_after_inline_html_crosses_blank_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
