@@ -143,6 +143,98 @@ class LinkTests(unittest.TestCase):
             self.assertIn("nested.svg", errors[0])
             self.assertIn("missing.png", errors[0])
 
+    def test_validates_svg_script_href_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><script href="missing-inline.js"></script></svg>\n'
+                "[diagram](diagram.svg)\n",
+                encoding="utf-8",
+            )
+            (root / "diagram.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<script href="missing-standalone.js"/></svg>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-inline.js" in error for error in errors))
+            self.assertTrue(
+                any("missing-standalone.js" in error for error in errors)
+            )
+
+    def test_validates_svg_xml_stylesheet_processing_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[diagram](diagram.svg)\n", encoding="utf-8"
+            )
+            (root / "theme.css").write_text(
+                '@import "missing.css";\n', encoding="utf-8"
+            )
+            (root / "diagram.svg").write_text(
+                '<?xml-stylesheet type="text/css" href="theme.css"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<?xml-stylesheet type="text/css" href="ignored-inside.css"?>'
+                "</svg>\n",
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("missing.css", errors[0])
+
+    def test_accepts_svg_view_specification_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[view](diagram.svg#svgView(viewBox(0,0,100,100))) "
+                "[invalid](diagram.svg#svgView(viewBox(0,0,-1,100)))\n",
+                encoding="utf-8",
+            )
+            (root / "diagram.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"/>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("svgView(viewBox(0,0,-1,100))", errors[0])
+
+    def test_validates_inline_svg_xlink_navigation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                '<svg><a xlink:href="missing-outer.html">outer</a></svg>\n'
+                '<iframe srcdoc="<svg><a '
+                'xlink:href=\047missing-srcdoc.html\047>srcdoc</a>'
+                '</svg>"></iframe>\n',
+                encoding="utf-8",
+            )
+
+            errors = validator.find_broken_links(root)
+            self.assertEqual(2, len(errors))
+            self.assertTrue(any("missing-outer.html" in error for error in errors))
+            self.assertTrue(any("missing-srcdoc.html" in error for error in errors))
+
+    def test_resolves_standalone_svg_resources_through_xml_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "[diagram](diagram.svg)\n", encoding="utf-8"
+            )
+            (root / "assets" / "icons").mkdir(parents=True)
+            (root / "assets" / "icons" / "pic.png").write_bytes(b"png")
+            (root / "diagram.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'xml:base="assets/"><g xml:base="icons/">'
+                '<image href="pic.png"/></g></svg>\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validator.find_broken_links(root))
+
     def test_restricts_link_resources_to_the_html_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

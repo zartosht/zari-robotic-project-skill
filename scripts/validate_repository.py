@@ -197,7 +197,9 @@ MARKDOWN_HTML_LINK_RESOURCE_RELATIONS = frozenset(
     }
 )
 MARKDOWN_SVG_RESOURCE_HREF_ATTRIBUTES = frozenset({"href", "xlink:href"})
-MARKDOWN_SVG_RESOURCE_HREF_TAGS = frozenset({"feimage", "image", "use"})
+MARKDOWN_SVG_RESOURCE_HREF_TAGS = frozenset(
+    {"feimage", "image", "script", "use"}
+)
 MARKDOWN_SVG_NAVIGATION_HREF_TAGS = frozenset({"a"})
 SVG_PRESENTATION_RESOURCE_ATTRIBUTES = frozenset(
     {
@@ -327,6 +329,7 @@ MATHML_NAMESPACE = "mathml"
 XHTML_XML_NAMESPACE = "http://www.w3.org/1999/xhtml"
 SVG_XML_NAMESPACE = "http://www.w3.org/2000/svg"
 XML_ID_ATTRIBUTE = "{http://www.w3.org/XML/1998/namespace}id"
+XML_BASE_ATTRIBUTE = "{http://www.w3.org/XML/1998/namespace}base"
 SVG_HTML_INTEGRATION_POINTS = frozenset({"desc", "foreignobject", "title"})
 MATHML_TEXT_INTEGRATION_POINTS = frozenset({"mi", "mn", "mo", "ms", "mtext"})
 HTML_FOREIGN_CONTENT_BREAKOUT_START_TAGS = frozenset(
@@ -3521,6 +3524,12 @@ class HTMLContextResourceParser(HTMLParser):
         if tag == "base" and "href" in values and namespace == HTML_NAMESPACE:
             self.base_hrefs.append(values["href"])
         if (
+            canonical_tag == "a"
+            and namespace == HTML_NAMESPACE
+            and "href" in values
+        ):
+            self.targets.append((values["href"], False, False))
+        if (
             canonical_tag == "area"
             and namespace == HTML_NAMESPACE
             and "href" in values
@@ -3626,6 +3635,10 @@ class HTMLContextResourceParser(HTMLParser):
                 self.targets.append(
                     (target, False, html_target_requires_file(target))
                 )
+        if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_NAVIGATION_HREF_TAGS:
+            target = values.get("href", values.get("xlink:href"))
+            if target is not None:
+                self.targets.append((target, False, False))
         if namespace == SVG_NAMESPACE:
             self.targets.extend(svg_presentation_resource_targets(values))
         if tag == "select" and namespace == HTML_NAMESPACE:
@@ -3834,6 +3847,10 @@ class HTMLFragmentResourceParser(HTMLParser):
                 self.targets.append(
                     (target, False, html_target_requires_file(target))
                 )
+        if namespace == SVG_NAMESPACE and tag in MARKDOWN_SVG_NAVIGATION_HREF_TAGS:
+            target = values.get("href", values.get("xlink:href"))
+            if target is not None:
+                self.targets.append((target, False, False))
         if (
             canonical_tag in MARKDOWN_HTML_SRC_TAGS
             and namespace == HTML_NAMESPACE
@@ -4091,13 +4108,101 @@ def svg_document_fragments(text: str) -> set[str]:
     return fragments
 
 
-def xml_expanded_name(name: str) -> tuple[str, str]:
+def svg_fragment_is_view_specification(fragment: str) -> bool:
+    """Return whether a fragment is a supported SVG viewBox specification."""
+
+    whitespace = r"[\t\n\f\r ]*"
+    separator = r"(?:[\t\n\f\r ]*,[\t\n\f\r ]*|[\t\n\f\r ]+)"
+    number = HTML_FLOATING_POINT_NUMBER.pattern
+    match = re.fullmatch(
+        rf"svgView\({whitespace}viewBox\({whitespace}"
+        rf"(?P<x>{number}){separator}(?P<y>{number}){separator}"
+        rf"(?P<width>{number}){separator}(?P<height>{number})"
+        rf"{whitespace}\){whitespace}\)",
+        fragment,
+    )
+    return bool(
+        match
+        and float(match.group("width")) >= 0
+        and float(match.group("height")) >= 0
+    )
+
+
+def xml_expanded_name(name: object) -> tuple[str, str]:
     """Split an ElementTree expanded name into namespace and local name."""
 
+    if not isinstance(name, str):
+        return "", ""
     if name.startswith("{") and "}" in name:
         namespace, local_name = name[1:].split("}", 1)
         return namespace, local_name
     return "", name
+
+
+def xml_resolve_target(target: str, base: str) -> str:
+    """Resolve an XML resource target against its inherited base URI."""
+
+    try:
+        return urljoin(base, target)
+    except ValueError:
+        return target
+
+
+def xml_stylesheet_processing_instruction_targets(text: str) -> list[str]:
+    """Return CSS hrefs from well-formed xml-stylesheet instructions."""
+
+    parser = ElementTree.XMLPullParser(events=("start", "pi"))
+    try:
+        parser.feed(text)
+        parser.close()
+        processing_instructions: list[str] = []
+        document_element_started = False
+        for event, element in parser.read_events():
+            if event == "start":
+                document_element_started = True
+            elif not document_element_started:
+                processing_instructions.append(element.text or "")
+    except ElementTree.ParseError:
+        return []
+
+    targets: list[str] = []
+    attribute_pattern = re.compile(
+        r"(?P<name>[A-Za-z_:][A-Za-z0-9_.:-]*)"
+        r"[\t\r\n ]*=[\t\r\n ]*"
+        r"(?P<quote>['\"])(?P<value>.*?)(?P=quote)",
+        re.DOTALL,
+    )
+    for instruction in processing_instructions:
+        target_match = re.match(r"xml-stylesheet(?=[\t\r\n ]|$)", instruction)
+        if target_match is None:
+            continue
+        attributes: dict[str, str] = {}
+        cursor = target_match.end()
+        valid = True
+        while cursor < len(instruction):
+            whitespace = re.match(r"[\t\r\n ]+", instruction[cursor:])
+            if whitespace is None:
+                valid = False
+                break
+            cursor += whitespace.end()
+            if cursor == len(instruction):
+                break
+            attribute = attribute_pattern.match(instruction, cursor)
+            if attribute is None:
+                valid = False
+                break
+            attributes.setdefault(
+                attribute.group("name"), html_unescape(attribute.group("value"))
+            )
+            cursor = attribute.end()
+        if (
+            valid
+            and "href" in attributes
+            and attributes.get("type", "text/css").strip().casefold()
+            == "text/css"
+        ):
+            targets.append(attributes["href"])
+    return targets
 
 
 def svg_xml_element_resource_targets(
@@ -4108,39 +4213,74 @@ def svg_xml_element_resource_targets(
     """Collect browser-loaded targets from an XML-parsed SVG subtree."""
 
     targets: list[tuple[str, bool, bool]] = []
-    style_sources: list[str] = []
+    style_sources: list[tuple[str, str]] = []
     document_stylesheet_targets: list[str] = []
     xlink_href = "{http://www.w3.org/1999/xlink}href"
-    for element in root.iter():
-        namespace, tag = xml_expanded_name(element.tag)
-        if namespace != SVG_XML_NAMESPACE:
-            continue
-        attributes = element.attrib
-        if tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
-            target = attributes.get("href", attributes.get(xlink_href))
-            if target is not None:
-                targets.append(
-                    (target, False, html_target_requires_file(target))
-                )
-        if tag in MARKDOWN_SVG_NAVIGATION_HREF_TAGS:
-            target = attributes.get("href", attributes.get(xlink_href))
-            if target is not None:
-                targets.append((target, False, False))
-        targets.extend(svg_presentation_resource_targets(attributes))
-        if "style" in attributes:
-            style_sources.append(attributes["style"])
-        if tag == "style":
-            style_sources.append("".join(element.itertext()))
 
-    used_custom_properties = css_used_custom_properties(style_sources)
-    for style_source in style_sources:
-        targets.extend(
-            (target, False, requires_file)
-            for target, requires_file in css_resource_references(
-                style_source,
-                used_custom_properties=used_custom_properties,
-                imported_targets=document_stylesheet_targets,
+    def visit(element: ElementTree.Element, inherited_base: str) -> None:
+        namespace, tag = xml_expanded_name(element.tag)
+        attributes = element.attrib
+        effective_base = inherited_base
+        if XML_BASE_ATTRIBUTE in attributes:
+            effective_base = xml_resolve_target(
+                attributes[XML_BASE_ATTRIBUTE], inherited_base
             )
+        if namespace == SVG_XML_NAMESPACE:
+            if tag in MARKDOWN_SVG_RESOURCE_HREF_TAGS:
+                target = attributes.get("href", attributes.get(xlink_href))
+                if target is not None:
+                    resolved_target = xml_resolve_target(target, effective_base)
+                    targets.append(
+                        (
+                            resolved_target,
+                            False,
+                            html_target_requires_file(resolved_target),
+                        )
+                    )
+            if tag in MARKDOWN_SVG_NAVIGATION_HREF_TAGS:
+                target = attributes.get("href", attributes.get(xlink_href))
+                if target is not None:
+                    targets.append(
+                        (xml_resolve_target(target, effective_base), False, False)
+                    )
+            for target, _, _ in svg_presentation_resource_targets(attributes):
+                resolved_target = xml_resolve_target(target, effective_base)
+                targets.append(
+                    (
+                        resolved_target,
+                        False,
+                        html_target_requires_file(resolved_target),
+                    )
+                )
+            if "style" in attributes:
+                style_sources.append((attributes["style"], effective_base))
+            if tag == "style":
+                style_sources.append(("".join(element.itertext()), effective_base))
+        for child in element:
+            visit(child, effective_base)
+
+    visit(root, "")
+    used_custom_properties = css_used_custom_properties(
+        [style_source for style_source, _ in style_sources]
+    )
+    for style_source, effective_base in style_sources:
+        imported_targets: list[str] = []
+        for target, _ in css_resource_references(
+            style_source,
+            used_custom_properties=used_custom_properties,
+            imported_targets=imported_targets,
+        ):
+            resolved_target = xml_resolve_target(target, effective_base)
+            targets.append(
+                (
+                    resolved_target,
+                    False,
+                    html_target_requires_file(resolved_target),
+                )
+            )
+        document_stylesheet_targets.extend(
+            xml_resolve_target(target, effective_base)
+            for target in imported_targets
         )
     if stylesheet_targets is not None:
         stylesheet_targets.extend(document_stylesheet_targets)
@@ -4158,9 +4298,18 @@ def svg_document_resource_targets(
         root = ElementTree.fromstring(text)
     except ElementTree.ParseError:
         return []
-    return svg_xml_element_resource_targets(
+    targets = svg_xml_element_resource_targets(
         root, stylesheet_targets=stylesheet_targets
     )
+    processing_instruction_targets = (
+        xml_stylesheet_processing_instruction_targets(text)
+    )
+    targets.extend(
+        (target, False, True) for target in processing_instruction_targets
+    )
+    if stylesheet_targets is not None:
+        stylesheet_targets.extend(processing_instruction_targets)
+    return targets
 
 
 def xhtml_document_fragments(text: str) -> set[str]:
@@ -4770,14 +4919,6 @@ def html_resource_targets(
             embedded_document_targets=document_resource_targets,
             stylesheet_targets=document_stylesheet_targets,
             module_script_targets=document_module_script_targets,
-        )
-    )
-    targets.extend(
-        (html_attribute_unescape(target), False, False)
-        for target in html_attribute_values(
-            attribute_text,
-            MARKDOWN_HTML_HREF_ATTRIBUTES,
-            tag_names=MARKDOWN_HTML_LEGACY_ANCHOR_TAGS,
         )
     )
     targets.extend(
@@ -6257,6 +6398,11 @@ def find_broken_links(root: Path) -> list[str]:
                 if (
                     suffix in (MARKDOWN_SUFFIXES | HTML_SUFFIXES)
                     and html_fragment_is_special_top(fragment)
+                ):
+                    continue
+                if (
+                    suffix in SVG_SUFFIXES
+                    and svg_fragment_is_view_specification(fragment)
                 ):
                     continue
                 if resolved not in fragment_cache:
